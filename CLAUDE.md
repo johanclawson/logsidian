@@ -69,6 +69,76 @@ yarn release              # Browser - outputs to static/
 yarn release-electron     # Desktop - outputs to static/out/
 ```
 
+### Windows Builds (x64 + ARM64)
+
+Local build for Windows x64:
+```powershell
+yarn install
+yarn gulp:build
+yarn cljs:release-electron
+yarn webpack-app-build
+
+cd static
+yarn install
+yarn electron:make
+# Output: static/out/make/
+```
+
+Local build for Windows ARM64:
+```powershell
+cd static
+$env:npm_config_arch = "arm64"
+yarn install
+yarn electron:make-win-arm64
+```
+
+**Note:** ARM64 builds require the rsapi native module to be compiled for ARM64. This is handled automatically by the GitHub Actions workflow.
+
+---
+
+## GitHub Actions Workflows
+
+| Workflow | File | Trigger |
+|----------|------|---------|
+| Build Windows | `.github/workflows/build-windows.yml` | `version.cljs` changes or manual |
+| Sync Upstream | `.github/workflows/sync-upstream.yml` | Weekly (Mon 6:00 UTC) or manual |
+
+**Build workflow jobs:**
+1. `build-rsapi-arm64` (Windows ARM64 runner) - Compiles rsapi with Rust + Clang
+2. `compile-cljs` (Ubuntu) - Builds ClojureScript with release optimizations
+3. `build-windows-x64` (Windows) - Builds Electron x64
+4. `build-windows-arm64` (Windows) - Builds Electron ARM64 with native modules
+5. `release` (Ubuntu) - Publishes versioned and rolling releases
+
+**Manual workflow options:**
+- `test_release`: Create test release with branch name in tag
+- `skip_x64`: Skip x64 build
+- `skip_arm64`: Skip ARM64 build
+
+**Release tags:**
+- `{version}-win64` - Versioned x64 release
+- `{version}-arm64` - Versioned ARM64 release
+- `win-latest` - Rolling release (both architectures)
+
+**Sync workflow:**
+- Only syncs with 0.10.x releases (ignores 0.11.x+ database versions)
+- Creates PR if merge is clean, creates issue if conflicts occur
+
+---
+
+## Performance Optimizations
+
+Production builds include these optimizations:
+
+| Optimization | File | Impact |
+|--------------|------|--------|
+| Node.js 22 Compile Cache | `resources/electron-entry.js` | 30-50% faster startup |
+| Direct Function Invocation | `shadow-cljs.edn` (`:fn-invoke-direct`) | 10-30% faster |
+| Disabled Logging | `shadow-cljs.edn` (`goog.debug.LOGGING_ENABLED`) | ~5-10% faster |
+| No Source Maps | `shadow-cljs.edn` (`:source-map false`) | Smaller bundles |
+| Webpack Production Mode | `webpack.config.js` | Tree shaking enabled |
+| Splash Screen | `resources/splash.html` | Perceived faster startup |
+
 ---
 
 ## Testing Commands

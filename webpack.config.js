@@ -2,7 +2,8 @@ const path = require('path');
 const webpack = require('webpack');
 
 var config = {
-  mode: "development",
+  // Logsidian: Use production mode when NODE_ENV is set (enables tree shaking)
+  mode: process.env.NODE_ENV === 'production' ? 'production' : 'development',
   externals: {
     'react': 'React',
     'react-dom': 'ReactDOM',

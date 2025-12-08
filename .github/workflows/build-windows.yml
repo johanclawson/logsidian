@@ -1,0 +1,432 @@
+name: Build Windows (x64 + ARM64)
+
+on:
+  # Only build when version.cljs changes (upstream releases)
+  push:
+    branches: [master]
+    paths:
+      - 'src/main/frontend/version.cljs'
+  workflow_dispatch:  # Allow manual trigger
+    inputs:
+      test_release:
+        description: 'Create test release (uses branch name in tag)'
+        type: boolean
+        default: false
+      skip_x64:
+        description: 'Skip x64 build'
+        type: boolean
+        default: false
+      skip_arm64:
+        description: 'Skip ARM64 build'
+        type: boolean
+        default: false
+
+jobs:
+  # First, build rsapi for ARM64 using native ARM64 runner
+  build-rsapi-arm64:
+    name: Build rsapi ARM64
+    runs-on: windows-11-arm
+    if: ${{ !inputs.skip_arm64 }}
+    steps:
+      - name: Checkout rsapi repository
+        uses: actions/checkout@v4
+        with:
+          repository: logseq/rsapi
+          ref: '@logseq/rsapi@0.0.92'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2024-12-09
+          targets: aarch64-pc-windows-msvc
+
+      - name: Add Clang to PATH
+        shell: pwsh
+        run: |
+          # ring crate requires Clang for Windows ARM64 builds
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $clangPaths = @(
+            "$vsPath\VC\Tools\Llvm\ARM64\bin",
+            "$vsPath\VC\Tools\Llvm\x64\bin",
+            "C:\Program Files\LLVM\bin"
+          )
+
+          foreach ($path in $clangPaths) {
+            if (Test-Path $path) {
+              Write-Host "Found Clang at: $path"
+              echo "$path" >> $env:GITHUB_PATH
+              break
+            }
+          }
+
+          clang --version
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      - name: Build rsapi for ARM64
+        shell: pwsh
+        env:
+          CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+        run: |
+          yarn lerna exec "yarn build --target aarch64-pc-windows-msvc" --concurrency 1 --stream --no-prefix
+
+      - name: Prepare rsapi artifact
+        shell: pwsh
+        run: |
+          $nodeFile = Get-ChildItem -Path packages/rsapi -Filter "*.node" -Recurse | Select-Object -First 1
+          if ($nodeFile) {
+            New-Item -ItemType Directory -Force -Path "rsapi-output"
+            Copy-Item $nodeFile.FullName -Destination "rsapi-output/rsapi.win32-arm64-msvc.node"
+            Get-ChildItem rsapi-output/
+          } else {
+            Write-Error "No .node file found!"
+            exit 1
+          }
+
+      - name: Upload rsapi artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsapi-win32-arm64-msvc
+          path: rsapi-output/
+          if-no-files-found: error
+
+  # Compile ClojureScript (shared by both architectures)
+  compile-cljs:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from version.cljs
+        id: version
+        run: |
+          VERSION=$(grep -oP 'defonce version "\K[^"]+' src/main/frontend/version.cljs)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 1.11.1.1413
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build ClojureScript
+        run: |
+          yarn gulp:build
+          yarn cljs:release-electron
+          yarn webpack-app-build
+
+      - name: Upload static assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cljs-static
+          path: static/
+
+  # Build Windows x64
+  build-windows-x64:
+    needs: [compile-cljs]
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_x64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download static assets
+        uses: actions/download-artifact@v4
+        with:
+          name: cljs-static
+          path: static/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies (x64)
+        working-directory: static
+        env:
+          npm_config_arch: x64
+        run: |
+          git config --global url."https://github.com".insteadOf ssh://git@github.com
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          yarn install
+
+      - name: Build Electron x64
+        working-directory: static
+        env:
+          npm_config_arch: x64
+        run: yarn electron:make
+
+      - name: Prepare artifacts
+        run: |
+          mkdir builds
+          move static\out\make\squirrel.windows\x64\*.nupkg builds\
+          move static\out\make\zip\win32\x64\*.zip builds\
+          move static\out\make\wix\x64\Logseq.msi builds\Logsidian-win-x64.msi
+        shell: cmd
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: builds/
+
+  # Build Windows ARM64
+  build-windows-arm64:
+    needs: [compile-cljs, build-rsapi-arm64]
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_arm64 }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download static assets
+        uses: actions/download-artifact@v4
+        with:
+          name: cljs-static
+          path: static/
+
+      - name: Download rsapi ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rsapi-win32-arm64-msvc
+          path: rsapi-arm64/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Install dependencies (ARM64)
+        working-directory: static
+        env:
+          npm_config_arch: arm64
+        run: |
+          git config --global url."https://github.com".insteadOf ssh://git@github.com
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          yarn install
+
+      - name: Download dugite ARM64 binary
+        working-directory: static/node_modules/dugite
+        env:
+          npm_config_arch: arm64
+        run: node script/download-git.js
+
+      - name: Install rsapi ARM64 binary
+        shell: pwsh
+        run: |
+          # Copy the built binary directly into the @logseq/rsapi package directory
+          # The index.js checks for local file first: existsSync(join(__dirname, 'rsapi.win32-arm64-msvc.node'))
+          $rsapiDir = "static/node_modules/@logseq/rsapi"
+
+          # Copy the built binary to the rsapi package directory
+          Copy-Item "rsapi-arm64/rsapi.win32-arm64-msvc.node" -Destination "$rsapiDir/"
+
+          Write-Host "rsapi ARM64 binary installed to @logseq/rsapi:"
+          Get-ChildItem $rsapiDir -Filter "*.node"
+
+      - name: Build Electron ARM64
+        working-directory: static
+        env:
+          npm_config_arch: arm64
+        run: yarn electron:make-win-arm64
+
+      - name: Prepare artifacts
+        run: |
+          mkdir builds
+          move static\out\make\squirrel.windows\arm64\*.nupkg builds\
+          move static\out\make\zip\win32\arm64\*.zip builds\
+          move static\out\make\wix\arm64\Logseq.msi builds\Logsidian-win-arm64.msi
+        shell: cmd
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: logsidian-win-arm64
+          path: builds/
+
+  # Test release job - only runs on manual trigger with test_release=true
+  test-release:
+    needs: [compile-cljs, build-windows-x64, build-windows-arm64]
+    runs-on: ubuntu-22.04
+    if: github.event_name == 'workflow_dispatch' && inputs.test_release == true && always() && !cancelled()
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.compile-cljs.outputs.version }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - name: Download x64 artifacts
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: ./x64/
+
+      - name: Download ARM64 artifacts
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-arm64
+          path: ./arm64/
+
+      - name: Prepare files
+        run: |
+          mkdir -p release
+          [ -d x64 ] && mv x64/* release/ || true
+          [ -d arm64 ] && mv arm64/* release/ || true
+          ls -la release/
+
+      - name: Create test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test-${{ env.BRANCH }}-${{ github.run_number }}
+          name: "TEST: ${{ env.BRANCH }} v${{ env.VERSION }} (#${{ github.run_number }})"
+          prerelease: true
+          files: release/*
+          body: |
+            ## TEST BUILD - ${{ env.BRANCH }}
+
+            **Version:** v${{ env.VERSION }}
+            **Branch:** `${{ env.BRANCH }}`
+            **Run:** #${{ github.run_number }}
+
+            This is a **test release** from a feature branch. Do not use in production.
+
+            ### Artifacts
+            - **x64**: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' && '✅' || '⏭️ Skipped' }}
+            - **ARM64**: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' && '✅' || '⏭️ Skipped' }}
+
+            ### Installation
+            - **x64 MSI**: `Logsidian-win-x64.msi`
+            - **ARM64 MSI**: `Logsidian-win-arm64.msi`
+
+  # Production release job - runs on master branch pushes OR manual trigger without test_release
+  release:
+    needs: [compile-cljs, build-windows-x64, build-windows-arm64]
+    runs-on: ubuntu-22.04
+    if: github.ref == 'refs/heads/master' && (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.test_release != true)) && always() && !cancelled()
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.compile-cljs.outputs.version }}
+    steps:
+      - name: Download x64 artifacts
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: ./x64/
+
+      - name: Download ARM64 artifacts
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-arm64
+          path: ./arm64/
+
+      - name: Prepare x64 release
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        run: mkdir -p release-x64 && mv x64/* release-x64/
+
+      - name: Prepare ARM64 release
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        run: mkdir -p release-arm64 && mv arm64/* release-arm64/
+
+      - name: Create x64 versioned release
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}-win64
+          name: Windows x64 v${{ env.VERSION }}
+          prerelease: false
+          files: release-x64/*
+          body: |
+            ## Logsidian Windows x64 v${{ env.VERSION }}
+
+            A high-performance fork of Logseq focused on file-based graphs.
+            "Obsidian's speed with Logseq's blocks, files stay yours."
+
+            **Included:**
+            - Core note-taking, local files, whiteboards, plugins
+            - Logseq Sync (rsapi)
+            - Git integration (dugite)
+
+            ### Installation
+            - **MSI installer** (recommended): `Logsidian-win-x64.msi`
+            - **Portable ZIP**: `Logsidian-win32-x64-*.zip`
+
+            See [README](https://github.com/johanclawson/logsidian#readme) for details.
+
+      - name: Create ARM64 versioned release
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}-arm64
+          name: Windows ARM64 v${{ env.VERSION }}
+          prerelease: false
+          files: release-arm64/*
+          body: |
+            ## Logsidian Windows ARM64 v${{ env.VERSION }}
+
+            A high-performance fork of Logseq focused on file-based graphs.
+            "Obsidian's speed with Logseq's blocks, files stay yours."
+
+            **Included:**
+            - Core note-taking, local files, whiteboards, plugins
+            - Logseq Sync (rsapi compiled for ARM64)
+            - Git integration (dugite with ARM64 binary)
+
+            ### Installation
+            - **MSI installer** (recommended): `Logsidian-win-arm64.msi`
+            - **Portable ZIP**: `Logsidian-win32-arm64-*.zip`
+
+            See [README](https://github.com/johanclawson/logsidian#readme) for details.
+
+      - name: Prepare rolling release
+        run: |
+          mkdir -p release-latest
+          [ -d release-x64 ] && cp release-x64/* release-latest/ || true
+          [ -d release-arm64 ] && cp release-arm64/* release-latest/ || true
+
+      - name: Update latest rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-latest
+          name: Windows Latest (v${{ env.VERSION }})
+          prerelease: true
+          files: release-latest/*
+          body: |
+            ## Logsidian Windows Latest
+
+            **Current version:** v${{ env.VERSION }}
+
+            This rolling release always contains the latest Windows builds.
+            For a specific version, see the [versioned releases](https://github.com/johanclawson/logsidian/releases).
+
+            ### Available Architectures
+            - **x64**: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' && '✅' || '⏭️ Not included' }}
+            - **ARM64**: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' && '✅' || '⏭️ Not included' }}
+
+            ### Installation
+            - `Logsidian-win-x64.msi` - Windows x64
+            - `Logsidian-win-arm64.msi` - Windows ARM64 (Surface Pro X, etc.)

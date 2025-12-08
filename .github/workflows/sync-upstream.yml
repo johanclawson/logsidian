@@ -1,0 +1,209 @@
+name: Sync Upstream 0.10.x Release
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'  # Every Monday at 6:00 UTC
+  workflow_dispatch:  # Allow manual trigger
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure Git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote
+        run: git remote add upstream https://github.com/logseq/logseq.git
+
+      - name: Fetch upstream tags
+        run: git fetch upstream --tags
+
+      - name: Get current version
+        id: current
+        run: |
+          # Extract version from version.cljs
+          CURRENT_VERSION=$(grep -oP 'defonce version "\K[^"]+' src/main/frontend/version.cljs || echo "0.0.0")
+          echo "version=$CURRENT_VERSION" >> $GITHUB_OUTPUT
+          echo "Current fork version: $CURRENT_VERSION"
+
+      - name: Get latest upstream 0.10.x release tag
+        id: latest
+        run: |
+          # CRITICAL: Only sync 0.10.x releases, ignore 0.11.x+ (DB-based versions)
+          # Logsidian is based on 0.10.15 (file-based only)
+          LATEST_TAG=$(git tag -l '0.10.*' --sort=-v:refname | head -1)
+
+          if [ -z "$LATEST_TAG" ]; then
+            echo "No 0.10.x release tags found"
+            echo "tag=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "tag=$LATEST_TAG" >> $GITHUB_OUTPUT
+          echo "Latest upstream 0.10.x release: $LATEST_TAG"
+
+          # Also show what we're ignoring
+          LATEST_ANY=$(git tag -l '[0-9]*.[0-9]*.[0-9]*' --sort=-v:refname | head -1)
+          if [ "$LATEST_ANY" != "$LATEST_TAG" ]; then
+            echo "NOTE: Ignoring newer version $LATEST_ANY (not 0.10.x)"
+          fi
+
+      - name: Check if update needed
+        id: check
+        run: |
+          CURRENT="${{ steps.current.outputs.version }}"
+          LATEST="${{ steps.latest.outputs.tag }}"
+
+          if [ -z "$LATEST" ]; then
+            echo "No upstream 0.10.x tags found, skipping"
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          # Compare versions using sort -V (version sort)
+          HIGHER=$(printf '%s\n%s' "$CURRENT" "$LATEST" | sort -V | tail -1)
+
+          if [ "$HIGHER" = "$LATEST" ] && [ "$CURRENT" != "$LATEST" ]; then
+            echo "Update available: $CURRENT -> $LATEST"
+            echo "needs_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "Already at latest or ahead: $CURRENT (latest 0.10.x: $LATEST)"
+            echo "needs_update=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Attempt merge with release tag
+        id: merge
+        if: steps.check.outputs.needs_update == 'true'
+        run: |
+          LATEST_TAG="${{ steps.latest.outputs.tag }}"
+
+          # Create sync branch
+          git checkout -b sync-upstream-$LATEST_TAG
+
+          # Try to merge the release tag
+          if git merge "$LATEST_TAG" --no-edit -m "Merge upstream release $LATEST_TAG"; then
+            echo "merge_status=success" >> $GITHUB_OUTPUT
+            echo "Merge successful!"
+          else
+            echo "merge_status=conflict" >> $GITHUB_OUTPUT
+            echo "Merge has conflicts"
+            git merge --abort
+          fi
+
+      - name: Push sync branch
+        if: steps.merge.outputs.merge_status == 'success'
+        run: |
+          git push origin sync-upstream-${{ steps.latest.outputs.tag }}
+
+      - name: Create Pull Request
+        if: steps.merge.outputs.merge_status == 'success'
+        uses: peter-evans/create-pull-request@v5
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          branch: sync-upstream-${{ steps.latest.outputs.tag }}
+          delete-branch: true
+          title: "Sync with upstream release ${{ steps.latest.outputs.tag }}"
+          body: |
+            ## Upstream Release Sync
+
+            This PR merges upstream release **${{ steps.latest.outputs.tag }}** from [logseq/logseq](https://github.com/logseq/logseq/releases/tag/${{ steps.latest.outputs.tag }}).
+
+            **Version upgrade:** `${{ steps.current.outputs.version }}` → `${{ steps.latest.outputs.tag }}`
+
+            > **Note:** Logsidian only syncs with 0.10.x releases (file-based graphs).
+            > We intentionally ignore 0.11.x+ which includes database graphs.
+
+            ### Review Checklist
+            - [ ] Check that Logsidian customizations are still intact
+            - [ ] Verify no conflicts in key files:
+              - `src/electron/electron/core.cljs` (splash screen, updater)
+              - `src/electron/electron/updater.cljs` (Logsidian update checker)
+              - `src/main/frontend/components/header.cljs` (update notification)
+              - `resources/package.json` (entry point)
+              - `shadow-cljs.edn` (release optimizations)
+            - [ ] Test build locally if significant changes
+
+            ### After Merging
+            Once merged, the build workflow will automatically:
+            1. Build both x64 and ARM64 versions
+            2. Create versioned releases
+            3. Notify users via in-app update notification
+
+            ---
+            *Auto-generated by sync-upstream workflow*
+
+      - name: Create Issue on Conflict
+        if: steps.merge.outputs.merge_status == 'conflict'
+        run: |
+          LATEST_TAG="${{ steps.latest.outputs.tag }}"
+          CURRENT_VERSION="${{ steps.current.outputs.version }}"
+
+          cat > /tmp/conflict-issue.md << EOF
+          ## Upstream Release Sync Conflict
+
+          The automatic sync with upstream release **$LATEST_TAG** encountered merge conflicts.
+
+          **Attempted upgrade:** \`$CURRENT_VERSION\` → \`$LATEST_TAG\`
+
+          ### Manual Resolution Steps
+
+          1. Fetch upstream tags:
+             \`\`\`bash
+             git remote add upstream https://github.com/logseq/logseq.git
+             git fetch upstream --tags
+             \`\`\`
+
+          2. Create sync branch and merge the release tag:
+             \`\`\`bash
+             git checkout -b sync-upstream-$LATEST_TAG
+             git merge $LATEST_TAG
+             \`\`\`
+
+          3. Resolve conflicts in likely files:
+             - \`src/electron/electron/core.cljs\` (splash screen, updater)
+             - \`src/electron/electron/updater.cljs\` (Logsidian update checker)
+             - \`src/main/frontend/components/header.cljs\` (update notification)
+             - \`resources/package.json\` (entry point)
+             - \`shadow-cljs.edn\` (release optimizations)
+
+          4. **Important:** Ensure Logsidian customizations are preserved:
+             - Splash screen in core.cljs
+             - Update checker pointing to johanclawson/logsidian
+             - electron-entry.js as main entry point
+             - Release optimizations in shadow-cljs.edn
+
+          5. Test the build:
+             \`\`\`bash
+             yarn install
+             yarn gulp:build
+             yarn cljs:release-electron
+             \`\`\`
+
+          6. Push and create PR:
+             \`\`\`bash
+             git push origin sync-upstream-$LATEST_TAG
+             \`\`\`
+
+          ### Release Notes
+          See [upstream release notes](https://github.com/logseq/logseq/releases/tag/$LATEST_TAG) for changes in this version.
+
+          ---
+          *Auto-generated by sync-upstream workflow*
+          EOF
+
+      - name: Post conflict issue
+        if: steps.merge.outputs.merge_status == 'conflict'
+        uses: peter-evans/create-issue-from-file@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+          title: "Sync with upstream release ${{ steps.latest.outputs.tag }} requires manual intervention"
+          content-filepath: /tmp/conflict-issue.md
+          labels: upstream-sync, needs-attention
