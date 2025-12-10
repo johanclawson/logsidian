@@ -162,6 +162,104 @@ bb lint:large-vars          # Check for overly complex functions
 
 ---
 
+## Performance Testing
+
+Performance benchmarks measure baseline metrics before sidecar implementation.
+
+### Running Benchmarks
+
+```bash
+# Compile tests first (required after any test file changes)
+yarn cljs:test
+
+# Run all benchmarks
+yarn cljs:run-test -i benchmark
+
+# Or via bb task
+bb benchmark:baseline
+
+# Run specific benchmark
+yarn cljs:run-test -n frontend.sidecar.baseline-benchmark-test/query-simple-benchmark
+```
+
+### Benchmark Results Location
+
+- **Results document**: `docs/tests/performance_before_sidecar.md`
+- **Test implementation**: `src/test/frontend/sidecar/baseline_benchmark_test.cljs`
+
+### Current Baseline (2025-12-09)
+
+| Metric | Value | Notes |
+|--------|-------|-------|
+| Small graph load (1K blocks) | 1,123 ms | 100 pages × 10 blocks |
+| Medium graph load (7.5K blocks) | 9,106 ms | 500 pages × 15 blocks |
+| Simple query avg | 0.36 ms | Entity lookup by name |
+| Backlinks query avg | 2.51 ms | Pattern matching |
+| Property filter avg | 6.98 ms | Content search |
+| Pull entity avg | 0.03 ms | Single entity pull |
+| Single block tx avg | 1.15 ms | Insert operation |
+
+### Adding New Tests
+
+**IMPORTANT QUIRKS** - Read before creating new tests:
+
+1. **File naming**: Test files MUST end with `_test.cljs`
+   - ✅ `my_feature_test.cljs`
+   - ❌ `my_feature_benchmark.cljs` (won't be discovered!)
+
+2. **Namespace naming**: Must match file path with `-test` suffix
+   - File: `src/test/frontend/sidecar/baseline_benchmark_test.cljs`
+   - Namespace: `frontend.sidecar.baseline-benchmark-test`
+
+3. **Test metadata for filtering**: Use `^:keyword` metadata
+   ```clojure
+   (deftest ^:benchmark my-benchmark-test ...)  ; Run with -i benchmark
+   (deftest ^:focus my-focused-test ...)        ; Run with -i focus
+   ```
+
+4. **Recompilation required**: After creating/modifying test files:
+   ```bash
+   # Clear cache and recompile (sometimes needed for new files)
+   rm -rf .shadow-cljs
+   yarn cljs:test
+   ```
+
+5. **Shadow-cljs test discovery**: Uses `:node-test` target which auto-discovers
+   tests from `src/test/` but ONLY files matching `*_test.cljs` pattern.
+
+### Test Helper Functions
+
+Located in `src/test/frontend/test/helper.cljs`:
+
+```clojure
+;; Database lifecycle
+(test-helper/start-and-destroy-db
+  (fn []
+    ;; Your test code here - db is available
+    ))
+
+;; Load test files
+(test-helper/load-test-files
+  [{:file/path "pages/test.md"
+    :file/content "- block 1\n- block 2"}])
+
+;; Timing measurement
+(let [{:keys [time result]} (util/with-time (expensive-operation))]
+  (println "Took:" time "ms"))
+```
+
+### Windows/Claude Code Path Issues
+
+When running tests via Claude Code's bash environment, yarn may fail with path translation errors.
+
+**Workaround**: Use PowerShell wrapper:
+```bash
+pwsh -Command "cd 'X:\source\repos\logsidian'; yarn cljs:test"
+pwsh -Command "cd 'X:\source\repos\logsidian'; yarn cljs:run-test -i benchmark"
+```
+
+---
+
 ## Architecture
 
 ### Tech Stack
@@ -318,19 +416,113 @@ git push origin master
 
 ## Windows Development Notes
 
-### Path Issues with Claude Code
+### Claude Code Cygpath Issues (IMPORTANT)
 
-When running commands through Claude Code's bash environment, there can be path translation issues (`X:\x\source\repos\` instead of `X:\source\repos\`).
+Claude Code's bash environment uses cygpath to translate Windows paths, which causes failures with yarn/npm commands. The path `X:\source\repos\` gets corrupted to `X:\x\source\repos\`.
 
-**Workaround:** Run build commands from a native Windows terminal (cmd.exe or PowerShell):
+**ALWAYS use PowerShell wrappers for these commands:**
 
-```cmd
-cd X:\source\repos\logsidian
-nvm use 22.21.0
-corepack enable
-yarn install
-yarn watch
+```bash
+# Instead of: yarn install
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm install"
+
+# Instead of: yarn gulp:build
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run gulp:build"
+
+# Instead of: yarn css:build
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run css:build"
+
+# Instead of: yarn cljs:release-electron
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run cljs:release-electron"
+
+# Instead of: yarn webpack-app-build
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run webpack-app-build"
 ```
+
+**Commands that work directly in bash** (no PowerShell needed):
+- `clojure` commands (Clojure CLI doesn't use cygpath)
+- `git` commands
+- `gh` (GitHub CLI)
+- File operations (`cp`, `ls`, `cat`, etc.)
+
+**nvm switching requires cmd.exe** (PowerShell nvm switch doesn't persist):
+```bash
+cmd.exe /c "nvm use 22.21.0 && cd /d X:\source\repos\logsidian\static && npm install"
+```
+
+### Complete Local Build Process (Windows x64)
+
+Full sequence to build a runnable Electron app from scratch:
+
+```bash
+# 1. Switch to Node 22 (required - project uses .nvmrc)
+cmd.exe /c "nvm use 22.21.0"
+
+# 2. Install root dependencies
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm install"
+
+# 3. Build CSS (PostCSS/Tailwind)
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run css:build"
+
+# 4. Copy resources to static/ (gulp task)
+# Note: gulp:build may fail on CSS step but still copies resources
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run gulp:build"
+
+# 5. Build ClojureScript (compiles to static/js/)
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run cljs:release-electron"
+
+# 6. Build webpack bundles (db-worker, inference-worker)
+pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run webpack-app-build"
+
+# 7. Install static/ dependencies and package Electron app
+cmd.exe /c "nvm use 22.21.0 && cd /d X:\source\repos\logsidian\static && npm install && npm run electron:make"
+
+# Output: static/out/Logseq-win32-x64/Logseq.exe
+```
+
+### Native Module: rsapi
+
+The `@logseq/rsapi-win32-x64-msvc` native module is required but NOT included in npm packages.
+
+**For local builds**, copy from a GitHub release:
+```bash
+# Download release
+gh release download <tag> --repo johanclawson/logsidian --pattern "Logseq-win32-x64-*.zip"
+
+# Extract and copy rsapi module
+# From: temp-extract/resources/app/node_modules/@logseq/rsapi-win32-x64-msvc/
+# To:   static/out/Logseq-win32-x64/resources/app/node_modules/@logseq/
+```
+
+**GitHub Actions** builds rsapi automatically in the `build-rsapi-arm64` job.
+
+### Post-Package File Copying
+
+After `electron:make`, if files are missing, manually copy:
+
+```bash
+# CSS (if gulp:build failed on CSS step)
+cp static/css/style.css static/out/Logseq-win32-x64/resources/app/css/
+
+# Webpack bundles (if not copied by packager)
+cp static/js/*-bundle.js static/out/Logseq-win32-x64/resources/app/js/
+cp static/js/*.wasm static/out/Logseq-win32-x64/resources/app/js/
+
+# rsapi native module (from GitHub release)
+cp -r <extracted>/resources/app/node_modules/@logseq/rsapi-win32-x64-msvc \
+      static/out/Logseq-win32-x64/resources/app/node_modules/@logseq/
+```
+
+### Debugging the Built App
+
+Open DevTools in the Electron app: **Ctrl+Shift+I**
+
+Common errors and fixes:
+| Error | Cause | Fix |
+|-------|-------|-----|
+| `Cannot find module '@logseq/rsapi-win32-x64-msvc'` | Missing native module | Copy from GitHub release |
+| `Failed to load db-worker-bundle.js` | Missing webpack bundles | Run `npm run webpack-app-build` and copy |
+| Unstyled UI (no CSS) | Missing style.css | Run `npm run css:build` and copy |
 
 ### Install Dependencies
 

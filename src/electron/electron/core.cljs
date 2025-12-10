@@ -35,6 +35,9 @@
 (defonce *teardown-fn (volatile! nil))
 (defonce *quit-dirty? (volatile! true))
 
+;; Splash screen window atom
+(defonce *splash-win (atom nil))
+
 ;; Handle creating/removing shortcuts on Windows when installing/uninstalling.
 (when (js/require "electron-squirrel-startup") (.quit app))
 
@@ -236,11 +239,41 @@
              (when-let [win @*win]
                (open-url-handler win url))))))
 
+(defn- create-splash-window!
+  "Create a splash screen window that shows immediately on startup"
+  []
+  (let [splash (BrowserWindow. (clj->js {:width 300
+                                          :height 350
+                                          :frame false
+                                          :transparent true
+                                          :alwaysOnTop true
+                                          :skipTaskbar true
+                                          :resizable false
+                                          :center true
+                                          :show true
+                                          :webPreferences {:nodeIntegration false
+                                                           :contextIsolation true}}))]
+    (.loadFile splash (node-path/join js/__dirname "splash.html"))
+    (reset! *splash-win splash)
+    splash))
+
+(defn- close-splash-window!
+  "Close the splash screen if it exists"
+  []
+  (when-let [splash @*splash-win]
+    (when-not (.isDestroyed splash)
+      (.close splash))
+    (reset! *splash-win nil)))
+
 (defn- on-app-ready!
   [^js app']
   (.on app' "ready"
        (fn []
          (logger/info (str "Logseq App(" (.getVersion app') ") Starting... "))
+
+         ;; Show splash screen immediately (production only)
+         (when-not dev?
+           (create-splash-window!))
 
          ;; Add React developer tool
          (when-let [^js devtoolsInstaller (and dev? (js/require "electron-devtools-installer"))]
@@ -266,6 +299,12 @@
                             t3 (handler/set-ipc-handler! win)
                             t4 (server/setup! win)
                             tt (exceptions/setup-exception-listeners!)]
+
+                        ;; Close splash and show main window when content is ready
+                        (.once (.-webContents win) "did-finish-load"
+                               (fn []
+                                 (close-splash-window!)
+                                 (.show win)))
 
                         (vreset! *teardown-fn
                                  #(doseq [f [t0 t1 t2 t3 t4 tt]]
