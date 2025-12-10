@@ -420,24 +420,34 @@ git push origin master
 
 Claude Code's bash environment uses cygpath to translate Windows paths, which causes failures with yarn/npm commands. The path `X:\source\repos\` gets corrupted to `X:\x\source\repos\`.
 
-**ALWAYS use PowerShell wrappers for these commands:**
+**Key principles for avoiding path corruption:**
 
-```bash
-# Instead of: yarn install
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm install"
+1. **Use the PowerShell build script** for multi-step builds:
+   ```bash
+   cd /x/source/repos/logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+   ```
 
-# Instead of: yarn gulp:build
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run gulp:build"
+2. **Run node tools directly** instead of through yarn scripts:
+   ```powershell
+   # Instead of: yarn css:build
+   node node_modules/postcss-cli/index.js tailwind.all.css -o static/css/style.css
 
-# Instead of: yarn css:build
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run css:build"
+   # Instead of: yarn gulp:build
+   node node_modules/gulp/bin/gulp.js build
 
-# Instead of: yarn cljs:release-electron
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run cljs:release-electron"
+   # Instead of: yarn webpack-app-build
+   node node_modules/webpack/bin/webpack.js --config webpack.config.js
+   ```
 
-# Instead of: yarn webpack-app-build
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run webpack-app-build"
-```
+3. **Use `--ignore-scripts`** with yarn install to prevent nested bash calls:
+   ```powershell
+   yarn install --ignore-scripts
+   ```
+
+4. **For complex multi-step builds**, create a PowerShell script under `./scripts/`:
+   - Create the folder if it doesn't exist
+   - Script can set Node version via PATH without changing global nvm
+   - Run tools directly via node to avoid bash path corruption
 
 **Commands that work directly in bash** (no PowerShell needed):
 - `clojure` commands (Clojure CLI doesn't use cygpath)
@@ -447,38 +457,55 @@ pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run webpack-app-bu
 
 **nvm switching requires cmd.exe** (PowerShell nvm switch doesn't persist):
 ```bash
-cmd.exe /c "nvm use 22.21.0 && cd /d X:\source\repos\logsidian\static && npm install"
-```
-
-### Complete Local Build Process (Windows x64)
-
-Full sequence to build a runnable Electron app from scratch:
-
-```bash
-# 1. Switch to Node 22 (required - project uses .nvmrc)
 cmd.exe /c "nvm use 22.21.0"
-
-# 2. Install root dependencies
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm install"
-
-# 3. Build CSS (PostCSS/Tailwind)
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run css:build"
-
-# 4. Copy resources to static/ (gulp task)
-# Note: gulp:build may fail on CSS step but still copies resources
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run gulp:build"
-
-# 5. Build ClojureScript (compiles to static/js/)
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run cljs:release-electron"
-
-# 6. Build webpack bundles (db-worker, inference-worker)
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run webpack-app-build"
-
-# 7. Install static/ dependencies and package Electron app
-cmd.exe /c "nvm use 22.21.0 && cd /d X:\source\repos\logsidian\static && npm install && npm run electron:make"
-
-# Output: static/out/Logseq-win32-x64/Logseq.exe
 ```
+
+### Complete Local Build Process (Windows)
+
+**Recommended: Use the PowerShell build script:**
+```bash
+cd /x/source/repos/logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+```
+
+Options:
+- `-SkipInstall` - Skip yarn install step (faster rebuilds)
+- `-ElectronOnly` - Only build electron (skip CSS/webpack)
+- `-Help` - Show help
+
+The script automatically:
+- Sets the correct Node version from `.nvmrc`
+- Runs yarn install with `--ignore-scripts`
+- Builds tldraw and ui packages directly
+- Runs postcss, gulp, cljs, webpack
+- Packages the Electron app
+
+**Output:** `static/out/Logseq-win32-arm64/Logseq.exe` or `static/out/Logseq-win32-x64/Logseq.exe`
+
+### Build Script Details (`scripts/build.ps1`)
+
+The build script was created to work around yarn/npm path corruption in Claude Code's bash environment. It runs all node tools directly via `node path/to/script.js` instead of through yarn scripts.
+
+**Location:** `scripts/build.ps1`
+
+**Key techniques used:**
+1. **Session-only Node version:** Reads `.nvmrc`, finds matching nvm directory, prepends to PATH
+2. **`--ignore-scripts` flag:** Prevents yarn from running postinstall scripts through bash
+3. **Direct node execution:** All tools (postcss, gulp, webpack, electron-forge) run via `node module/path.js`
+4. **Handle hoisted modules:** Some dependencies (like zx) get hoisted by yarn workspaces - script searches multiple locations
+
+**Build steps executed:**
+| Step | Tool | Direct Path |
+|------|------|-------------|
+| 1 | yarn install | Uses `--ignore-scripts` to avoid bash |
+| 1b | zx (tldraw build) | `node packages/tldraw/node_modules/zx/build/cli.js build.mjs` |
+| 1c | parcel (ui build) | `node node_modules/parcel/lib/bin.js build --target ui` |
+| 2 | postcss | `node node_modules/postcss-cli/index.js tailwind.all.css ...` |
+| 3 | gulp | `node node_modules/gulp/bin/gulp.js build` |
+| 4 | shadow-cljs | `yarn cljs:release-electron` (Clojure - works in bash) |
+| 5 | webpack | `node node_modules/webpack/bin/webpack.js --config webpack.config.js` |
+| 6 | electron-forge | `node static/node_modules/@electron-forge/cli/dist/electron-forge.js make` |
+
+**Known issue:** If gulp's `clean` task fails with EBUSY (file locked), `resources/package.json` won't be copied to `static/`. Fix: `cp -r resources/* static/` manually.
 
 ### Native Module: rsapi
 

@@ -220,7 +220,15 @@
   logseq.tasks.file-sync/integration-tests
 
   ai:check-common-errors
-  logseq.tasks.common-errors/check-common-errors}
+  logseq.tasks.common-errors/check-common-errors
+
+  benchmark:baseline
+  {:doc "Run baseline performance benchmarks (before sidecar implementation)"
+   :task logseq.tasks.benchmark/baseline}
+
+  benchmark:compare
+  {:doc "Compare baseline vs sidecar performance results"
+   :task logseq.tasks.benchmark/compare-results}}
 
  :tasks/config
  {:large-vars
