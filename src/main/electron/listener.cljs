@@ -155,7 +155,24 @@
   (safe-api-call "handbook"
                  (fn [^js data]
                    (when-let [k (and data (.-key data))]
-                     (state/open-handbook-pane! k)))))
+                     (state/open-handbook-pane! k))))
+
+  ;; Sidecar push messages from JVM sidecar via main process
+  (safe-api-call "sidecar-push"
+                 (fn [data]
+                   (let [{:keys [event payload]} (bean/->clj data)]
+                     (case event
+                       :write-files
+                       (state/pub-event! [:file/write (:files payload)])
+
+                       :notification
+                       (notification/show! (:content payload) (keyword (:type payload)) false)
+
+                       :sync-db-changes
+                       (state/pub-event! [:db/sync-changes (:repo payload) (:changes payload)])
+
+                       ;; Unknown event - log it
+                       (js/console.warn "Unknown sidecar push event:" event))))))
 
 (defn listen!
   []

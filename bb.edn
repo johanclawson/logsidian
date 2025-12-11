@@ -228,7 +228,48 @@
 
   benchmark:compare
   {:doc "Compare baseline vs sidecar performance results"
-   :task logseq.tasks.benchmark/compare-results}}
+   :task logseq.tasks.benchmark/compare-results}
+
+  ;; JVM Sidecar tasks
+  sidecar:test
+  {:doc "Run JVM sidecar tests"
+   :task (shell {:dir "sidecar"} "clojure" "-M:test")}
+
+  sidecar:test-watch
+  {:doc "Run JVM sidecar tests in watch mode"
+   :task (shell {:dir "sidecar"} "clojure" "-M:test" "--watch")}
+
+  sidecar:repl
+  {:doc "Start sidecar REPL with nREPL"
+   :task (shell {:dir "sidecar"} "clojure" "-M:dev" "-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]")}
+
+  sidecar:uberjar
+  {:doc "Build sidecar uberjar (outputs to sidecar/target/logsidian-sidecar.jar)"
+   :task (shell {:dir "sidecar"} "clojure" "-T:build" "uberjar")}
+
+  sidecar:run
+  {:doc "Run sidecar server directly"
+   :task (apply shell {:dir "sidecar"} "clojure" "-M" "-m" "logseq.sidecar.server" *command-line-args*)}
+
+  sidecar:validate
+  {:doc "Run Phase 0 validation tests (JVM startup time, IPC latency)"
+   :task (shell {:dir "sidecar"} "clojure" "-M:test" "-i" "validation")}
+
+  sidecar:integration-test
+  {:doc "Run ClojureScript integration tests against running sidecar (requires sidecar:run first)"
+   :task (do
+           (shell "yarn" "cljs:test")
+           (shell "node" "static/tests.js" "-i" "integration"))}
+
+  sidecar:parity-test
+  {:doc "Run parity tests to verify sidecar matches DataScript behavior (requires sidecar:run first)"
+   :task (do
+           (shell "yarn" "cljs:test")
+           (shell "node" "static/tests.js" "-i" "parity"))}
+
+  sidecar:e2e-test
+  {:doc "Run sidecar E2E tests (requires sidecar:run and bb serve in clj-e2e)"
+   :task (shell {:dir "clj-e2e"} "clojure" "-M:test" "-n" "logseq.e2e.sidecar-basic-test")}}
 
  :tasks/config
  {:large-vars

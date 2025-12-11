@@ -22,6 +22,7 @@
             [electron.fs-watcher :as watcher]
             [electron.git :as git]
             [electron.handler-interface :refer [handle]]
+            [electron.sidecar :as sidecar]
             [electron.keychain :as keychain]
             [electron.logger :as logger]
             [electron.plugin :as plugin]
@@ -626,6 +627,28 @@
 
 (defmethod handle :keychain/delete-e2ee-password [_window [_ key]]
   (keychain/<delete-password! key))
+
+;; =============================================================================
+;; Sidecar Handlers
+;; =============================================================================
+
+(defmethod handle :sidecar/start [_window [_ opts]]
+  (sidecar/start! (or opts {})))
+
+(defmethod handle :sidecar/stop [_window [_]]
+  (sidecar/stop!))
+
+(defmethod handle :sidecar/connect [_window [_ opts]]
+  (sidecar/connect! (or opts {})))
+
+(defmethod handle :sidecar/disconnect [_window [_]]
+  (sidecar/disconnect!))
+
+(defmethod handle :sidecar/request [_window [_ op payload opts]]
+  (sidecar/send-request op payload (or opts {})))
+
+(defmethod handle :sidecar/status [_window [_]]
+  (sidecar/status))
 
 (defmethod handle :default [args]
   (logger/error "Error: no ipc handler for:" args))

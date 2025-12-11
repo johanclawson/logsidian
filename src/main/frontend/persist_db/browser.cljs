@@ -13,6 +13,7 @@
             [frontend.handler.notification :as notification]
             [frontend.handler.worker :as worker-handler]
             [frontend.persist-db.protocol :as protocol]
+            [frontend.sidecar.core :as sidecar]
             [frontend.state :as state]
             [frontend.undo-redo :as undo-redo]
             [frontend.util :as util]
@@ -113,7 +114,9 @@
                                     (when-not lock
                                       (js/window.location.reload)))))))
 
-(defn start-db-worker!
+(defn- start-web-worker!
+  "Start the web worker backend for database operations.
+   This is the original implementation, now internal."
   []
   (when-not util/node-test?
     (p/do!
@@ -159,6 +162,40 @@
                                       (assoc tx-meta :client-id (:client-id @state/state))))))
            (p/catch (fn [error]
                       (log/error :init-sqlite-wasm-error ["Can't init SQLite wasm" error]))))))))
+
+(defn start-db-worker!
+  "Start the database backend - either JVM sidecar or web worker.
+
+   On Electron desktop, attempts to start the JVM sidecar first for better
+   performance with large graphs. Falls back to web worker if sidecar fails.
+
+   On web/mobile, always uses the web worker."
+  []
+  (when-not util/node-test?
+    (if (sidecar/sidecar-enabled?)
+      ;; Desktop with sidecar support
+      (-> (sidecar/start-db-backend!
+           {:start-web-worker-fn start-web-worker!
+            :fallback-on-error? true
+            :on-backend-ready (fn [{:keys [type]}]
+                                (log/info :db-backend-started {:type type}))})
+          (p/then (fn [{:keys [type]}]
+                    (when (= type :sidecar)
+                      ;; Sidecar needs some additional setup that web worker handles internally
+                      (sync-app-state!)
+                      (sync-ui-state!)
+                      (state/pub-event! [:graph/sync-context])
+                      (ldb/register-transact-fn!
+                       (fn sidecar-transact!
+                         [repo tx-data tx-meta]
+                         (db-transact/transact transact!
+                                               (if (string? repo) repo (state/get-current-repo))
+                                               tx-data
+                                               (assoc tx-meta :client-id (:client-id @state/state))))))))
+          (p/catch (fn [error]
+                     (log/error :start-db-backend-error {:error error}))))
+      ;; Web/mobile - use web worker directly
+      (start-web-worker!))))
 
 (defn <check-webgpu-available?
   []

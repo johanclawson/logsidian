@@ -378,15 +378,14 @@ Large Logseq graphs (10k+ blocks) suffer from:
 ### Project Structure
 
 ```
-X:\source\repos\
-├── logsidian/                    # Main app (AGPL-3.0)
-│   └── (this repo)
-│
-├── logsidian-sidecar/            # JVM sidecar (MIT)
-│   └── (separate repo - original code)
-│
-└── logseqWinArm64/               # ARM64 fork reference
-    └── docs/hybrid-architecture-revised.md
+logsidian/                        # Main app (AGPL-3.0)
+├── src/main/frontend/sidecar/    # CLJS sidecar client code
+├── src/electron/electron/        # Electron sidecar integration
+├── sidecar/                      # JVM sidecar server (MIT)
+│   ├── src/logseq/sidecar/       # Clojure server code
+│   ├── test/                     # Server tests
+│   └── deps.edn                  # Sidecar dependencies
+└── ...
 ```
 
 ### Implementation Phases
@@ -395,6 +394,70 @@ X:\source\repos\
 2. **Phase 1: Read Path** - Lazy loading for queries
 3. **Phase 2: Write Path** - Transaction handling
 4. **Phase 3: Integration** - Full file-based graph support
+
+### Sidecar Development & Testing
+
+The sidecar has two communication paths:
+- **Electron (IPC)**: Desktop app uses TCP socket via main process IPC
+- **Browser (WebSocket)**: Web app connects directly via WebSocket
+
+#### Running the Sidecar
+
+```bash
+# Build the sidecar JAR (from repo root)
+cd sidecar && clj -T:build uberjar
+
+# Run the sidecar server
+cd sidecar && java -jar target/logsidian-sidecar.jar
+
+# Sidecar listens on:
+# - TCP port 47632 (for Electron IPC)
+# - WebSocket port 47633 (for browser)
+```
+
+#### Testing with Playwright MCP
+
+To test the sidecar from a browser, you need to:
+1. Start the dev server (`yarn watch` or `clojure -M:cljs watch app`)
+2. Start the sidecar (`java -jar sidecar/target/logsidian-sidecar.jar`)
+3. Enable WebSocket sidecar mode in the browser
+
+**Enable WebSocket sidecar in browser console or via Playwright:**
+
+```javascript
+// Option 1: Via localStorage (persists across page reloads)
+localStorage.setItem('sidecar-websocket-enabled', 'true');
+location.reload();
+
+// Option 2: Via CLJS API (programmatic, for testing)
+frontend.sidecar.core.force_enable_websocket_sidecar_BANG_();
+await frontend.sidecar.core.start_websocket_sidecar_BANG_();
+
+// Verify connection
+frontend.sidecar.websocket_client.connected_QMARK_();  // should return true
+frontend.sidecar.websocket_client.status();            // shows connection details
+```
+
+**Test a sidecar request:**
+```javascript
+// Send a test request to the sidecar
+const result = await frontend.sidecar.websocket_client.send_request(
+  cljs.core.keyword('thread-api/list-db'),
+  cljs.core.clj__GT_js({ args: [] })
+);
+console.log('Result:', cljs.core.clj__GT_js(result));
+```
+
+#### Key Sidecar Files
+
+| File | Description |
+|------|-------------|
+| `sidecar/src/logseq/sidecar/server.clj` | Main entry point, starts TCP + WebSocket servers |
+| `sidecar/src/logseq/sidecar/websocket.clj` | WebSocket server (http-kit) |
+| `sidecar/src/logseq/sidecar/protocol.clj` | Transit serialization |
+| `sidecar/src/logseq/sidecar/thread_api.clj` | Database operation handlers |
+| `src/main/frontend/sidecar/core.cljs` | CLJS sidecar integration |
+| `src/main/frontend/sidecar/websocket_client.cljs` | Browser WebSocket client |
 
 ---
 
@@ -567,24 +630,22 @@ winget install --id CoreyButler.NVMforWindows
 nvm install 22
 nvm use 22
 npm install -g yarn
-winget install --id Microsoft.OpenJDK.17
+winget install --id Microsoft.OpenJDK.21
 ```
 
 ---
 
 ## Related Resources
 
-- **Architecture Document**: `X:\source\repos\logseqWinArm64\docs\hybrid-architecture-revised.md`
-- **ARM64 Fork**: https://github.com/johanclawson/logseq-win-arm64
 - **Upstream Logseq**: https://github.com/logseq/logseq
 - **Logseq 0.10.15**: https://github.com/logseq/logseq/releases/tag/0.10.15
+- **ARM64 Fork (archived)**: https://github.com/johanclawson/logseq-win-arm64
 
 ---
 
 ## Links
 
 - **Main Repo**: https://github.com/johanclawson/logsidian (private)
-- **Sidecar Repo**: https://github.com/johanclawson/logsidian-sidecar (private)
 - **Domain**: https://logsidian.com (reserved)
 - **GitHub Org**: https://github.com/logsidian (reserved)
 
