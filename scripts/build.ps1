@@ -187,33 +187,45 @@ function Invoke-NodeBin {
     return 1
 }
 
-# Step 2: Build CSS - run postcss directly
-Write-Host "`n=== Step 2: Building CSS ===" -ForegroundColor Cyan
-$postcssPath = Join-Path $ProjectRoot "node_modules/postcss-cli/index.js"
-& node $postcssPath tailwind.all.css -o static/css/style.css --verbose --env production
+# Step 2: Gulp build (without CSS) + CSS build
+# Run directly using node.exe to avoid yarn path corruption
+Write-Host "`n=== Step 2: Gulp build ===" -ForegroundColor Cyan
+
+$gulpPath = Join-Path $ProjectRoot "node_modules/gulp/bin/gulp.js"
+$nodePath = Join-Path $nodeDir "node.exe"
+
+# Set NODE_ENV for production
+$env:NODE_ENV = "production"
+
+# Run gulp buildNoCSS (avoids yarn css:build which has path corruption)
+Write-Host "Running gulp buildNoCSS..."
+& $nodePath $gulpPath buildNoCSS
 if ($LASTEXITCODE -ne 0) {
-    Write-Host "css:build failed" -ForegroundColor Red
+    Write-Host "gulp buildNoCSS failed" -ForegroundColor Red
     exit $LASTEXITCODE
 }
 
-# Step 3: Gulp build (copy resources) - run gulp directly
-Write-Host "`n=== Step 3: Gulp build ===" -ForegroundColor Cyan
-$gulpPath = Join-Path $ProjectRoot "node_modules/gulp/bin/gulp.js"
-& node $gulpPath build
-# Note: gulp:build may fail on CSS step but still copies resources
-# We don't exit on failure here
+# Build CSS directly with postcss
+Write-Host "`n=== Step 2b: Building CSS ===" -ForegroundColor Cyan
+$postcssPath = Join-Path $ProjectRoot "node_modules/postcss-cli/index.js"
+& $nodePath $postcssPath tailwind.all.css -o static/css/style.css --verbose --env production
+if ($LASTEXITCODE -ne 0) {
+    Write-Host "postcss build failed" -ForegroundColor Red
+    exit $LASTEXITCODE
+}
+Write-Host "CSS build completed successfully" -ForegroundColor Green
 
-# Step 4: Build ClojureScript for Electron
-# This uses shadow-cljs which is a Clojure tool, not Node - should work
-Write-Host "`n=== Step 4: Building ClojureScript ===" -ForegroundColor Cyan
+# Step 3: Build ClojureScript for Electron
+# This uses shadow-cljs which is a Clojure tool, not Node.js - should work
+Write-Host "`n=== Step 3: Building ClojureScript ===" -ForegroundColor Cyan
 & yarn cljs:release-electron
 if ($LASTEXITCODE -ne 0) {
     Write-Host "cljs:release-electron failed" -ForegroundColor Red
     exit $LASTEXITCODE
 }
 
-# Step 5: Build webpack bundles - run webpack directly
-Write-Host "`n=== Step 5: Building webpack bundles ===" -ForegroundColor Cyan
+# Step 4: Build webpack bundles - run webpack directly
+Write-Host "`n=== Step 4: Building webpack bundles ===" -ForegroundColor Cyan
 $webpackPath = Join-Path $ProjectRoot "node_modules/webpack/bin/webpack.js"
 & node $webpackPath --config webpack.config.js
 if ($LASTEXITCODE -ne 0) {
@@ -221,15 +233,29 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 
-# Step 6: Install static dependencies and package
-Write-Host "`n=== Step 6: Packaging Electron app ===" -ForegroundColor Cyan
+# Step 5: Install static dependencies and package
+Write-Host "`n=== Step 5: Packaging Electron app ===" -ForegroundColor Cyan
 Set-Location (Join-Path $ProjectRoot "static")
-& yarn install --ignore-scripts
+
+# Note: We need full install here (no --ignore-scripts) because electron-forge
+# needs its postinstall scripts to set up properly
+& yarn install
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# Run electron-forge make directly to avoid bash path issues
+# Find electron-forge CLI - it may be in different locations depending on yarn version
 $forgePath = Join-Path $PWD "node_modules/@electron-forge/cli/dist/electron-forge.js"
-Write-Host "Running electron-forge make..."
+if (-not (Test-Path $forgePath)) {
+    # Try alternate path (older versions)
+    $forgePath = Join-Path $PWD "node_modules/.bin/electron-forge"
+}
+if (-not (Test-Path $forgePath)) {
+    Write-Host "ERROR: Could not find electron-forge CLI" -ForegroundColor Red
+    Write-Host "Searched: node_modules/@electron-forge/cli/dist/electron-forge.js"
+    Write-Host "Searched: node_modules/.bin/electron-forge"
+    exit 1
+}
+
+Write-Host "Running electron-forge make from: $forgePath"
 & node $forgePath make
 if ($LASTEXITCODE -ne 0) {
     Write-Host "electron:make failed" -ForegroundColor Red

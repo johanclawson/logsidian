@@ -168,6 +168,7 @@
    Returns a promise that resolves when:
    1. The WebSocket is connected
    2. state/*db-worker is set to route through WebSocket sidecar
+   3. Current graph is initialized in sidecar
 
    If connection fails, returns a rejected promise."
   ([] (start-websocket-sidecar! {}))
@@ -179,6 +180,11 @@
                worker-fn (ws-client/create-worker-fn)]
          ;; Set as the db-worker
          (reset! state/*db-worker worker-fn)
+         ;; Initialize current repo in sidecar if one is open
+         (when-let [repo (state/get-current-repo)]
+           (log/info :websocket-sidecar-init-repo {:repo repo})
+           ;; Create or open the graph in sidecar
+           (state/<invoke-db-worker :thread-api/create-or-open-db repo {}))
          (log/info :websocket-sidecar-started {:url url})
          {:type :websocket-sidecar :url url})
        (p/catch (fn [err]
@@ -207,62 +213,91 @@
 ;; =============================================================================
 
 (defn start-db-backend!
-  "Start the database backend - sidecar (Electron IPC or WebSocket) or web worker.
+  "Start the database backend - hybrid (worker + sidecar) or worker only.
 
-   This is the main entry point that replaces start-db-worker! in browser.cljs.
-   It automatically chooses the best backend based on environment:
-   - Electron + sidecar enabled → IPC sidecar (start-sidecar!)
-   - Browser + WebSocket sidecar enabled → WebSocket sidecar (start-websocket-sidecar!)
-   - Otherwise → web worker
+   HYBRID ARCHITECTURE (2025-12-11):
+   The web worker is ALWAYS started first because it handles file parsing via mldoc.
+   mldoc is an OCaml→JavaScript library that can ONLY run in JS environments.
+   The sidecar is then started alongside for efficient queries.
+
+   Flow:
+   1. Start web worker FIRST (for file parsing with mldoc)
+   2. If sidecar enabled, also start sidecar (for queries)
+   3. Initial sync happens on :graph/added event (see initial_sync.cljs)
+   4. Queries route to sidecar once synced
 
    Options:
-   - :prefer-sidecar? - Whether to try sidecar first (default: true when available)
-   - :fallback-on-error? - Fall back to web worker if sidecar fails (default: true)
-   - :on-backend-ready - Callback when backend is ready (receives {:type :sidecar|:websocket-sidecar|:worker})
+   - :prefer-sidecar? - Whether to also start sidecar (default: true when available)
+   - :fallback-on-error? - Continue with worker-only if sidecar fails (default: true)
+   - :on-backend-ready - Callback when backend is ready
+   - :start-web-worker-fn - Function to start the web worker (required)
 
-   Returns a promise that resolves with {:type :sidecar|:websocket-sidecar|:worker}"
+   Returns a promise that resolves with:
+   - {:type :hybrid :worker true :sidecar true} - Worker + sidecar running
+   - {:type :hybrid :worker true :sidecar :websocket} - Worker + WebSocket sidecar
+   - {:type :worker} - Worker only"
   ([] (start-db-backend! {}))
   ([{:keys [prefer-sidecar? fallback-on-error? on-backend-ready start-web-worker-fn]
      :or {prefer-sidecar? true
           fallback-on-error? true}}]
    (let [use-ipc-sidecar? (and prefer-sidecar? (sidecar-enabled?))
          use-ws-sidecar? (and prefer-sidecar? (websocket-sidecar-enabled?))
-         fallback-to-worker (fn [err]
-                              (if (and fallback-on-error? start-web-worker-fn)
-                                (do
-                                  (log/warn :sidecar-fallback-to-worker {:error err})
-                                  (p/let [_ (start-web-worker-fn)]
-                                    (let [result {:type :worker}]
-                                      (when on-backend-ready
-                                        (on-backend-ready result))
-                                      result)))
-                                (throw err)))]
-     (cond
-       ;; Electron: Try IPC sidecar
-       use-ipc-sidecar?
-       (-> (start-sidecar!)
-           (p/then (fn [result]
-                     (when on-backend-ready
-                       (on-backend-ready result))
-                     result))
-           (p/catch fallback-to-worker))
 
-       ;; Browser: Try WebSocket sidecar
-       use-ws-sidecar?
-       (-> (start-websocket-sidecar!)
-           (p/then (fn [result]
-                     (when on-backend-ready
-                       (on-backend-ready result))
-                     result))
-           (p/catch fallback-to-worker))
+         ;; Start sidecar after worker is running (non-blocking, errors logged)
+         start-sidecar-async! (fn []
+                                (cond
+                                  use-ipc-sidecar?
+                                  (-> (start-sidecar!)
+                                      (p/then (fn [_]
+                                                (log/info :hybrid-sidecar-connected {:type :ipc})
+                                                :ipc))
+                                      (p/catch (fn [err]
+                                                 (log/warn :hybrid-sidecar-failed
+                                                           {:type :ipc :error (str err)})
+                                                 nil)))
 
-       ;; Use web worker directly
-       start-web-worker-fn
-       (p/let [_ (start-web-worker-fn)]
-         (let [result {:type :worker}]
-           (when on-backend-ready
-             (on-backend-ready result))
-           result))
+                                  use-ws-sidecar?
+                                  (-> (start-websocket-sidecar!)
+                                      (p/then (fn [_]
+                                                (log/info :hybrid-sidecar-connected {:type :websocket})
+                                                :websocket))
+                                      (p/catch (fn [err]
+                                                 (log/warn :hybrid-sidecar-failed
+                                                           {:type :websocket :error (str err)})
+                                                 nil)))
 
-       :else
-       (p/rejected (ex-info "No backend available" {:type :no-backend}))))))
+                                  :else
+                                  (p/resolved nil)))]
+
+     (if start-web-worker-fn
+       ;; ALWAYS start worker first (required for file parsing)
+       (-> (p/let [_ (do
+                       (log/info :hybrid-starting-worker {})
+                       (start-web-worker-fn))
+                   _ (log/info :hybrid-worker-started {})
+                   ;; Now start sidecar (if enabled) in parallel
+                   ;; Note: Don't block on sidecar - worker is primary for parsing
+                   sidecar-type (when (or use-ipc-sidecar? use-ws-sidecar?)
+                                  (start-sidecar-async!))]
+             (let [result (cond
+                            sidecar-type
+                            {:type :hybrid :worker true :sidecar sidecar-type}
+
+                            (or use-ipc-sidecar? use-ws-sidecar?)
+                            ;; Sidecar was requested but failed - worker-only
+                            {:type :worker :sidecar-requested true}
+
+                            :else
+                            {:type :worker})]
+               (log/info :hybrid-backend-ready result)
+               (when on-backend-ready
+                 (on-backend-ready result))
+               result))
+           (p/catch (fn [err]
+                      ;; Worker failed - this is fatal
+                      (log/error :hybrid-worker-failed {:error err})
+                      (throw err))))
+
+       ;; No worker function provided - cannot start
+       (p/rejected (ex-info "No start-web-worker-fn provided - required for file parsing"
+                            {:type :no-worker-fn}))))))

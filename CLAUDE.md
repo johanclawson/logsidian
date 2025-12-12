@@ -162,6 +162,42 @@ bb lint:large-vars          # Check for overly complex functions
 
 ---
 
+## Electron E2E Testing
+
+E2E tests for the Electron desktop app with sidecar integration use **Playwright Node.js** (not Wally/Java).
+
+**Why Node.js?** Playwright Java does not support Electron ([issue #830](https://github.com/microsoft/playwright-java/issues/830)).
+
+### Running Electron E2E Tests
+
+```bash
+# Prerequisites: Build app and sidecar first
+pwsh -File scripts/build.ps1
+cd sidecar && clj -T:build uberjar && cd ..
+
+# Run all Electron E2E tests
+npx playwright test --config e2e-electron/playwright.config.ts
+
+# Run with visible browser
+npx playwright test --config e2e-electron/playwright.config.ts --headed
+
+# Run specific test
+npx playwright test --config e2e-electron/playwright.config.ts -g "app launches"
+```
+
+### Test Coverage
+
+| Test | Status | Notes |
+|------|--------|-------|
+| App launches and shows UI | ✅ | Sidecar connects, handshake completes |
+| No critical console errors | ✅ | Filters expected errors |
+| Create page | ⏸️ SKIPPED | Needs `:thread-api/apply-outliner-ops` |
+| Create block | ⏸️ SKIPPED | Needs `:thread-api/apply-outliner-ops` |
+
+See `e2e-electron/README.md` for detailed documentation.
+
+---
+
 ## Performance Testing
 
 Performance benchmarks measure baseline metrics before sidecar implementation.
@@ -260,6 +296,93 @@ pwsh -Command "cd 'X:\source\repos\logsidian'; yarn cljs:run-test -i benchmark"
 
 ---
 
+## TDD Workflow for Sidecar Development
+
+The sidecar development uses a Test-Driven Development (TDD) workflow with automated error reporting.
+
+### TDD Loop Script
+
+The primary development tool is `scripts/tdd-loop.ps1`:
+
+```powershell
+# Run sidecar E2E tests once
+.\scripts\tdd-loop.ps1
+
+# Run in watch mode (continuous testing)
+.\scripts\tdd-loop.ps1 -WatchMode
+
+# Run only smoke tests
+.\scripts\tdd-loop.ps1 -TestFilter smoke
+
+# Skip starting sidecar (if already running)
+.\scripts\tdd-loop.ps1 -SkipSidecarStart
+```
+
+**What the script does:**
+1. Builds sidecar JAR if not present
+2. Starts sidecar server if not running
+3. Runs E2E tests with Playwright
+4. Generates error reports on failure
+5. Writes reports to `clj-e2e/error-reports/`
+
+### Claude Code TDD Command
+
+Use the `/tdd` slash command to run the TDD workflow:
+1. Runs tests
+2. Reads error reports
+3. Fixes code
+4. Repeats until tests pass
+
+### Error Reporting Infrastructure
+
+**Files:**
+| File | Purpose |
+|------|---------|
+| `clj-e2e/src/logseq/e2e/error_collector.clj` | Console error collection |
+| `clj-e2e/src/logseq/e2e/test_reporter.clj` | Structured error reports |
+| `clj-e2e/error-reports/latest-tdd.md` | Latest TDD loop report |
+| `clj-e2e/error-reports/latest.edn` | Latest structured report |
+
+**Test metadata:**
+```clojure
+(deftest ^:sidecar ^:smoke my-test ...)  ; Tagged for filtering
+```
+
+Filter options:
+- `-i sidecar` - All sidecar tests
+- `-i smoke` - Quick smoke tests only
+- `-n namespace/test-name` - Single test
+
+### Console Error Assertions
+
+Tests automatically check for console errors:
+
+```clojure
+;; Fixture automatically asserts no console errors
+(use-fixtures :each errors/wrap-assert-no-console-errors)
+
+;; Or check manually in test
+(testing "my operation"
+  (do-something)
+  (errors/assert-no-console-errors!)
+  (errors/assert-no-errors-containing! "sidecar"))
+```
+
+### Running E2E Tests Manually
+
+```bash
+# All sidecar tests
+cd clj-e2e && clj -M:test -i sidecar
+
+# Specific test
+cd clj-e2e && clj -M:test -n logseq.e2e.sidecar-basic-test
+
+# With structured reporting
+cd clj-e2e && clj -M:test-reporter logseq.e2e.sidecar-basic-test
+```
+
+---
+
 ## Architecture
 
 ### Tech Stack
@@ -333,47 +456,86 @@ Large Logseq graphs (10k+ blocks) suffer from:
 
 ### The Solution: JVM Sidecar with Lazy Loading
 
-**Architecture:**
+**Architecture (Sync-Based Model):**
+
+The sidecar cannot parse markdown files directly because Logseq's parser ([mldoc](https://github.com/logseq/mldoc)) is written in OCaml and compiled to JavaScript. Instead, we use a sync-based approach where the Electron main process parses files and syncs datoms to the sidecar.
+
 ```
 ┌─────────────────────────────────────────────────────────────┐
 │                     Electron (Renderer)                      │
 │  ┌─────────────────────────────────────────────────────┐    │
 │  │                 ClojureScript UI                     │    │
-│  │         (existing Logseq frontend code)              │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                           │                                  │
-│                    Transit over IPC                          │
-│                           │                                  │
-└───────────────────────────┼─────────────────────────────────┘
-                            │
-┌───────────────────────────┼─────────────────────────────────┐
-│                     JVM Sidecar                              │
+│  │              (queries go to sidecar)                 │    │
+│  └───────────────────────┬─────────────────────────────┘    │
+│                          │ Transit over IPC                  │
+└──────────────────────────┼──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                   Electron Main Process                      │
 │  ┌─────────────────────────────────────────────────────┐    │
-│  │              DataScript + IStorage                   │    │
-│  │         (lazy loading with soft references)          │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                           │                                  │
-│                      File System                             │
-│                           │                                  │
+│  │              Node.js + mldoc                         │    │
+│  │         (parses files, syncs to sidecar)             │    │
+│  └───────────────────────┬─────────────────────────────┘    │
+│                          │ Transit over TCP                  │
+└──────────────────────────┼──────────────────────────────────┘
+                           │
+┌──────────────────────────▼──────────────────────────────────┐
+│                   JVM Sidecar                                │
 │  ┌─────────────────────────────────────────────────────┐    │
-│  │              Markdown/Org-mode Files                 │    │
-│  │           (source of truth, unchanged)               │    │
+│  │           DataScript + IStorage (lazy loading)       │    │
+│  │                 SQLite-JDBC backing                  │    │
 │  └─────────────────────────────────────────────────────┘    │
 └─────────────────────────────────────────────────────────────┘
 ```
 
 **Key Components:**
-1. **DataScript IStorage**: JVM-only protocol enabling lazy loading with soft references
+1. **DataScript IStorage**: JVM-only protocol enabling lazy loading with soft references ([docs](https://github.com/tonsky/datascript/blob/master/docs/storage.md))
 2. **Transit Serialization**: Already used in Logseq worker communication
-3. **Named Pipes (Windows)**: Fast IPC with sub-millisecond latency
-4. **Soft References**: JVM garbage collector automatically evicts unused data
+3. **Soft References**: JVM garbage collector automatically evicts unused data
+4. **SQLite-JDBC**: Persistent storage for lazy-loaded datoms
+
+### What the Sidecar Handles
+
+- ✅ DataScript queries (`q`, `pull`, `pull-many`, `datoms`)
+- ✅ Transactions (`transact`)
+- ✅ Graph CRUD operations
+- ✅ Lazy loading via IStorage (the key performance win)
+
+### What the Sidecar Does NOT Handle
+
+Vector search stays in the browser where it has WebGPU acceleration:
+- ❌ Text embeddings (@huggingface/transformers)
+- ❌ HNSW index (hnswlib-wasm)
+- ❌ ML model inference
+
+The vec-search operations in `server.clj` return "not configured" responses, which is correct - the frontend handles this gracefully.
 
 ### Why JVM?
 
-- **DataScript IStorage is JVM-only**: The lazy loading protocol only exists in JVM DataScript
-- **Soft References**: JVM GC can automatically manage memory pressure
+- **Soft References**: JVM GC can automatically evict unused data under memory pressure - JavaScript has no equivalent
+- **Memory management**: The `:ref-type :soft` option in JVM DataScript enables true lazy loading where unused B-tree nodes are automatically unloaded
 - **Clojure compatibility**: Same language as ClojureScript, easy code sharing
 - **Proven technology**: DataScript on JVM is battle-tested
+
+### Note: Logseq's CLJS IStorage Fork
+
+Logseq has forked DataScript and **ported IStorage to ClojureScript** ([logseq/datascript](https://github.com/logseq/datascript)). This means:
+
+- ✅ Incremental storage works (only changed B-tree nodes written to SQLite)
+- ✅ Lazy restore from SQLite works (nodes loaded on demand)
+- ❌ **No soft references** - JavaScript has no equivalent to Java's `SoftReference`
+- ❌ **No automatic memory eviction** - Once loaded, data stays in memory until page refresh
+
+**The real performance bottleneck** is in `deps/db/src/logseq/db/common/initial_data.cljs`:
+```clojure
+;; Line 360-362: load ALL pages for file graphs at startup
+(->> (d/datoms db :avet :block/name)
+     (mapcat (fn [d] (d/datoms db :eavt (:e d)))))
+```
+
+This loads every page's datoms into memory at startup, regardless of platform (desktop, mobile, browser).
+
+**The JVM sidecar advantage**: With `:ref-type :soft`, the JVM can automatically evict unused B-tree nodes when memory is low, then lazily reload them from SQLite when needed again. This is impossible in JavaScript.
 
 ### Project Structure
 
@@ -390,16 +552,36 @@ logsidian/                        # Main app (AGPL-3.0)
 
 ### Implementation Phases
 
-1. **Phase 0: Validation** - Test JVM startup time, IPC latency
-2. **Phase 1: Read Path** - Lazy loading for queries
-3. **Phase 2: Write Path** - Transaction handling
-4. **Phase 3: Integration** - Full file-based graph support
+1. **Phase 0: Testing Infrastructure** ✅ - TDD workflow, error reporting, E2E tests
+2. **Phase 1.1: IStorage with SQLite-JDBC** ✅ - `storage.clj` implements lazy loading (11 tests)
+3. **Phase 1.2: Datom Sync** ✅ - `sync-datoms` operation, storage integration (6 tests)
+4. **Phase 1.3: Outliner Operations** ✅ - Full outliner with 11 operations
+   - Block ops: save, insert, delete, move, up/down, indent/outdent
+   - Page ops: create, rename, delete
+   - Import ops: batch-import-edn
+5. **Phase 2: Electron Integration** ✅ - Complete sidecar integration
+   - ✅ Phase 2.1: Main process sidecar bridge
+   - ✅ Phase 2.2: File write-back
+     - Affected pages tracking in outliner ops
+     - Page tree export (`get-page-trees`)
+     - Markdown serialization (`file-export.clj`)
+     - `:thread-api/get-file-writes` handler
+   - ✅ Phase 2.3: Initial file sync on graph open
+     - `initial_sync.cljs` - Full graph datom sync
+     - Wired into `:graph/added` event and graph-switch
+   - ✅ Phase 2.4: File watcher integration
+     - `file_sync.cljs` - Incremental sync on file changes
+     - Wired into `watcher_handler.cljs`
+     - `:thread-api/delete-page` handler for deletions
+6. **Phase 3: E2E Tests** 📋 - Full Playwright test suite
+
+**Current focus:** Phase 3 - E2E tests with Playwright
 
 ### Sidecar Development & Testing
 
 The sidecar has two communication paths:
-- **Electron (IPC)**: Desktop app uses TCP socket via main process IPC
-- **Browser (WebSocket)**: Web app connects directly via WebSocket
+- **Electron (IPC)**: Desktop app uses TCP socket via main process IPC - **PRIMARY PATH**
+- **Browser (WebSocket)**: Web app connects directly via WebSocket - **ON HOLD** (see below)
 
 #### Running the Sidecar
 
@@ -415,49 +597,223 @@ cd sidecar && java -jar target/logsidian-sidecar.jar
 # - WebSocket port 47633 (for browser)
 ```
 
-#### Testing with Playwright MCP
+#### Running Sidecar JVM Tests
 
-To test the sidecar from a browser, you need to:
-1. Start the dev server (`yarn watch` or `clojure -M:cljs watch app`)
-2. Start the sidecar (`java -jar sidecar/target/logsidian-sidecar.jar`)
-3. Enable WebSocket sidecar mode in the browser
+```bash
+# Run all sidecar tests
+cd sidecar && clj -M:test
 
-**Enable WebSocket sidecar in browser console or via Playwright:**
+# Run specific test namespace
+cd sidecar && clj -M:test -n logseq.sidecar.storage-test
+cd sidecar && clj -M:test -n logseq.sidecar.sync-test
+
+# Run multiple namespaces
+cd sidecar && clj -M:test -n logseq.sidecar.storage-test -n logseq.sidecar.sync-test
+```
+
+**Current test coverage:**
+
+*JVM Sidecar Tests:*
+| Test File | Tests | Assertions | Status |
+|-----------|-------|------------|--------|
+| `storage_test.clj` | 11 | 22 | ✅ All passing |
+| `sync_test.clj` | 6 | 13 | ✅ All passing |
+| `outliner_test.clj` | 17 | 97 | ✅ All passing |
+| `file_export_test.clj` | 4 | 26 | ✅ All passing |
+| `protocol_test.clj` | 6 | 17 | ✅ All passing |
+| `validation_test.clj` | 4 | 8 | ✅ All passing |
+| `server_test.clj` | 18 | 27+ | ✅ All passing (some port conflicts in parallel) |
+
+**JVM Core unit tests: 66 tests, 230 assertions**
+
+*CLJS Sidecar Tests:*
+| Test File | Tests | Assertions | Status |
+|-----------|-------|------------|--------|
+| `initial_sync_test.cljs` | 6 | 281 | ✅ All passing |
+| `file_sync_test.cljs` | 6 | 39 | ✅ All passing |
+
+**CLJS Sidecar tests: 12 tests, 320 assertions**
+
+#### Key Sidecar Operations
+
+**Graph Management:**
+```clojure
+;; Create graph with optional SQLite storage and soft references
+(server/create-graph server "repo-id" {:storage-path ":memory:"  ; or "/path/to.db"
+                                        :ref-type :soft})          ; enables lazy loading
+
+;; List graphs
+(invoke :thread-api/list-db [])
+
+;; Remove graph (closes storage)
+(server/remove-graph server "repo-id")
+```
+
+**Datom Sync (for populating from main process):**
+```clojure
+;; Datom format: [entity-id attr value tx added?]
+;; added? = true for assertions, false for retractions
+(invoke :thread-api/sync-datoms
+        ["repo-id"
+         [[1 :block/name "page1" 1000 true]
+          [1 :block/uuid #uuid "..." 1000 true]]
+         {:full-sync? true}])
+```
+
+**Queries:**
+```clojure
+(invoke :thread-api/q ["repo-id" ['{:find [?e] :where [[?e :block/name _]]}]])
+(invoke :thread-api/pull ["repo-id" '[*] [:block/name "page1"]])
+(invoke :thread-api/datoms ["repo-id" :avet :block/name])
+```
+
+**Outliner Operations (via `apply-outliner-ops`):**
+```clojure
+;; Block operations
+(invoke :thread-api/apply-outliner-ops
+        ["repo-id"
+         [[:save-block [{:block/uuid uuid :block/content "Updated"} {}]]
+          [:insert-blocks [[{:block/content "New"}] target-id {:sibling? true}]]
+          [:delete-blocks [[block-id] {:children? true}]]
+          [:move-blocks [[block-id] target-id {:sibling? true}]]
+          [:move-blocks-up-down [[block-id] true]]  ; true=up, false=down
+          [:indent-outdent-blocks [[block-id] true {}]]]  ; true=indent, false=outdent
+         {}])
+
+;; Page operations
+(invoke :thread-api/apply-outliner-ops
+        ["repo-id"
+         [[:create-page ["Page Title" {:format :markdown}]]
+          [:rename-page [page-uuid "New Title"]]
+          [:delete-page [page-uuid]]]
+         {}])
+
+;; Batch import
+(invoke :thread-api/apply-outliner-ops
+        ["repo-id"
+         [[:batch-import-edn [{:blocks [{:uuid uuid
+                                          :title "Page"
+                                          :children [{:content "Block"}]}]}
+                              {}]]]
+         {}])
+```
+
+**Page Sync Operations (Phase 2.3/2.4):**
+```clojure
+;; Delete page from sidecar (used by file watcher on file delete)
+(invoke :thread-api/delete-page ["repo-id" "page-name" {}])
+
+;; Get page trees for file serialization
+(invoke :thread-api/get-page-trees ["repo-id" [page-id-1 page-id-2]])
+
+;; Get file writes (markdown content) for pages
+(invoke :thread-api/get-file-writes ["repo-id" [page-id-1 page-id-2] "/graph/path" {}])
+```
+
+#### WebSocket Path Status (ON HOLD)
+
+The WebSocket implementation is **functional but incomplete**. Current state:
+- ✅ WebSocket server starts and accepts connections
+- ✅ Transit serialization works (with datascript-transit handlers)
+- ✅ Browser client connects and can send requests
+- ❌ **Data sync issue**: Browser has graph data in IndexedDB, sidecar has empty DB
+
+**Why it's on hold:** The WebSocket path requires syncing data FROM the browser TO the sidecar, which partially defeats the lazy loading purpose. The Electron path is the primary target because:
+1. Main process can parse files directly and sync to sidecar
+2. This is the actual production architecture
+3. Lazy loading via IStorage works correctly with synced data
+
+**To fix WebSocket path (future work):**
+1. Export graph datoms from browser's IndexedDB/web worker
+2. Send to sidecar via `thread-api/sync-datoms` (new endpoint needed)
+3. Or use FileSystem Access API to let sidecar access files directly
+
+#### E2E Testing with Playwright (Recommended)
+
+The project has a comprehensive e2e test framework in `clj-e2e/` using [Wally](https://github.com/logseq/wally) (Clojure Playwright wrapper):
+
+```bash
+# Start the web app
+yarn watch
+
+# Start the sidecar (optional, for sidecar tests)
+cd sidecar && java -jar target/logsidian-sidecar.jar
+
+# Run e2e tests
+cd clj-e2e
+clojure -M:test                                    # All tests
+clojure -M:test -n logseq.e2e.sidecar-basic-test   # Sidecar tests only
+```
+
+**E2E test features:**
+- Console log capture (detects errors automatically)
+- Screenshot on failure
+- Page/block operations
+- Sidecar-specific tests in `test/logseq/e2e/sidecar_basic_test.clj`
+
+#### Manual Browser Testing (WebSocket - ON HOLD)
+
+If you need to test WebSocket connectivity manually:
 
 ```javascript
-// Option 1: Via localStorage (persists across page reloads)
+// Enable WebSocket sidecar in browser console
 localStorage.setItem('sidecar-websocket-enabled', 'true');
 location.reload();
 
-// Option 2: Via CLJS API (programmatic, for testing)
+// Or programmatically
 frontend.sidecar.core.force_enable_websocket_sidecar_BANG_();
 await frontend.sidecar.core.start_websocket_sidecar_BANG_();
 
 // Verify connection
-frontend.sidecar.websocket_client.connected_QMARK_();  // should return true
-frontend.sidecar.websocket_client.status();            // shows connection details
+frontend.sidecar.websocket_client.connected_QMARK_();  // true
+frontend.sidecar.websocket_client.status();            // connection details
 ```
 
-**Test a sidecar request:**
-```javascript
-// Send a test request to the sidecar
-const result = await frontend.sidecar.websocket_client.send_request(
-  cljs.core.keyword('thread-api/list-db'),
-  cljs.core.clj__GT_js({ args: [] })
-);
-console.log('Result:', cljs.core.clj__GT_js(result));
-```
+**Note:** WebSocket connection will succeed but queries will return empty results because the sidecar doesn't have the graph data.
 
 #### Key Sidecar Files
 
+**JVM Sidecar (MIT License):**
 | File | Description |
 |------|-------------|
-| `sidecar/src/logseq/sidecar/server.clj` | Main entry point, starts TCP + WebSocket servers |
-| `sidecar/src/logseq/sidecar/websocket.clj` | WebSocket server (http-kit) |
-| `sidecar/src/logseq/sidecar/protocol.clj` | Transit serialization |
-| `sidecar/src/logseq/sidecar/thread_api.clj` | Database operation handlers |
-| `src/main/frontend/sidecar/core.cljs` | CLJS sidecar integration |
-| `src/main/frontend/sidecar/websocket_client.cljs` | Browser WebSocket client |
+| `sidecar/src/logseq/sidecar/server.clj` | Main entry point, operation handlers, graph management |
+| `sidecar/src/logseq/sidecar/storage.clj` | ✅ IStorage implementation with SQLite-JDBC backing |
+| `sidecar/src/logseq/sidecar/outliner.clj` | ✅ Outliner ops (11 ops), affected pages tracking, page tree export |
+| `sidecar/src/logseq/sidecar/file_export.clj` | ✅ Markdown serialization for file writes |
+| `sidecar/src/logseq/sidecar/pipes.clj` | ✅ TCP socket server for Electron IPC |
+| `sidecar/src/logseq/sidecar/websocket.clj` | WebSocket server (http-kit) - ON HOLD |
+| `sidecar/src/logseq/sidecar/protocol.clj` | Transit serialization with datascript-transit handlers |
+
+**JVM Sidecar Tests:**
+| File | Description |
+|------|-------------|
+| `sidecar/test/logseq/sidecar/storage_test.clj` | ✅ 11 tests for IStorage/SQLite |
+| `sidecar/test/logseq/sidecar/sync_test.clj` | ✅ 6 tests for datom sync + storage integration |
+| `sidecar/test/logseq/sidecar/outliner_test.clj` | ✅ 17 tests for outliner + file sync (97 assertions) |
+| `sidecar/test/logseq/sidecar/protocol_test.clj` | ✅ 6 tests for Transit serialization |
+| `sidecar/test/logseq/sidecar/server_test.clj` | ✅ 18 tests for server integration |
+
+**ClojureScript Client:**
+| File | Description |
+|------|-------------|
+| `src/main/frontend/sidecar/core.cljs` | Main entry point, `start-db-backend!` |
+| `src/main/frontend/sidecar/client.cljs` | IPC client for Electron |
+| `src/main/frontend/sidecar/initial_sync.cljs` | ✅ Full graph sync on graph open |
+| `src/main/frontend/sidecar/file_sync.cljs` | ✅ Incremental sync on file changes |
+| `src/main/frontend/sidecar/websocket_client.cljs` | WebSocket client for browser (ON HOLD) |
+| `src/main/frontend/sidecar/spawn.cljs` | JVM process spawning |
+
+**ClojureScript Tests:**
+| File | Description |
+|------|-------------|
+| `src/test/frontend/sidecar/initial_sync_test.cljs` | ✅ 6 tests for datom extraction, batching |
+| `src/test/frontend/sidecar/file_sync_test.cljs` | ✅ 6 tests for page sync, entity extraction |
+
+**E2E Tests:**
+| File | Description |
+|------|-------------|
+| `clj-e2e/test/logseq/e2e/sidecar_basic_test.clj` | Sidecar-specific e2e tests |
+| `clj-e2e/test/logseq/e2e/fixtures.clj` | Test fixtures with console log capture |
 
 ---
 
@@ -522,6 +878,30 @@ Claude Code's bash environment uses cygpath to translate Windows paths, which ca
 ```bash
 cmd.exe /c "nvm use 22.21.0"
 ```
+
+### Running PowerShell Scripts from Claude Code
+
+**IMPORTANT:** When running PowerShell scripts that use yarn/npm, start them in a **separate Windows Terminal** to avoid inheriting the corrupted environment from Claude Code's bash shell.
+
+**Option 1: Use `wt.exe` to spawn a new terminal:**
+```bash
+wt.exe -d "X:\source\repos\logsidian" pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+```
+
+**Option 2: Use `Start-Process` from PowerShell to spawn isolated process:**
+```powershell
+Start-Process -FilePath "pwsh" -ArgumentList "-NoProfile", "-ExecutionPolicy", "Bypass", "-File", "scripts/build.ps1" -WorkingDirectory "X:\source\repos\logsidian" -Wait
+```
+
+**Option 3: Run node.exe directly** (avoids yarn entirely):
+```powershell
+# In scripts/build.ps1, use direct node paths:
+$nodePath = "C:\Users\johan\AppData\Local\nvm\v22.21.0\node.exe"
+& $nodePath "node_modules/gulp/bin/gulp.js" buildNoCSS
+& $nodePath "node_modules/postcss-cli/index.js" tailwind.all.css -o static/css/style.css
+```
+
+**Why this matters:** Claude Code's bash environment sets environment variables that corrupt Windows paths when yarn spawns child processes. Starting a fresh terminal or using direct node.exe avoids inheriting these variables.
 
 ### Complete Local Build Process (Windows)
 

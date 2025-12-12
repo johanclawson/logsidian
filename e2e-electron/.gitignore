@@ -1,0 +1,7 @@
+# Test artifacts
+screenshots/
+test-results/
+playwright-report/
+
+# Keep the directories
+!screenshots/.gitkeep

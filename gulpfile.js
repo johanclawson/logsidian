@@ -303,3 +303,7 @@ exports.build = gulp.series(common.clean, common.syncResourceFile,
   common.syncAssetFiles, css.buildCSS)
 exports.buildMobile = gulp.series(common.clean, common.syncResourceFile,
   common.syncAssetFiles, css.buildMobileCSS)
+
+// Build without CSS - for use when CSS is built separately (e.g., via scripts/build.ps1)
+// This avoids yarn path corruption issues in Claude Code's bash environment
+exports.buildNoCSS = gulp.series(common.clean, common.syncResourceFile, common.syncAssetFiles)

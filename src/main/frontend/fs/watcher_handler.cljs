@@ -14,6 +14,7 @@
             [frontend.handler.notification :as notification]
             [frontend.handler.page :as page-handler]
             [frontend.handler.ui :as ui-handler]
+            [frontend.sidecar.file-sync :as sidecar-file-sync]
             [frontend.state :as state]
             [frontend.util.fs :as fs-util]
             [lambdaisland.glogi :as log]
@@ -59,7 +60,9 @@
                                                             :fs/event :fs/local-file-change
                                                             :ctime ctime
                                                             :mtime mtime})]
-        (set-missing-block-ids! content)))))
+        (set-missing-block-ids! content)
+        ;; Sync file change to sidecar (async, non-blocking)
+        (sidecar-file-sync/sync-file-change! repo path)))))
 
 (defn handle-changed!
   [type {:keys [dir path content stat global-dir] :as payload}]
@@ -104,6 +107,8 @@
                   (when dir-exists?
                     (when-let [page-name (file-model/get-file-page path)]
                       (println "Delete page: " page-name ", file path: " path ".")
+                      ;; Sync deletion to sidecar before deleting from frontend
+                      (sidecar-file-sync/sync-file-delete! repo page-name)
                       (page-handler/<delete! page-name #()))))
 
           ;; global config handling

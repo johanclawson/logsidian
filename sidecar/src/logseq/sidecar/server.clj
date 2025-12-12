@@ -12,8 +12,11 @@
    - Each operation is dispatched to the appropriate handler"
   (:require [clojure.tools.logging :as log]
             [datascript.core :as d]
+            [logseq.sidecar.file-export :as file-export]
+            [logseq.sidecar.outliner :as outliner]
             [logseq.sidecar.pipes :as pipes]
             [logseq.sidecar.protocol :as protocol]
+            [logseq.sidecar.storage :as storage]
             [logseq.sidecar.websocket :as websocket])
   (:import [java.util.concurrent ConcurrentHashMap])
   (:gen-class))
@@ -111,23 +114,55 @@
 
 (defn create-graph
   "Create a new graph with the given ID.
-   Returns the graph-id on success, nil on failure."
-  [^SidecarServer server graph-id {:keys [schema] :or {schema base-schema}}]
+   Returns the graph-id on success, nil on failure.
+
+   Options:
+   - :schema - DataScript schema (default: base-schema)
+   - :storage-path - Path to SQLite database for persistence.
+                     Use \":memory:\" for in-memory storage.
+                     If nil, uses plain DataScript without persistence.
+   - :ref-type - Reference type (:soft for soft references, nil for strong).
+                 Soft references allow GC to reclaim memory under pressure."
+  [^SidecarServer server graph-id {:keys [schema storage-path ref-type]
+                                   :or {schema base-schema}}]
   (let [graphs ^ConcurrentHashMap (:graphs server)]
     (if (.containsKey graphs graph-id)
       (do
         (log/warn "Graph already exists:" graph-id)
         graph-id)
-      (let [conn (d/create-conn schema)]
-        (.put graphs graph-id {:conn conn :schema schema})
-        (log/info "Created graph:" graph-id)
+      (let [;; Create storage if path provided
+            storage (when storage-path
+                      (storage/create-sqlite-storage storage-path))
+            ;; Build connection options
+            conn-opts (cond-> {}
+                        storage (assoc :storage storage)
+                        ref-type (assoc :ref-type ref-type))
+            ;; Create connection with or without storage
+            conn (if (empty? conn-opts)
+                   (d/create-conn schema)
+                   (d/create-conn schema conn-opts))]
+        (.put graphs graph-id {:conn conn
+                               :schema schema
+                               :storage storage
+                               :storage-path storage-path})
+        (log/info "Created graph:" graph-id
+                  {:storage-path storage-path
+                   :ref-type ref-type
+                   :has-storage (some? storage)})
         graph-id))))
 
 (defn remove-graph
-  "Remove a graph from the server."
+  "Remove a graph from the server.
+   Also closes the storage if it exists."
   [^SidecarServer server graph-id]
-  (let [graphs ^ConcurrentHashMap (:graphs server)]
+  (let [graphs ^ConcurrentHashMap (:graphs server)
+        graph-info (.get graphs graph-id)]
     (when (.remove graphs graph-id)
+      ;; Close storage if it exists and implements Closeable
+      (when-let [storage (:storage graph-info)]
+        (when (instance? java.io.Closeable storage)
+          (.close ^java.io.Closeable storage)
+          (log/info "Closed storage for graph:" graph-id)))
       (log/info "Removed graph:" graph-id)
       true)))
 
@@ -143,36 +178,179 @@
     (:conn graph-info)))
 
 ;; =============================================================================
+;; CLJS-to-CLJ Data Normalization
+;; =============================================================================
+;;
+;; When data is sent from CLJS through Transit via Electron IPC, type information
+;; can be lost. Keywords become strings, symbols become strings, etc.
+;; These functions normalize the data back to proper Clojure types.
+
+(def ^:private datalog-clause-names
+  "Known Datalog clause names that should be keywords."
+  #{"find" "where" "in" "with" "keys" "strs" "syms"})
+
+(defn- query-variable?
+  "Check if s looks like a Datalog query variable or special symbol."
+  [s]
+  (let [s-str (str s)]
+    (or (clojure.string/starts-with? s-str "?")
+        (= s-str "_")      ;; Wildcard
+        (= s-str "...")    ;; Spread operator
+        (= s-str "pull")   ;; Pull keyword in query
+        (= s-str "*"))))   ;; Wildcard for pull patterns
+
+(defn normalize-cljs-data
+  "Recursively normalize CLJS data that may have lost type information.
+
+   Handles:
+   - Namespaced strings (foo/bar) → keywords (:foo/bar)
+   - Datalog clause names (find, where) → keywords (:find, :where)
+   - Query variables (?e, ?name, _) → symbols
+   - Vectors, lists, maps → recursively normalized
+   - Numbers, booleans, nil → unchanged
+
+   This is the core fix for Transit serialization issues between CLJS and CLJ."
+  [data]
+  (cond
+    ;; Already a keyword - keep as is
+    (keyword? data)
+    data
+
+    ;; Vectors - recurse into them
+    (vector? data)
+    (mapv normalize-cljs-data data)
+
+    ;; Lists - recurse (for pull patterns etc)
+    (list? data)
+    (map normalize-cljs-data data)
+
+    ;; Sets - recurse
+    (set? data)
+    (set (map normalize-cljs-data data))
+
+    ;; Maps - normalize both keys and values
+    (map? data)
+    (into {} (map (fn [[k v]]
+                    [(normalize-cljs-data k) (normalize-cljs-data v)])
+                  data))
+
+    ;; Strings or symbols that might need conversion
+    (or (string? data) (symbol? data))
+    (let [s (str data)]
+      (cond
+        ;; Datalog clause names become keywords
+        (contains? datalog-clause-names s)
+        (keyword s)
+
+        ;; Query variables stay as symbols
+        (query-variable? s)
+        (symbol s)
+
+        ;; Namespaced names (foo/bar) become keywords
+        ;; This handles attribute names like block/name → :block/name
+        (clojure.string/includes? s "/")
+        (let [[ns name] (clojure.string/split s #"/" 2)]
+          (keyword ns name))
+
+        ;; Plain strings without namespace - keep as is (might be literal values)
+        :else
+        data))
+
+    ;; Everything else (numbers, booleans, nil) - keep as is
+    :else
+    data))
+
+;; =============================================================================
 ;; DataScript Operations
 ;; =============================================================================
+
+(defn- normalize-query
+  "Normalize query format from CLJS frontend.
+   Uses normalize-cljs-data for the heavy lifting."
+  [query-form]
+  (let [result (normalize-cljs-data query-form)]
+    (when-not (= query-form result)
+      (log/debug "normalize-query" {:changed? true
+                                    :sample-original (take 3 query-form)
+                                    :sample-result (take 3 result)}))
+    result))
 
 (defn query
   "Execute a Datalog query on a graph."
   [^SidecarServer server graph-id query-form inputs]
-  (if-let [conn (get-conn server graph-id)]
-    (apply d/q query-form @conn inputs)
-    (throw (ex-info "Graph not found" {:graph-id graph-id}))))
+  (let [normalized (normalize-query query-form)]
+    (log/debug "query" {:graph-id graph-id
+                        :original query-form
+                        :normalized normalized
+                        :query-type (type query-form)})
+    (if-let [conn (get-conn server graph-id)]
+      (apply d/q normalized @conn inputs)
+      (throw (ex-info "Graph not found" {:graph-id graph-id})))))
 
 (defn transact!
   "Execute a transaction on a graph.
+   Normalizes tx-data to handle CLJS data type issues.
    Returns the transaction report."
   [^SidecarServer server graph-id tx-data]
   (if-let [conn (get-conn server graph-id)]
-    (d/transact! conn tx-data)
+    (let [normalized-tx (normalize-cljs-data tx-data)]
+      (d/transact! conn normalized-tx))
     (throw (ex-info "Graph not found" {:graph-id graph-id}))))
 
+(defn- normalize-eid
+  "Normalize an entity ID for DataScript.
+   Handles:
+   - Numbers (db/id) - pass through
+   - Keywords (:block/uuid) - pass through
+   - Vectors (lookup refs) - normalize only the attribute (first element)
+   - Strings with / that look like attributes - convert to keyword"
+  [eid]
+  (cond
+    ;; Already a number or keyword - pass through
+    (or (number? eid) (keyword? eid))
+    eid
+
+    ;; Lookup ref vector like ["file/path" "logseq/config.edn"]
+    ;; Only the first element (attribute) should be a keyword
+    ;; The second element (value) should stay as-is
+    (and (vector? eid) (= 2 (count eid)))
+    (let [[attr val] eid
+          normalized-attr (if (and (string? attr) (clojure.string/includes? attr "/"))
+                            (let [[ns name] (clojure.string/split attr #"/" 2)]
+                              (keyword ns name))
+                            (if (string? attr)
+                              (keyword attr)
+                              attr))]
+      [normalized-attr val])
+
+    ;; Other - try generic normalization (might be an entity map or something)
+    :else
+    (normalize-cljs-data eid)))
+
 (defn pull
-  "Pull an entity from a graph."
+  "Pull an entity from a graph.
+   Normalizes selector and eid to handle CLJS data type issues."
   [^SidecarServer server graph-id selector eid]
   (if-let [conn (get-conn server graph-id)]
-    (d/pull @conn selector eid)
+    (let [;; Normalize selector (pull pattern) - converts strings like "block/name" to :block/name
+          normalized-selector (normalize-cljs-data selector)
+          ;; Normalize eid - special handling for lookup refs
+          normalized-eid (normalize-eid eid)]
+      (log/debug "pull" {:selector selector
+                         :normalized-selector normalized-selector
+                         :eid eid
+                         :normalized-eid normalized-eid})
+      (d/pull @conn normalized-selector normalized-eid))
     (throw (ex-info "Graph not found" {:graph-id graph-id}))))
 
 (defn pull-many
-  "Pull multiple entities from a graph."
+  "Pull multiple entities from a graph.
+   Normalizes selector and eids to handle CLJS data type issues."
   [^SidecarServer server graph-id selector eids]
   (if-let [conn (get-conn server graph-id)]
-    (d/pull-many @conn selector eids)
+    (let [normalized-selector (normalize-cljs-data selector)
+          normalized-eids (mapv normalize-eid eids)]
+      (d/pull-many @conn normalized-selector normalized-eids))
     (throw (ex-info "Graph not found" {:graph-id graph-id}))))
 
 (defn- datom->vec
@@ -183,10 +361,70 @@
 
 (defn datoms
   "Get datoms from a graph by index.
+   Normalizes index and components to handle CLJS data type issues.
    Returns vectors instead of Datom objects for Transit serialization."
   [^SidecarServer server graph-id index & components]
   (if-let [conn (get-conn server graph-id)]
-    (mapv datom->vec (apply d/datoms @conn index components))
+    (let [normalized-index (normalize-cljs-data index)
+          normalized-components (mapv normalize-cljs-data components)]
+      (mapv datom->vec (apply d/datoms @conn normalized-index normalized-components)))
+    (throw (ex-info "Graph not found" {:graph-id graph-id}))))
+
+;; =============================================================================
+;; Datom Sync Operations
+;; =============================================================================
+
+(defn- datom-vec->tx-data
+  "Convert a datom vector [e a v tx added?] to transaction data.
+   For assertions (added?=true): [:db/add e a v]
+   For retractions (added?=false): [:db/retract e a v]"
+  [[e a v _tx added?]]
+  (if added?
+    [:db/add e a v]
+    [:db/retract e a v]))
+
+(defn sync-datoms
+  "Sync datom batches from the main process into the sidecar's DataScript database.
+
+   This is the core mechanism for keeping the sidecar in sync with the main process.
+   The main process sends datoms after parsing files or receiving edits.
+
+   Arguments:
+   - server: The SidecarServer instance
+   - graph-id: The graph/repo identifier
+   - datoms: Vector of datom vectors [e a v tx added?]
+   - opts: Options map with:
+     - :full-sync? - If true, this is an initial full sync (clears existing data first)
+
+   Returns a map with sync statistics."
+  [^SidecarServer server graph-id datoms opts]
+  (if-let [conn (get-conn server graph-id)]
+    (let [start-time (System/currentTimeMillis)
+          full-sync? (:full-sync? opts)
+
+          ;; For full sync, we could clear the DB first, but for now we just
+          ;; apply all datoms. This works because we use entity IDs from the
+          ;; source, not tempids.
+          _ (when full-sync?
+              (log/info "Full sync starting for" graph-id "with" (count datoms) "datoms"))
+
+          ;; Convert datom vectors to transaction data
+          tx-data (mapv datom-vec->tx-data datoms)
+
+          ;; Apply transaction
+          tx-report (d/transact! conn tx-data)
+
+          elapsed (- (System/currentTimeMillis) start-time)]
+
+      (log/info "Sync completed for" graph-id
+                {:datom-count (count datoms)
+                 :elapsed-ms elapsed
+                 :full-sync? full-sync?})
+
+      {:datom-count (count datoms)
+       :elapsed-ms elapsed
+       :tx-data-count (count tx-data)})
+
     (throw (ex-info "Graph not found" {:graph-id graph-id}))))
 
 ;; =============================================================================
@@ -425,6 +663,19 @@
             (protocol/make-response op result id))
 
           ;; ============================================
+          ;; Datom Sync Operations
+          ;; ============================================
+
+          :thread-api/sync-datoms
+          ;; Sync datom batches from main process
+          ;; Signature: [repo datoms opts]
+          ;; datoms = [[e a v tx added?] ...]
+          ;; opts = {:full-sync? bool}
+          (let [[repo datoms opts] (:args payload)
+                result (sync-datoms server repo datoms (or opts {}))]
+            (protocol/make-response op result id))
+
+          ;; ============================================
           ;; Database existence check
           ;; ============================================
 
@@ -433,6 +684,95 @@
           (let [[repo] (:args payload)
                 exists (graph-exists? server repo)]
             (protocol/make-response op exists id))
+
+          ;; ============================================
+          ;; Page Operations
+          ;; ============================================
+
+          :thread-api/delete-page
+          ;; Delete a page and all its blocks from the sidecar DB
+          ;; Signature: [repo page-name opts]
+          ;; Used when files are deleted from disk
+          (let [[repo page-name _opts] (:args payload)]
+            (if-let [conn (get-conn server repo)]
+              (let [db @conn
+                    ;; Find page by name
+                    page-id (d/q '[:find ?e .
+                                   :in $ ?name
+                                   :where [?e :block/name ?name]]
+                                 db (clojure.string/lower-case page-name))]
+                (if page-id
+                  (let [;; Find all blocks belonging to this page
+                        block-ids (d/q '[:find [?b ...]
+                                         :in $ ?page-id
+                                         :where [?b :block/page ?page-id]]
+                                       db page-id)
+                        ;; Retract page and all its blocks
+                        retractions (concat
+                                     [[:db.fn/retractEntity page-id]]
+                                     (map (fn [bid] [:db.fn/retractEntity bid]) block-ids))]
+                    (d/transact! conn retractions)
+                    (log/info "Deleted page from sidecar" {:page page-name
+                                                           :page-id page-id
+                                                           :blocks-deleted (count block-ids)})
+                    (protocol/make-response op {:deleted true
+                                                :page-id page-id
+                                                :blocks-deleted (count block-ids)} id))
+                  ;; Page not found, just return success (idempotent)
+                  (do
+                    (log/debug "Page not found in sidecar for deletion" {:page page-name})
+                    (protocol/make-response op {:deleted false :reason :not-found} id))))
+              (protocol/make-error-response :graph-not-found
+                                            (str "Graph not found: " repo)
+                                            id)))
+
+          ;; ============================================
+          ;; Outliner Operations
+          ;; TODO: Port outliner logic from CLJS to CLJ for full implementation
+          ;; These are CRITICAL for block editing functionality
+          ;; ============================================
+
+          :thread-api/apply-outliner-ops
+          ;; Applies outliner operations (insert, delete, move, indent, etc.)
+          ;; Web worker signature: [repo ops opts]
+          (let [[repo ops opts] (:args payload)]
+            (if-let [conn (get-conn server repo)]
+              (let [result (outliner/apply-ops! conn ops (or opts {}))]
+                (protocol/make-response op result id))
+              (protocol/make-error-response :graph-not-found
+                                            (str "Graph not found: " repo)
+                                            id)))
+
+          :thread-api/get-page-trees
+          ;; Get page trees for file synchronization
+          ;; Signature: [repo page-ids]
+          ;; Returns vector of page trees with blocks for file serialization
+          (let [[repo page-ids] (:args payload)]
+            (if-let [conn (get-conn server repo)]
+              (let [db @conn
+                    result (outliner/get-pages-for-file-sync db page-ids)]
+                (protocol/make-response op result id))
+              (protocol/make-error-response :graph-not-found
+                                            (str "Graph not found: " repo)
+                                            id)))
+
+          :thread-api/get-file-writes
+          ;; Get file writes for affected pages (for file sync after operations)
+          ;; Signature: [repo page-ids opts]
+          ;; Returns vector of [file-path content] tuples ready for writing
+          ;; Used by main process after apply-outliner-ops to write files
+          (let [[repo page-ids opts] (:args payload)]
+            (if-let [conn (get-conn server repo)]
+              (let [db @conn
+                    ;; Get the graph directory from opts or use a placeholder
+                    ;; (main process will resolve the actual path)
+                    graph-dir (or (:graph-dir opts) "")
+                    page-trees (outliner/get-pages-for-file-sync db page-ids)
+                    file-writes (file-export/pages->file-writes page-trees graph-dir (or opts {}))]
+                (protocol/make-response op file-writes id))
+              (protocol/make-error-response :graph-not-found
+                                            (str "Graph not found: " repo)
+                                            id)))
 
           ;; ============================================
           ;; Stub operations (RTC, vec-search, mobile)
@@ -460,20 +800,74 @@
             (log/debug "Stub op called (unsupported):" op)
             (protocol/make-response op {:rtc-state :closed} id))
 
-          ;; Vec search (Electron-only vector search feature)
+          ;; ============================================
+          ;; Vector Search Operations
+          ;; TODO: Implement full vector search using ONNX Runtime + JVector
+          ;; For now, return "not configured" responses (nil/empty)
+          ;; which matches behavior when no embedding model is loaded
+          ;; ============================================
+
+          :thread-api/vec-search-embedding-model-info
+          ;; Returns available models and current graph's model
+          ;; For now: no models available (feature not implemented)
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op {:available-model-names []
+                                        :graph-text-embedding-model-name nil} id))
+
+          :thread-api/vec-search-init-embedding-model
+          ;; Initializes the embedding model for a repo
+          ;; Returns nil if no model configured (which is the case for us)
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op nil id))
+
+          :thread-api/vec-search-load-model
+          ;; Loads a specific embedding model
+          ;; Returns false (model not loaded) for now
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op false id))
+
+          :thread-api/vec-search-embedding-graph
+          ;; Triggers embedding of all blocks in graph
+          ;; Returns nil (no-op when model not loaded)
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op nil id))
+
+          :thread-api/vec-search-search
+          ;; Semantic search - returns empty results when not configured
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op [] id))
+
+          :thread-api/vec-search-cancel-indexing
+          ;; Cancel ongoing indexing - no-op
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op nil id))
+
+          :thread-api/vec-search-update-index-info
+          ;; Update index info - returns empty info
+          (do
+            (log/debug "Vec search not yet implemented:" op)
+            (protocol/make-response op nil id))
+
+          ;; Legacy vec-search operations (may be used by older code)
           :thread-api/vec-upsert-blocks
           (do
-            (log/debug "Stub op called (unsupported):" op)
+            (log/debug "Vec search not yet implemented:" op)
             (protocol/make-response op nil id))
 
           :thread-api/vec-delete-blocks
           (do
-            (log/debug "Stub op called (unsupported):" op)
+            (log/debug "Vec search not yet implemented:" op)
             (protocol/make-response op nil id))
 
           :thread-api/vec-search-blocks
           (do
-            (log/debug "Stub op called (unsupported):" op)
+            (log/debug "Vec search not yet implemented:" op)
             (protocol/make-response op [] id))
 
           ;; Mobile logs - not applicable to sidecar
@@ -490,6 +884,12 @@
           ;; Import DB - used for file graph import, returns nil since sidecar
           ;; handles graph data differently
           :thread-api/import-db
+          (do
+            (log/debug "Stub op called (unsupported):" op)
+            (protocol/make-response op nil id))
+
+          ;; View data - used for DB-based views, not applicable to file graphs
+          :thread-api/get-view-data
           (do
             (log/debug "Stub op called (unsupported):" op)
             (protocol/make-response op nil id))

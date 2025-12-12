@@ -5,11 +5,15 @@
 
 (defn developer-mode
   []
-  (w/click "button[title='More'] .ls-icon-dots")
-  (w/click ".ls-icon-settings")
-  (w/click "[data-id='advanced']")
-  (let [q (.last (w/-query ".ui__toggle [aria-checked='false']"))]
-    (when (.isVisible q)
-      (w/click q)))
+  ;; Click the "More" button in the header
+  (w/click "button[title='More']")
+  ;; Click Settings menu item
+  (w/click "[role='menuitem']:has-text('Settings')")
+  ;; Click Advanced tab in settings sidebar
+  (w/click "[role='listitem']:has-text('Advanced')")
+  ;; Enable developer mode if not already enabled
+  (let [dev-mode-checkbox (w/-query "[role='checkbox']:near(:text('Developer mode'))")]
+    (when-not (.isChecked dev-mode-checkbox)
+      (w/click dev-mode-checkbox)))
   (k/esc)
   (assert/assert-in-normal-mode?))

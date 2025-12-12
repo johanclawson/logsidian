@@ -20,6 +20,8 @@
             [frontend.fs :as fs]
             [frontend.fs.sync :as sync]
             [frontend.fs.watcher-handler :as fs-watcher]
+            [frontend.sidecar.core :as sidecar]
+            [frontend.sidecar.initial-sync :as initial-sync]
             [frontend.handler.assets :as assets-handler]
             [frontend.handler.code :as code-handler]
             [frontend.handler.common.page :as page-common-handler]
@@ -73,7 +75,19 @@
   (route-handler/redirect-to-home!)
   (when-let [dir-name (and (not (config/db-based-graph? repo)) (config/get-repo-dir repo))]
     (fs/watch-dir! dir-name))
-  (file-sync-restart!))
+  (file-sync-restart!)
+  ;; Sync graph data to sidecar if enabled
+  (when (or (sidecar/sidecar-enabled?)
+            (sidecar/websocket-sidecar-enabled?))
+    (log/info :sidecar-initial-sync-starting {:repo repo})
+    (-> (initial-sync/sync-graph-to-sidecar! repo {:storage-path ":memory:"})
+        (p/then (fn [result]
+                  (log/info :sidecar-initial-sync-complete
+                            {:repo repo
+                             :datom-count (:datom-count result)
+                             :batch-count (:batch-count result)})))
+        (p/catch (fn [err]
+                   (log/error :sidecar-initial-sync-failed {:repo repo :error err}))))))
 
 (defmethod handle :init/commands [_]
   (page-handler/init-commands!))
@@ -95,7 +109,19 @@
     (when-not db-based?
            ;; graph-switch will trigger a rtc-start automatically
            ;; (rtc-handler/<rtc-start! graph)
-      (file-sync-restart!))
+      (file-sync-restart!)
+      ;; Sync graph data to sidecar on graph switch
+      (when (or (sidecar/sidecar-enabled?)
+                (sidecar/websocket-sidecar-enabled?))
+        (log/info :sidecar-graph-switch-sync {:graph graph})
+        (-> (initial-sync/sync-graph-to-sidecar! graph {:storage-path ":memory:"})
+            (p/then (fn [result]
+                      (log/info :sidecar-graph-switch-sync-complete
+                                {:graph graph
+                                 :datom-count (:datom-count result)
+                                 :batch-count (:batch-count result)})))
+            (p/catch (fn [err]
+                       (log/error :sidecar-graph-switch-sync-failed {:graph graph :error err}))))))
     (when-let [dir-name (and (not db-based?) (config/get-repo-dir graph))]
       (fs/watch-dir! dir-name))
     (graph-handler/settle-metadata-to-local! {:last-seen-at (js/Date.now)})))
