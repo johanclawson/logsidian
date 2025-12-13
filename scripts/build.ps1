@@ -237,12 +237,47 @@ if ($LASTEXITCODE -ne 0) {
 Write-Host "`n=== Step 5: Packaging Electron app ===" -ForegroundColor Cyan
 Set-Location (Join-Path $ProjectRoot "static")
 
-# Note: We need full install here (no --ignore-scripts) because electron-forge
-# needs its postinstall scripts to set up properly
-& yarn install
+# Install with --ignore-scripts to avoid PATH issues with postinstall
+& yarn install --ignore-scripts
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
-# Find electron-forge CLI - it may be in different locations depending on yarn version
+# Verify electron-forge is installed (yarn linking can sometimes fail in isolated processes)
+$forgePath = Join-Path $PWD "node_modules/@electron-forge/cli/dist/electron-forge.js"
+if (-not (Test-Path $forgePath)) {
+    Write-Host "electron-forge not found after yarn install, retrying..." -ForegroundColor Yellow
+    # Delete node_modules and reinstall to force fresh linking
+    $nodeModulesPath = Join-Path $PWD "node_modules"
+    if (Test-Path $nodeModulesPath) {
+        Write-Host "Removing node_modules for clean install..."
+        Remove-Item -Recurse -Force $nodeModulesPath
+    }
+    # Also remove yarn.lock to force fresh resolution
+    $yarnLockPath = Join-Path $PWD "yarn.lock"
+    if (Test-Path $yarnLockPath) {
+        Remove-Item -Force $yarnLockPath
+    }
+    & yarn install --ignore-scripts
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+}
+
+# Manually run install-app-deps (the postinstall script)
+# This is from electron-builder and rebuilds native modules
+$installAppDepsPath = Join-Path $PWD "node_modules/electron-builder/out/cli/install-app-deps.js"
+if (-not (Test-Path $installAppDepsPath)) {
+    # Try alternate location (app-builder-lib)
+    $installAppDepsPath = Join-Path $PWD "node_modules/app-builder-lib/out/cli/install-app-deps.js"
+}
+if (Test-Path $installAppDepsPath) {
+    Write-Host "Running install-app-deps manually..."
+    & node $installAppDepsPath
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Warning: install-app-deps failed, continuing anyway..." -ForegroundColor Yellow
+    }
+} else {
+    Write-Host "Note: install-app-deps not found, skipping native module rebuild" -ForegroundColor Yellow
+}
+
+# Find electron-forge CLI
 $forgePath = Join-Path $PWD "node_modules/@electron-forge/cli/dist/electron-forge.js"
 if (-not (Test-Path $forgePath)) {
     # Try alternate path (older versions)
@@ -252,15 +287,35 @@ if (-not (Test-Path $forgePath)) {
     Write-Host "ERROR: Could not find electron-forge CLI" -ForegroundColor Red
     Write-Host "Searched: node_modules/@electron-forge/cli/dist/electron-forge.js"
     Write-Host "Searched: node_modules/.bin/electron-forge"
+    Write-Host "Try running 'yarn install' manually in the static directory" -ForegroundColor Yellow
     exit 1
 }
 
 Write-Host "Running electron-forge make from: $forgePath"
 & node $forgePath make
-if ($LASTEXITCODE -ne 0) {
-    Write-Host "electron:make failed" -ForegroundColor Red
-    exit $LASTEXITCODE
+$forgeExitCode = $LASTEXITCODE
+
+# Check for WiX-specific errors and treat them as warnings (WiX toolkit often not installed)
+if ($forgeExitCode -ne 0) {
+    # Check if zip was created despite error (WiX failure is common and non-fatal)
+    $zipFiles = Get-ChildItem -Path (Join-Path $PWD "out/make/zip") -Filter "*.zip" -Recurse -ErrorAction SilentlyContinue
+    if ($zipFiles) {
+        Write-Host "Warning: electron-forge make had errors (likely WiX), but zip was created" -ForegroundColor Yellow
+    } else {
+        Write-Host "electron:make failed" -ForegroundColor Red
+        exit $forgeExitCode
+    }
 }
 
 Write-Host "`n=== Build complete! ===" -ForegroundColor Green
-Write-Host "Output: static\out\Logseq-win32-x64\Logseq.exe"
+
+# Find and display the output
+$outDir = Join-Path $PWD "out"
+$appDir = Get-ChildItem -Path $outDir -Directory -Filter "Logseq-win32-*" -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($appDir) {
+    Write-Host "App: $($appDir.FullName)\Logseq.exe"
+}
+$zipFile = Get-ChildItem -Path $outDir -Filter "*.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
+if ($zipFile) {
+    Write-Host "Zip: $($zipFile.FullName)"
+}

@@ -905,22 +905,32 @@ $nodePath = "C:\Users\johan\AppData\Local\nvm\v22.21.0\node.exe"
 
 ### Complete Local Build Process (Windows)
 
-**Recommended: Use the PowerShell build script:**
+**Recommended: Use `cmd.exe /c pwsh` to run the build in full isolation:**
 ```bash
-cd /x/source/repos/logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/build.ps1
+# THE KEY FIX: cmd.exe /c breaks the chain of environment pollution
+cmd.exe /c "cd /d X:\source\repos\logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1"
+
+# Or use the wrapper script that provides real-time output:
+cmd.exe /c "cd /d X:\source\repos\logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\run-build.ps1"
 ```
 
-Options:
+**Why `cmd.exe /c` is required:**
+- Running `pwsh` directly from Claude Code bash inherits corrupted environment variables
+- `cmd.exe /c` creates a completely fresh Windows process
+- This is what makes CSS builds and yarn installs work correctly
+
+Options for `build.ps1`:
 - `-SkipInstall` - Skip yarn install step (faster rebuilds)
 - `-ElectronOnly` - Only build electron (skip CSS/webpack)
 - `-Help` - Show help
 
 The script automatically:
-- Sets the correct Node version from `.nvmrc`
+- Sets the correct Node version from `.nvmrc` via PATH manipulation
+- Forces `$env:SHELL = "cmd.exe"` to prevent bash interference
 - Runs yarn install with `--ignore-scripts`
-- Builds tldraw and ui packages directly
+- Builds tldraw and ui packages directly (via node, not yarn scripts)
 - Runs postcss, gulp, cljs, webpack
-- Packages the Electron app
+- Packages the Electron app with electron-forge
 
 **Output:** `static/out/Logseq-win32-arm64/Logseq.exe` or `static/out/Logseq-win32-x64/Logseq.exe`
 
@@ -948,7 +958,10 @@ The build script was created to work around yarn/npm path corruption in Claude C
 | 5 | webpack | `node node_modules/webpack/bin/webpack.js --config webpack.config.js` |
 | 6 | electron-forge | `node static/node_modules/@electron-forge/cli/dist/electron-forge.js make` |
 
-**Known issue:** If gulp's `clean` task fails with EBUSY (file locked), `resources/package.json` won't be copied to `static/`. Fix: `cp -r resources/* static/` manually.
+**Known issues:**
+- If gulp's `clean` task fails with EBUSY (file locked), `resources/package.json` won't be copied to `static/`. Fix: `cp -r resources/* static/` manually.
+- **WiX MSI maker fails** if WiX Toolset is not installed. The build still succeeds and creates a zip archive. To install WiX: `winget install WiXToolset.WiX` or download from https://wixtoolset.org/. This is optional - the zip output is sufficient for development.
+- **Yarn linking can fail in isolated processes**: The build script now auto-retries with a clean install if electron-forge is not found after yarn install.
 
 ### Native Module: rsapi
 
