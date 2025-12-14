@@ -14,12 +14,23 @@ Pre-built native Node.js modules for local development. These are checked in tem
 
 ## Usage
 
-These binaries are used automatically when running `yarn install` if the corresponding npm packages detect them. For local builds, you can copy them to the expected locations:
+These binaries are **automatically copied** by the build script (`scripts/build.ps1`):
+
+1. **During build** - Copied to `static/node_modules/` after yarn install
+2. **After build** - Verified/copied to final app in `static/out/Logseq-win32-x64/`
+
+### Manual Copy (if needed)
 
 ```powershell
-# Copy rsapi to packages/rsapi
+# Copy to static/node_modules after yarn install
 Copy-Item native-binaries/win32-x64/rsapi.win32-x64-msvc.node `
-    packages/rsapi/rsapi.win32-x64-msvc.node
+    static/node_modules/@logseq/rsapi/
+
+Copy-Item native-binaries/win32-x64/keytar.node `
+    static/node_modules/keytar/build/Release/
+
+Copy-Item native-binaries/win32-x64/electron-deeplink.node `
+    static/node_modules/electron-deeplink/build/Release/
 ```
 
 ## Source
