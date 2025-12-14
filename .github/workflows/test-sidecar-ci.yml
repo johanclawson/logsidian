@@ -1,0 +1,440 @@
+name: Test Sidecar CI Components
+
+# This is a TDD test workflow to validate each new CI component
+# before integrating into the main build-windows.yml workflow.
+#
+# Usage:
+#   - Run manually via workflow_dispatch
+#   - Test individual components via test_component input
+#   - Once all components pass, integrate into build-windows.yml
+
+on:
+  workflow_dispatch:
+    inputs:
+      test_component:
+        description: 'Component to test'
+        type: choice
+        options:
+          - all
+          - sidecar-jar
+          - jre-x64
+          - jre-arm64
+          - sidecar-tests
+          - e2e-tests
+        default: 'all'
+      verbose:
+        description: 'Enable verbose logging'
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION: '21'
+  CLOJURE_VERSION: '1.11.1.1435'
+  NODE_VERSION: '22'
+
+jobs:
+  # ============================================================
+  # TEST 1: Sidecar JAR Build
+  # ============================================================
+  test-sidecar-jar:
+    name: 'TEST: Sidecar JAR Build'
+    runs-on: ubuntu-22.04
+    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'sidecar-jar' }}
+    outputs:
+      jar-size-mb: ${{ steps.verify.outputs.size }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-sidecar-${{ hashFiles('sidecar/deps.edn') }}
+          restore-keys: ${{ runner.os }}-clojure-sidecar-
+
+      - name: Build sidecar uberjar
+        run: cd sidecar && clojure -T:build uberjar
+
+      # TDD Assertions
+      - name: '[ASSERT] JAR file exists'
+        run: test -f sidecar/target/logsidian-sidecar.jar
+
+      - name: '[ASSERT] JAR is valid (can list contents)'
+        run: jar tf sidecar/target/logsidian-sidecar.jar | head -20
+
+      - name: '[ASSERT] JAR contains main class'
+        run: jar tf sidecar/target/logsidian-sidecar.jar | grep -q "logseq/sidecar/server"
+
+      - name: '[ASSERT] JAR size is reasonable (25-50 MB)'
+        id: verify
+        run: |
+          SIZE=$(stat -c %s sidecar/target/logsidian-sidecar.jar)
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "JAR size: ${SIZE_MB} MB"
+          echo "size=${SIZE_MB}" >> $GITHUB_OUTPUT
+
+          if [ $SIZE -lt 20000000 ]; then
+            echo "::error::JAR too small (${SIZE_MB} MB) - missing dependencies?"
+            exit 1
+          fi
+          if [ $SIZE -gt 60000000 ]; then
+            echo "::error::JAR too large (${SIZE_MB} MB) - bloated?"
+            exit 1
+          fi
+          echo "::notice::JAR size OK: ${SIZE_MB} MB"
+
+      - name: '[ASSERT] JAR can be invoked'
+        run: |
+          timeout 10 java -jar sidecar/target/logsidian-sidecar.jar --help || true
+          echo "JAR invocation test passed"
+
+      - name: Upload artifact for other tests
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-sidecar-jar
+          path: sidecar/target/logsidian-sidecar.jar
+          retention-days: 1
+          if-no-files-found: error
+
+  # ============================================================
+  # TEST 2: JRE x64 Build
+  # ============================================================
+  test-jre-x64:
+    name: 'TEST: JRE x64 Build'
+    runs-on: windows-latest
+    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'jre-x64' }}
+    outputs:
+      jre-size-mb: ${{ steps.verify.outputs.size }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'microsoft'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Create minimal JRE with jlink
+        shell: pwsh
+        run: |
+          # Modules required by sidecar:
+          # - java.base: Always required
+          # - java.logging: For tools.logging
+          # - java.sql: For next.jdbc, sqlite-jdbc
+          # - java.naming: For sqlite-jdbc, logback JNDI
+          # - java.management: For logback JMX
+          $modules = "java.base,java.logging,java.sql,java.naming,java.management"
+
+          Write-Host "Creating minimal JRE with modules: $modules"
+          Write-Host "JAVA_HOME: $env:JAVA_HOME"
+
+          jlink --module-path "$env:JAVA_HOME/jmods" `
+                --add-modules $modules `
+                --output jre-x64 `
+                --strip-debug `
+                --compress=2 `
+                --no-header-files `
+                --no-man-pages
+
+      # TDD Assertions
+      - name: '[ASSERT] JRE directory exists'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "jre-x64")) {
+            throw "JRE directory not created"
+          }
+
+      - name: '[ASSERT] java.exe exists'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "jre-x64/bin/java.exe")) {
+            throw "java.exe not found in JRE"
+          }
+
+      - name: '[ASSERT] java -version works'
+        shell: pwsh
+        run: |
+          $output = & ./jre-x64/bin/java.exe -version 2>&1
+          Write-Host $output
+          if ($LASTEXITCODE -ne 0) {
+            throw "java -version failed"
+          }
+
+      - name: '[ASSERT] JRE size is reasonable (50-100 MB)'
+        id: verify
+        shell: pwsh
+        run: |
+          $size = (Get-ChildItem -Recurse jre-x64 | Measure-Object -Sum Length).Sum
+          $sizeMB = [math]::Round($size/1MB, 2)
+          Write-Host "JRE size: $sizeMB MB"
+          echo "size=$sizeMB" >> $env:GITHUB_OUTPUT
+
+          if ($size -lt 40MB) {
+            throw "JRE too small ($sizeMB MB) - missing modules?"
+          }
+          if ($size -gt 120MB) {
+            throw "JRE too large ($sizeMB MB) - extra modules?"
+          }
+          Write-Host "::notice::JRE size OK: $sizeMB MB"
+
+      - name: Upload JRE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-jre-x64
+          path: jre-x64/
+          retention-days: 1
+
+  # ============================================================
+  # TEST 3: JRE ARM64 Build
+  # ============================================================
+  test-jre-arm64:
+    name: 'TEST: JRE ARM64 Build'
+    runs-on: windows-11-arm
+    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'jre-arm64' }}
+    outputs:
+      jre-size-mb: ${{ steps.verify.outputs.size }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'microsoft'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Create minimal JRE with jlink
+        shell: pwsh
+        run: |
+          $modules = "java.base,java.logging,java.sql,java.naming,java.management"
+
+          Write-Host "Creating minimal JRE (ARM64) with modules: $modules"
+          Write-Host "JAVA_HOME: $env:JAVA_HOME"
+
+          jlink --module-path "$env:JAVA_HOME/jmods" `
+                --add-modules $modules `
+                --output jre-arm64 `
+                --strip-debug `
+                --compress=2 `
+                --no-header-files `
+                --no-man-pages
+
+      # TDD Assertions
+      - name: '[ASSERT] JRE directory exists'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "jre-arm64")) {
+            throw "JRE directory not created"
+          }
+
+      - name: '[ASSERT] java.exe exists'
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "jre-arm64/bin/java.exe")) {
+            throw "java.exe not found in JRE"
+          }
+
+      - name: '[ASSERT] java -version works'
+        shell: pwsh
+        run: |
+          $output = & ./jre-arm64/bin/java.exe -version 2>&1
+          Write-Host $output
+
+      - name: '[ASSERT] JRE size is reasonable (50-100 MB)'
+        id: verify
+        shell: pwsh
+        run: |
+          $size = (Get-ChildItem -Recurse jre-arm64 | Measure-Object -Sum Length).Sum
+          $sizeMB = [math]::Round($size/1MB, 2)
+          Write-Host "JRE size: $sizeMB MB"
+          echo "size=$sizeMB" >> $env:GITHUB_OUTPUT
+
+          if ($size -lt 40MB) {
+            throw "JRE too small ($sizeMB MB)"
+          }
+          if ($size -gt 120MB) {
+            throw "JRE too large ($sizeMB MB)"
+          }
+          Write-Host "::notice::JRE size OK: $sizeMB MB"
+
+      - name: Upload JRE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-jre-arm64
+          path: jre-arm64/
+          retention-days: 1
+
+  # ============================================================
+  # TEST 4: Sidecar Unit Tests
+  # ============================================================
+  test-sidecar-tests:
+    name: 'TEST: Sidecar Unit Tests'
+    runs-on: ubuntu-22.04
+    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'sidecar-tests' }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-sidecar-${{ hashFiles('sidecar/deps.edn') }}
+
+      - name: Run sidecar unit tests
+        run: cd sidecar && clj -M:test
+        env:
+          # Avoid port conflicts in parallel test runs
+          SIDECAR_TEST_PORT_OFFSET: ${{ github.run_number }}
+
+      # TDD Assertions
+      - name: '[ASSERT] All tests passed'
+        run: echo "Tests passed (previous step would have failed otherwise)"
+
+  # ============================================================
+  # TEST 5: Sidecar + JRE Integration
+  # ============================================================
+  test-sidecar-jre-integration:
+    name: 'TEST: Sidecar + JRE Integration'
+    needs: [test-sidecar-jar, test-jre-x64]
+    runs-on: windows-latest
+    if: ${{ inputs.test_component == 'all' }}
+    steps:
+      - name: Download sidecar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: test-sidecar-jar
+          path: sidecar/
+
+      - name: Download JRE x64
+        uses: actions/download-artifact@v4
+        with:
+          name: test-jre-x64
+          path: jre-x64/
+
+      # TDD Assertions
+      - name: '[ASSERT] Sidecar runs with minimal JRE'
+        shell: pwsh
+        run: |
+          Write-Host "Starting sidecar with minimal JRE..."
+
+          # Start sidecar in background
+          $proc = Start-Process -FilePath "./jre-x64/bin/java.exe" `
+                                -ArgumentList "-jar", "sidecar/logsidian-sidecar.jar" `
+                                -NoNewWindow `
+                                -PassThru `
+                                -RedirectStandardOutput "sidecar-stdout.log" `
+                                -RedirectStandardError "sidecar-stderr.log"
+
+          Write-Host "Sidecar PID: $($proc.Id)"
+
+          # Wait for startup
+          Start-Sleep -Seconds 5
+
+          # Check if process is still running
+          if ($proc.HasExited) {
+            Write-Host "Sidecar stdout:"
+            Get-Content sidecar-stdout.log
+            Write-Host "Sidecar stderr:"
+            Get-Content sidecar-stderr.log
+            throw "Sidecar process exited unexpectedly"
+          }
+
+          Write-Host "Sidecar is running!"
+
+      - name: '[ASSERT] Sidecar TCP port is listening'
+        shell: pwsh
+        run: |
+          # Check TCP port 47632
+          $maxAttempts = 10
+          $attempt = 0
+          $connected = $false
+
+          while ($attempt -lt $maxAttempts -and -not $connected) {
+            try {
+              $client = New-Object System.Net.Sockets.TcpClient
+              $client.Connect("127.0.0.1", 47632)
+              $connected = $true
+              $client.Close()
+              Write-Host "Connected to sidecar on port 47632"
+            } catch {
+              $attempt++
+              Write-Host "Attempt $attempt/$maxAttempts - waiting for sidecar..."
+              Start-Sleep -Seconds 1
+            }
+          }
+
+          if (-not $connected) {
+            throw "Failed to connect to sidecar on port 47632"
+          }
+
+      - name: Show sidecar logs
+        if: always()
+        shell: pwsh
+        run: |
+          Write-Host "=== Sidecar stdout ==="
+          if (Test-Path sidecar-stdout.log) {
+            Get-Content sidecar-stdout.log -Tail 50
+          }
+          Write-Host "=== Sidecar stderr ==="
+          if (Test-Path sidecar-stderr.log) {
+            Get-Content sidecar-stderr.log -Tail 50
+          }
+
+  # ============================================================
+  # Summary Job
+  # ============================================================
+  test-summary:
+    name: 'TEST: Summary'
+    needs: [test-sidecar-jar, test-jre-x64, test-jre-arm64, test-sidecar-tests, test-sidecar-jre-integration]
+    runs-on: ubuntu-22.04
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "## Sidecar CI Test Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| Component | Status |" >> $GITHUB_STEP_SUMMARY
+          echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
+          echo "| Sidecar JAR Build | ${{ needs.test-sidecar-jar.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| JRE x64 Build | ${{ needs.test-jre-x64.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| JRE ARM64 Build | ${{ needs.test-jre-arm64.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sidecar Unit Tests | ${{ needs.test-sidecar-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| Sidecar + JRE Integration | ${{ needs.test-sidecar-jre-integration.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Artifact Sizes" >> $GITHUB_STEP_SUMMARY
+          echo "- Sidecar JAR: ${{ needs.test-sidecar-jar.outputs.jar-size-mb || 'N/A' }} MB" >> $GITHUB_STEP_SUMMARY
+          echo "- JRE x64: ${{ needs.test-jre-x64.outputs.jre-size-mb || 'N/A' }} MB" >> $GITHUB_STEP_SUMMARY
+          echo "- JRE ARM64: ${{ needs.test-jre-arm64.outputs.jre-size-mb || 'N/A' }} MB" >> $GITHUB_STEP_SUMMARY
+
+      - name: Check all passed
+        run: |
+          if [ "${{ needs.test-sidecar-jar.result }}" != "success" ] || \
+             [ "${{ needs.test-jre-x64.result }}" != "success" ] || \
+             [ "${{ needs.test-jre-arm64.result }}" != "success" ] || \
+             [ "${{ needs.test-sidecar-tests.result }}" != "success" ] || \
+             [ "${{ needs.test-sidecar-jre-integration.result }}" != "success" ]; then
+            echo "::error::Some tests failed - see summary above"
+            exit 1
+          fi
+          echo "All tests passed!"

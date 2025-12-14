@@ -71,7 +71,8 @@ Feature specifications and design documents for planned features.
 ### `/research`
 Detailed research findings, library comparisons, and technical investigations. Research docs support task implementation and inform decisions.
 
-*Research docs will be added as parallel tasks begin.*
+- [github-actions-sidecar-cicd.md](research/github-actions-sidecar-cicd.md) - **Comprehensive CI/CD research** for sidecar builds including job dependencies, JRE bundling with jlink, E2E test strategy, TDD implementation plan, cost analysis, and security considerations
+- [github-actions-complete-workflow.yml](research/github-actions-complete-workflow.yml) - Target workflow YAML showing final integrated state
 
 ### `/decisions`
 Architecture Decision Records (ADRs) documenting key technical decisions.
