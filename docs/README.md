@@ -73,6 +73,7 @@ Detailed research findings, library comparisons, and technical investigations. R
 
 - [hybrid-architecture-search.md](research/hybrid-architecture-search.md) - Vector search compatibility analysis
 - [edge-architecture-pivot.md](research/edge-architecture-pivot.md) - Edge computing pivot feasibility (~10-15 days, not massive!)
+- [hosting-comparison.md](research/hosting-comparison.md) - Fly.io vs Cloudflare Workers comparison and recommendation
 
 ### `/decisions`
 Architecture Decision Records (ADRs) documenting key technical decisions.

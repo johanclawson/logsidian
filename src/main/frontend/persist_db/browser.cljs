@@ -179,8 +179,12 @@
             :fallback-on-error? true
             :on-backend-ready (fn [{:keys [type]}]
                                 (log/info :db-backend-started {:type type}))})
-          (p/then (fn [{:keys [type]}]
-                    (when (= type :sidecar)
+          (p/then (fn [{:keys [type sidecar]}]
+                    ;; Run sidecar setup when sidecar is actually active:
+                    ;; - Pure sidecar mode: {:type :sidecar :port 47632}
+                    ;; - Hybrid mode: {:type :hybrid :sidecar :ipc} or {:sidecar :ws}
+                    ;; Bug fix: Check for truthy sidecar key, not just :hybrid type
+                    (when (or (= type :sidecar) sidecar)
                       ;; Sidecar needs some additional setup that web worker handles internally
                       (sync-app-state!)
                       (sync-ui-state!)

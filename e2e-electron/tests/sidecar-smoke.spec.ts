@@ -303,15 +303,12 @@ test.describe('Sidecar Electron Smoke Tests', () => {
     expect(sidecarErrors).toHaveLength(0);
   });
 
-  // SKIPPED: These tests require the full file parsing pipeline to work.
-  // Currently, the sidecar replaces the web worker but the web worker is needed
-  // for file parsing. Until the architecture is updated to either:
-  // 1. Start web worker alongside sidecar for file parsing, OR
-  // 2. Move file parsing to the sidecar/main process
-  // These tests will fail due to empty content in the main area.
-  //
-  // See: https://github.com/johanclawson/logsidian/issues/TBD
-  test.skip('can create a new page', async () => {
+  // Re-enabled after hybrid architecture fix (browser.cljs type check bug)
+  // The architecture now:
+  // 1. Starts web worker first for file parsing (mldoc)
+  // 2. Then connects sidecar for queries
+  // See: docs/tasks/hybrid-architecture.md
+  test('can create a new page', async () => {
     // Open command palette with Ctrl+K
     await page.keyboard.press('Control+k');
     await page.waitForTimeout(500);
@@ -332,8 +329,8 @@ test.describe('Sidecar Electron Smoke Tests', () => {
     await page.screenshot({ path: 'e2e-electron/screenshots/page-created.png' });
   });
 
-  // SKIPPED: Same as above - requires file parsing pipeline to populate content.
-  test.skip('can create a block', async () => {
+  // Re-enabled after hybrid architecture fix
+  test('can create a block', async () => {
     // Click in the editor area to focus
     await page.click('.editor-wrapper, .block-editor, .ls-block');
     await page.waitForTimeout(300);
