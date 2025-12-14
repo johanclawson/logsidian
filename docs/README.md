@@ -71,7 +71,8 @@ Feature specifications and design documents for planned features.
 ### `/research`
 Detailed research findings, library comparisons, and technical investigations. Research docs support task implementation and inform decisions.
 
-*Research docs will be added as parallel tasks begin.*
+- [hybrid-architecture-search.md](research/hybrid-architecture-search.md) - Vector search compatibility analysis
+- [edge-architecture-pivot.md](research/edge-architecture-pivot.md) - Edge computing pivot feasibility (~10-15 days, not massive!)
 
 ### `/decisions`
 Architecture Decision Records (ADRs) documenting key technical decisions.
