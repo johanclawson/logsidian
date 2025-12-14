@@ -76,3 +76,6 @@ clj-e2e/e2e-dump
 
 # Local JRE test artifacts
 jre-test/
+
+# Build artifacts (downloaded from CI)
+build-artifacts/
