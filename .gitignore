@@ -73,3 +73,9 @@ clj-e2e/resources
 clj-e2e/e2e-dump
 .dir-locals.el
 .projectile
+
+# Local JRE test artifacts
+jre-test/
+
+# Build artifacts (downloaded from CI)
+build-artifacts/

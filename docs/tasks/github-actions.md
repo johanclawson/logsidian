@@ -2,238 +2,151 @@
 
 **Worktree:** `C:\Users\johan\repos\_worktrees\logsidian-cicd`
 **Branch:** `feature-sidecar-cicd`
-**Status:** Not Started
+**Status:** ✅ Complete
 **Priority:** 2
-**Estimate:** 2-3 hours
-**Depends on:** Nothing (can start now)
 
 ## Goal
 
 Set up GitHub Actions workflows to:
-1. Build the sidecar JAR
-2. Build minimal JREs for x64 and ARM64
-3. Run E2E tests
-4. Package releases with bundled Java
+1. ✅ Build the sidecar JAR
+2. ✅ Build minimal JREs for x64 using jlink
+3. ✅ Run sidecar unit tests in CI
+4. ✅ Package releases with bundled Java
+5. ⏳ ARM64 JRE (blocked - private repo runners)
+6. ⏳ E2E tests with sidecar (future iteration)
 
-## Implementation Steps
+## What's Implemented
 
-### Step 1: Add Sidecar JAR Build Job
+### build-windows.yml
 
-**File:** `.github/workflows/build-windows.yml`
+The main build workflow now includes:
 
-Add after existing jobs:
+| Job | Description | Duration |
+|-----|-------------|----------|
+| `build-sidecar-jar` | Builds uberjar (~27 MB) | ~40s |
+| `build-jre-x64` | Creates minimal JRE (~35 MB) | ~1-2m |
+| `build-windows-x64` | Packages Electron + JRE + JAR | ~12-15m |
+| `test-release` | Creates GitHub prerelease | ~1m |
 
-```yaml
-build-sidecar-jar:
-  runs-on: ubuntu-22.04
-  steps:
-    - uses: actions/checkout@v4
+### test-sidecar-ci.yml
 
-    - uses: actions/setup-java@v4
-      with:
-        distribution: 'microsoft'
-        java-version: '21'
+TDD test workflow for validating CI components:
 
-    - uses: DeLaGuardo/setup-clojure@12.5
-      with:
-        cli: 1.11.1.1435
+```bash
+# Run all tests
+gh workflow run test-sidecar-ci.yml -f test_component=all
 
-    - name: Build sidecar uberjar
-      run: cd sidecar && clojure -T:build uberjar
-
-    - uses: actions/upload-artifact@v4
-      with:
-        name: sidecar-jar
-        path: sidecar/target/logsidian-sidecar.jar
+# Test individual components
+gh workflow run test-sidecar-ci.yml -f test_component=sidecar-jar
+gh workflow run test-sidecar-ci.yml -f test_component=jre-x64
 ```
 
-### Step 2: Add JRE Build Jobs
+### Electron Integration
 
-```yaml
-build-jre-x64:
-  runs-on: windows-latest
-  steps:
-    - uses: actions/setup-java@v4
-      with:
-        distribution: 'microsoft'
-        java-version: '21'
+**File:** `src/electron/electron/sidecar.cljs`
 
-    - name: Create minimal JRE (x64)
-      run: |
-        jlink --module-path "$env:JAVA_HOME/jmods" `
-              --add-modules java.base,java.logging,java.sql,java.naming,java.management `
-              --output jre-x64 --strip-debug --compress=2 --no-header-files --no-man-pages
+The `find-java` function now checks for bundled JRE first:
+1. `{resources}/jre/bin/java.exe` (bundled)
+2. `{resources}/jre-{platform}-{arch}/bin/java.exe` (platform-specific)
+3. `JAVA_HOME` environment variable
+4. System `PATH`
 
-    - uses: actions/upload-artifact@v4
-      with:
-        name: jre-x64
-        path: jre-x64/
+## Implementation Phases
 
-build-jre-arm64:
-  runs-on: windows-11-arm  # GitHub ARM64 runner
-  steps:
-    - uses: actions/setup-java@v4
-      with:
-        distribution: 'microsoft'
-        java-version: '21'
+### Phase 1: Foundation ✅ Complete
 
-    - name: Create minimal JRE (ARM64)
-      run: |
-        jlink --module-path "$env:JAVA_HOME/jmods" `
-              --add-modules java.base,java.logging,java.sql,java.naming,java.management `
-              --output jre-arm64 --strip-debug --compress=2 --no-header-files --no-man-pages
+- [x] Research current workflow structure
+- [x] Analyze sidecar build requirements
+- [x] Design job dependency graph
+- [x] Create test workflow (`test-sidecar-ci.yml`)
+- [x] Write comprehensive research document
 
-    - uses: actions/upload-artifact@v4
-      with:
-        name: jre-arm64
-        path: jre-arm64/
-```
+### Phase 2: Validate Test Workflow ✅ Complete
 
-### Step 3: Create E2E Test Workflow
+- [x] Run `test-sidecar-ci.yml` with `test_component=sidecar-jar`
+- [x] Run `test-sidecar-ci.yml` with `test_component=jre-x64`
+- [x] Run `test-sidecar-ci.yml` with `test_component=sidecar-tests`
+- [x] Run `test-sidecar-ci.yml` with `test_component=all`
+- [x] Verify all assertions pass
+- [x] Fix CI failures (GREEN phase of TDD)
 
-**File:** `.github/workflows/e2e-tests.yml`
+### Phase 3: Integrate into build-windows.yml ✅ Complete
 
-```yaml
-name: E2E Tests
+- [x] Add `build-sidecar-jar` job
+- [x] Add `build-jre-x64` job
+- [x] Update `build-windows-x64` to download and bundle JRE + JAR
+- [x] Update Electron code to find bundled JRE
 
-on:
-  push:
-    branches: [feature-sidecar, main]
-  pull_request:
-    branches: [feature-sidecar, main]
+### Phase 4: E2E Test Integration ⏳ Future
 
-jobs:
-  e2e:
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
+- [ ] Add `e2e-tests` job
+- [ ] Configure Playwright for CI
+- [ ] Gate releases on E2E pass
 
-      - uses: actions/setup-java@v4
-        with:
-          distribution: 'microsoft'
-          java-version: '21'
+### Phase 5: ARM64 Support ⏳ Blocked
 
-      - uses: DeLaGuardo/setup-clojure@12.5
-        with:
-          cli: 1.11.1.1435
+- [ ] `build-jre-arm64` job (requires `windows-11-arm` runner)
+- [ ] Update `build-windows-arm64` dependencies
 
-      - uses: actions/setup-node@v4
-        with:
-          node-version: '22'
-
-      - name: Build Sidecar
-        run: cd sidecar && clj -T:build uberjar
-
-      - name: Install Dependencies
-        run: yarn install
-
-      - name: Build App
-        run: yarn release-electron
-
-      - name: Install Playwright
-        run: npx playwright install --with-deps
-
-      - name: Start Sidecar
-        run: |
-          Start-Process -FilePath "java" -ArgumentList "-jar", "sidecar/target/logsidian-sidecar.jar" -NoNewWindow
-          Start-Sleep -Seconds 5
-        shell: pwsh
-
-      - name: Run E2E Tests
-        run: npx playwright test --config e2e-electron/playwright.config.ts
-
-      - name: Upload Screenshots
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: e2e-screenshots
-          path: e2e-electron/screenshots/
-```
-
-### Step 4: Modify Release Job to Include Sidecar
-
-Update the existing release job to download and include sidecar artifacts:
-
-```yaml
-build-windows-x64:
-  needs: [compile-cljs, build-sidecar-jar, build-jre-x64]
-  runs-on: windows-latest
-  steps:
-    # ... existing steps ...
-
-    - name: Download sidecar JAR
-      uses: actions/download-artifact@v4
-      with:
-        name: sidecar-jar
-        path: sidecar/target/
-
-    - name: Download JRE x64
-      uses: actions/download-artifact@v4
-      with:
-        name: jre-x64
-        path: jre-x64/
-
-    - name: Set JRE path for packaging
-      run: echo "JRE_PATH=jre-x64" >> $env:GITHUB_ENV
-
-    # ... continue with electron:make ...
-```
-
-## Files to Create/Modify
-
-| File | Action |
-|------|--------|
-| `.github/workflows/build-windows.yml` | Modify - add sidecar and JRE jobs |
-| `.github/workflows/e2e-tests.yml` | Create - E2E test workflow |
+**Note:** `windows-11-arm` runners are not available for private repositories. This will be enabled when the repo goes public or GitHub adds support.
 
 ## Job Dependencies
 
 ```
-┌─────────────────────┐
-│   compile-cljs      │
-└──────────┬──────────┘
-           │
-┌──────────┼──────────┐     ┌─────────────────────┐
-│          │          │     │  build-sidecar-jar  │
-│          ▼          │     └──────────┬──────────┘
-│  build-windows-x64  │◄───────────────┤
-│                     │     ┌──────────┴──────────┐
-│                     │◄────│     build-jre-x64   │
-└─────────────────────┘     └─────────────────────┘
-
 ┌─────────────────────┐     ┌─────────────────────┐
-│ build-windows-arm64 │◄────│    build-jre-arm64  │
-└─────────────────────┘     └─────────────────────┘
+│   compile-cljs      │     │  build-sidecar-jar  │
+└──────────┬──────────┘     └──────────┬──────────┘
+           │                           │
+           │     ┌─────────────────────┤
+           │     │                     │
+           ▼     ▼                     ▼
+┌─────────────────────┐     ┌─────────────────────┐
+│  build-windows-x64  │◄────│   build-jre-x64     │
+└──────────┬──────────┘     └─────────────────────┘
+           │
+           ▼
+┌─────────────────────┐
+│    test-release     │
+└─────────────────────┘
 ```
 
-## Existing Workflow Reference
+## Artifacts
 
-The current `.github/workflows/build-windows.yml` has:
-- `build-rsapi-arm64` - Compiles native rsapi module
-- `compile-cljs` - Builds ClojureScript
-- `build-windows-x64` - Packages Electron x64
-- `build-windows-arm64` - Packages Electron ARM64
-- `release` - Creates GitHub releases
+| Artifact | Contents | Size |
+|----------|----------|------|
+| `sidecar-jar` | `logsidian-sidecar.jar` | ~27 MB |
+| `jre-win32-x64` | Minimal JRE (jlink) | ~35 MB |
+| `cljs-static` | Compiled frontend | ~80 MB |
+| `logsidian-win-x64` | MSI + ZIP + nupkg | ~300 MB |
 
-## Success Criteria
+## Success Criteria ✅
 
-- [ ] `build-sidecar-jar` job creates uberjar
-- [ ] `build-jre-x64` job creates minimal JRE (~50-80MB)
-- [ ] `build-jre-arm64` job creates ARM64 JRE
-- [ ] E2E tests run in CI and pass
-- [ ] Release artifacts include sidecar JAR and JRE
-- [ ] ARM64 build uses ARM64 JRE
+- [x] `build-sidecar-jar` job creates uberjar (~27 MB)
+- [x] `build-jre-x64` job creates minimal JRE (~35 MB)
+- [x] Sidecar runs successfully with minimal JRE (integration test)
+- [x] Release artifacts include sidecar JAR and JRE
+- [x] MSI installer works without system Java installed
+- [ ] ARM64 build uses ARM64 JRE (blocked)
+- [ ] E2E smoke tests pass with sidecar (future)
 
-## Testing the Workflow
+## jlink Modules
 
-1. Push changes to a test branch
-2. Check Actions tab for job status
-3. Download artifacts and verify sizes
-4. Test E2E workflow manually first
+```
+java.base          # Always required
+java.logging       # For tools.logging
+java.sql           # For next.jdbc, sqlite-jdbc
+java.naming        # For sqlite-jdbc, logback
+java.management    # For logback JMX
+```
 
-## Notes
+## Future Improvements
 
-- GitHub has ARM64 Windows runners (`windows-11-arm`)
-- Microsoft OpenJDK 21 supports both x64 and ARM64
-- E2E tests need the sidecar running before tests start
-- Consider caching JRE builds (they rarely change)
+1. **AppCDS** - Pre-generate class data sharing archive for ~500ms startup
+2. **E2E Tests** - Playwright tests with sidecar running
+3. **ARM64** - When runners become available for private repos
+4. **Caching** - Cache JRE builds (they change rarely)
+
+## References
+
+- [Research Document](../research/github-actions-sidecar-cicd.md)
+- [jlink Documentation](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jlink.html)

@@ -241,6 +241,51 @@ Set-Location (Join-Path $ProjectRoot "static")
 & yarn install --ignore-scripts
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
+# Step 5a: Copy pre-built native binaries if they exist
+# This handles cases where npm install doesn't provide working binaries
+$nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-x64"
+if (Test-Path $nativeBinDir) {
+    Write-Host "`n=== Step 5a: Installing pre-built native binaries ===" -ForegroundColor Cyan
+
+    # rsapi - copy to @logseq/rsapi package
+    $rsapiSrc = Join-Path $nativeBinDir "rsapi.win32-x64-msvc.node"
+    $rsapiDest = Join-Path $PWD "node_modules/@logseq/rsapi"
+    if ((Test-Path $rsapiSrc) -and (Test-Path $rsapiDest)) {
+        Write-Host "Copying rsapi native binary..."
+        Copy-Item $rsapiSrc -Destination $rsapiDest -Force
+    }
+
+    # keytar - copy to keytar package
+    $keytarSrc = Join-Path $nativeBinDir "keytar.node"
+    $keytarDest = Join-Path $PWD "node_modules/keytar/build/Release"
+    if ((Test-Path $keytarSrc) -and (Test-Path $keytarDest)) {
+        Write-Host "Copying keytar native binary..."
+        Copy-Item $keytarSrc -Destination $keytarDest -Force
+    } elseif (Test-Path $keytarSrc) {
+        # Create the directory if it doesn't exist
+        $keytarBuildDir = Join-Path $PWD "node_modules/keytar/build/Release"
+        New-Item -ItemType Directory -Force -Path $keytarBuildDir | Out-Null
+        Copy-Item $keytarSrc -Destination $keytarBuildDir -Force
+    }
+
+    # electron-deeplink - copy to electron-deeplink package
+    $deeplinkSrc = Join-Path $nativeBinDir "electron-deeplink.node"
+    $deeplinkDest = Join-Path $PWD "node_modules/electron-deeplink/build/Release"
+    if ((Test-Path $deeplinkSrc) -and (Test-Path $deeplinkDest)) {
+        Write-Host "Copying electron-deeplink native binary..."
+        Copy-Item $deeplinkSrc -Destination $deeplinkDest -Force
+    } elseif (Test-Path $deeplinkSrc) {
+        # Create the directory if it doesn't exist
+        $deeplinkBuildDir = Join-Path $PWD "node_modules/electron-deeplink/build/Release"
+        New-Item -ItemType Directory -Force -Path $deeplinkBuildDir | Out-Null
+        Copy-Item $deeplinkSrc -Destination $deeplinkBuildDir -Force
+    }
+
+    Write-Host "Native binaries installed" -ForegroundColor Green
+} else {
+    Write-Host "Note: native-binaries/win32-x64 not found, relying on npm packages" -ForegroundColor Yellow
+}
+
 # Verify electron-forge is installed (yarn linking can sometimes fail in isolated processes)
 $forgePath = Join-Path $PWD "node_modules/@electron-forge/cli/dist/electron-forge.js"
 if (-not (Test-Path $forgePath)) {
@@ -314,6 +359,56 @@ $outDir = Join-Path $PWD "out"
 $appDir = Get-ChildItem -Path $outDir -Directory -Filter "Logseq-win32-*" -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($appDir) {
     Write-Host "App: $($appDir.FullName)\Logseq.exe"
+
+    # Verify/copy native binaries to the final app
+    $appResourcesDir = Join-Path $appDir.FullName "resources/app/node_modules"
+    $nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-x64"
+
+    if ((Test-Path $nativeBinDir) -and (Test-Path $appResourcesDir)) {
+        Write-Host "`n=== Verifying native binaries in final app ===" -ForegroundColor Cyan
+
+        # rsapi
+        $rsapiDest = Join-Path $appResourcesDir "@logseq/rsapi/rsapi.win32-x64-msvc.node"
+        if (-not (Test-Path $rsapiDest)) {
+            $rsapiSrc = Join-Path $nativeBinDir "rsapi.win32-x64-msvc.node"
+            if (Test-Path $rsapiSrc) {
+                Write-Host "Copying rsapi to final app..."
+                $rsapiDestDir = Join-Path $appResourcesDir "@logseq/rsapi"
+                if (-not (Test-Path $rsapiDestDir)) { New-Item -ItemType Directory -Force -Path $rsapiDestDir | Out-Null }
+                Copy-Item $rsapiSrc -Destination $rsapiDestDir -Force
+            }
+        } else {
+            Write-Host "rsapi binary present in final app" -ForegroundColor Green
+        }
+
+        # keytar
+        $keytarDest = Join-Path $appResourcesDir "keytar/build/Release/keytar.node"
+        if (-not (Test-Path $keytarDest)) {
+            $keytarSrc = Join-Path $nativeBinDir "keytar.node"
+            if (Test-Path $keytarSrc) {
+                Write-Host "Copying keytar to final app..."
+                $keytarDestDir = Join-Path $appResourcesDir "keytar/build/Release"
+                if (-not (Test-Path $keytarDestDir)) { New-Item -ItemType Directory -Force -Path $keytarDestDir | Out-Null }
+                Copy-Item $keytarSrc -Destination $keytarDestDir -Force
+            }
+        } else {
+            Write-Host "keytar binary present in final app" -ForegroundColor Green
+        }
+
+        # electron-deeplink
+        $deeplinkDest = Join-Path $appResourcesDir "electron-deeplink/build/Release/electron-deeplink.node"
+        if (-not (Test-Path $deeplinkDest)) {
+            $deeplinkSrc = Join-Path $nativeBinDir "electron-deeplink.node"
+            if (Test-Path $deeplinkSrc) {
+                Write-Host "Copying electron-deeplink to final app..."
+                $deeplinkDestDir = Join-Path $appResourcesDir "electron-deeplink/build/Release"
+                if (-not (Test-Path $deeplinkDestDir)) { New-Item -ItemType Directory -Force -Path $deeplinkDestDir | Out-Null }
+                Copy-Item $deeplinkSrc -Destination $deeplinkDestDir -Force
+            }
+        } else {
+            Write-Host "electron-deeplink binary present in final app" -ForegroundColor Green
+        }
+    }
 }
 $zipFile = Get-ChildItem -Path $outDir -Filter "*.zip" -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
 if ($zipFile) {

@@ -1,0 +1,754 @@
+# =============================================================================
+# LOGSIDIAN BUILD WINDOWS WORKFLOW - TARGET STATE
+# =============================================================================
+#
+# This is the TARGET workflow after sidecar CI/CD integration.
+# It shows what build-windows.yml should look like when complete.
+#
+# Changes from current:
+# - Added: build-sidecar-jar job
+# - Added: build-jre-x64 job
+# - Added: build-jre-arm64 job
+# - Added: test-sidecar job
+# - Added: e2e-tests job
+# - Modified: build-windows-x64 to include sidecar
+# - Modified: build-windows-arm64 to include sidecar
+# - Modified: release jobs to gate on e2e-tests
+#
+# =============================================================================
+
+name: Build Windows (x64 + ARM64)
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'src/main/frontend/version.cljs'
+  workflow_dispatch:
+    inputs:
+      test_release:
+        description: 'Create test release (uses branch name in tag)'
+        type: boolean
+        default: false
+      skip_x64:
+        description: 'Skip x64 build'
+        type: boolean
+        default: false
+      skip_arm64:
+        description: 'Skip ARM64 build'
+        type: boolean
+        default: false
+      skip_sidecar:
+        description: 'Skip sidecar build (for debugging Electron-only issues)'
+        type: boolean
+        default: false
+      skip_e2e:
+        description: 'Skip E2E tests'
+        type: boolean
+        default: false
+
+env:
+  JAVA_VERSION: '21'
+  CLOJURE_VERSION: '1.11.1.1435'
+  NODE_VERSION: '22'
+
+jobs:
+  # ===========================================================================
+  # NEW: Build Sidecar JAR
+  # ===========================================================================
+  build-sidecar-jar:
+    name: Build Sidecar JAR
+    runs-on: ubuntu-22.04
+    if: ${{ !inputs.skip_sidecar }}
+    outputs:
+      jar-size-mb: ${{ steps.build.outputs.size }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-sidecar-${{ hashFiles('sidecar/deps.edn') }}
+          restore-keys: ${{ runner.os }}-clojure-sidecar-
+
+      - name: Build sidecar uberjar
+        id: build
+        run: |
+          cd sidecar && clojure -T:build uberjar
+          SIZE=$(stat -c %s target/logsidian-sidecar.jar)
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "size=${SIZE_MB}" >> $GITHUB_OUTPUT
+          echo "Sidecar JAR size: ${SIZE_MB} MB"
+
+      - name: Upload sidecar JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-jar
+          path: sidecar/target/logsidian-sidecar.jar
+          if-no-files-found: error
+
+  # ===========================================================================
+  # NEW: Test Sidecar (Unit Tests)
+  # ===========================================================================
+  test-sidecar:
+    name: Test Sidecar
+    needs: build-sidecar-jar
+    runs-on: ubuntu-22.04
+    if: ${{ !inputs.skip_sidecar }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-sidecar-${{ hashFiles('sidecar/deps.edn') }}
+
+      - name: Run sidecar unit tests
+        run: cd sidecar && clj -M:test
+
+  # ===========================================================================
+  # NEW: Build Minimal JRE for x64
+  # ===========================================================================
+  build-jre-x64:
+    name: Build JRE x64
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_x64 && !inputs.skip_sidecar }}
+    outputs:
+      jre-size-mb: ${{ steps.build.outputs.size }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'microsoft'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Create minimal JRE with jlink
+        id: build
+        shell: pwsh
+        run: |
+          # Modules required by sidecar
+          $modules = "java.base,java.logging,java.sql,java.naming,java.management"
+
+          jlink --module-path "$env:JAVA_HOME/jmods" `
+                --add-modules $modules `
+                --output jre-x64 `
+                --strip-debug `
+                --compress=2 `
+                --no-header-files `
+                --no-man-pages
+
+          # Calculate size
+          $size = (Get-ChildItem -Recurse jre-x64 | Measure-Object -Sum Length).Sum
+          $sizeMB = [math]::Round($size/1MB, 2)
+          echo "size=$sizeMB" >> $env:GITHUB_OUTPUT
+          Write-Host "JRE x64 size: $sizeMB MB"
+
+      - name: Upload JRE x64
+        uses: actions/upload-artifact@v4
+        with:
+          name: jre-x64
+          path: jre-x64/
+
+  # ===========================================================================
+  # NEW: Build Minimal JRE for ARM64
+  # ===========================================================================
+  build-jre-arm64:
+    name: Build JRE ARM64
+    runs-on: windows-11-arm
+    if: ${{ !inputs.skip_arm64 && !inputs.skip_sidecar }}
+    outputs:
+      jre-size-mb: ${{ steps.build.outputs.size }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'microsoft'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Create minimal JRE with jlink
+        id: build
+        shell: pwsh
+        run: |
+          $modules = "java.base,java.logging,java.sql,java.naming,java.management"
+
+          jlink --module-path "$env:JAVA_HOME/jmods" `
+                --add-modules $modules `
+                --output jre-arm64 `
+                --strip-debug `
+                --compress=2 `
+                --no-header-files `
+                --no-man-pages
+
+          $size = (Get-ChildItem -Recurse jre-arm64 | Measure-Object -Sum Length).Sum
+          $sizeMB = [math]::Round($size/1MB, 2)
+          echo "size=$sizeMB" >> $env:GITHUB_OUTPUT
+          Write-Host "JRE ARM64 size: $sizeMB MB"
+
+      - name: Upload JRE ARM64
+        uses: actions/upload-artifact@v4
+        with:
+          name: jre-arm64
+          path: jre-arm64/
+
+  # ===========================================================================
+  # EXISTING: Build rsapi ARM64 (unchanged)
+  # ===========================================================================
+  build-rsapi-arm64:
+    name: Build rsapi ARM64
+    runs-on: windows-11-arm
+    if: ${{ !inputs.skip_arm64 }}
+    steps:
+      - name: Checkout rsapi repository
+        uses: actions/checkout@v4
+        with:
+          repository: logseq/rsapi
+          ref: '@logseq/rsapi@0.0.92'
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'yarn'
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: nightly-2024-12-09
+          targets: aarch64-pc-windows-msvc
+
+      - name: Add Clang to PATH
+        shell: pwsh
+        run: |
+          $vsPath = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -property installationPath
+          $clangPaths = @(
+            "$vsPath\VC\Tools\Llvm\ARM64\bin",
+            "$vsPath\VC\Tools\Llvm\x64\bin",
+            "C:\Program Files\LLVM\bin"
+          )
+          foreach ($path in $clangPaths) {
+            if (Test-Path $path) {
+              echo "$path" >> $env:GITHUB_PATH
+              break
+            }
+          }
+          clang --version
+
+      - name: Install dependencies
+        run: yarn install --immutable --mode=skip-build
+
+      - name: Build rsapi for ARM64
+        shell: pwsh
+        env:
+          CARGO_BUILD_TARGET: aarch64-pc-windows-msvc
+        run: yarn lerna exec "yarn build --target aarch64-pc-windows-msvc" --concurrency 1 --stream --no-prefix
+
+      - name: Prepare rsapi artifact
+        shell: pwsh
+        run: |
+          $nodeFile = Get-ChildItem -Path packages/rsapi -Filter "*.node" -Recurse | Select-Object -First 1
+          if ($nodeFile) {
+            New-Item -ItemType Directory -Force -Path "rsapi-output"
+            Copy-Item $nodeFile.FullName -Destination "rsapi-output/rsapi.win32-arm64-msvc.node"
+          } else {
+            throw "No .node file found!"
+          }
+
+      - name: Upload rsapi artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rsapi-win32-arm64-msvc
+          path: rsapi-output/
+          if-no-files-found: error
+
+  # ===========================================================================
+  # EXISTING: Compile ClojureScript (unchanged)
+  # ===========================================================================
+  compile-cljs:
+    runs-on: ubuntu-22.04
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Get version from version.cljs
+        id: version
+        run: |
+          VERSION=$(grep -oP 'defonce version "\K[^"]+' src/main/frontend/version.cljs)
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Building version: $VERSION"
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies
+        run: yarn install
+
+      - name: Build ClojureScript
+        run: |
+          yarn gulp:build
+          yarn cljs:release-electron
+          yarn webpack-app-build
+
+      - name: Upload static assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: cljs-static
+          path: static/
+
+  # ===========================================================================
+  # MODIFIED: Build Windows x64 (now includes sidecar)
+  # ===========================================================================
+  build-windows-x64:
+    needs: [compile-cljs, build-sidecar-jar, build-jre-x64]
+    # Handle conditional dependencies - run if cljs succeeded, ignore sidecar if skipped
+    if: |
+      !inputs.skip_x64 &&
+      needs.compile-cljs.result == 'success' &&
+      (inputs.skip_sidecar || (needs.build-sidecar-jar.result == 'success' && needs.build-jre-x64.result == 'success'))
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download static assets
+        uses: actions/download-artifact@v4
+        with:
+          name: cljs-static
+          path: static/
+
+      # NEW: Download sidecar artifacts
+      - name: Download sidecar JAR
+        if: ${{ !inputs.skip_sidecar }}
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-jar
+          path: resources/sidecar/
+
+      - name: Download JRE x64
+        if: ${{ !inputs.skip_sidecar }}
+        uses: actions/download-artifact@v4
+        with:
+          name: jre-x64
+          path: resources/jre/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies (x64)
+        working-directory: static
+        env:
+          npm_config_arch: x64
+        run: |
+          git config --global url."https://github.com".insteadOf ssh://git@github.com
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          yarn install
+
+      - name: Build Electron x64
+        working-directory: static
+        env:
+          npm_config_arch: x64
+        run: yarn electron:make
+
+      - name: Prepare artifacts
+        run: |
+          mkdir builds
+          move static\out\make\squirrel.windows\x64\*.nupkg builds\
+          move static\out\make\zip\win32\x64\*.zip builds\
+          move static\out\make\wix\x64\Logseq.msi builds\Logsidian-win-x64.msi
+        shell: cmd
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: builds/
+
+  # ===========================================================================
+  # MODIFIED: Build Windows ARM64 (now includes sidecar)
+  # ===========================================================================
+  build-windows-arm64:
+    needs: [compile-cljs, build-rsapi-arm64, build-sidecar-jar, build-jre-arm64]
+    if: |
+      !inputs.skip_arm64 &&
+      needs.compile-cljs.result == 'success' &&
+      needs.build-rsapi-arm64.result == 'success' &&
+      (inputs.skip_sidecar || (needs.build-sidecar-jar.result == 'success' && needs.build-jre-arm64.result == 'success'))
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download static assets
+        uses: actions/download-artifact@v4
+        with:
+          name: cljs-static
+          path: static/
+
+      - name: Download rsapi ARM64 binary
+        uses: actions/download-artifact@v4
+        with:
+          name: rsapi-win32-arm64-msvc
+          path: rsapi-arm64/
+
+      # NEW: Download sidecar artifacts
+      - name: Download sidecar JAR
+        if: ${{ !inputs.skip_sidecar }}
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-jar
+          path: resources/sidecar/
+
+      - name: Download JRE ARM64
+        if: ${{ !inputs.skip_sidecar }}
+        uses: actions/download-artifact@v4
+        with:
+          name: jre-arm64
+          path: resources/jre/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install dependencies (ARM64)
+        working-directory: static
+        env:
+          npm_config_arch: arm64
+        run: |
+          git config --global url."https://github.com".insteadOf ssh://git@github.com
+          git config --global url."https://github.com/".insteadOf git@github.com:
+          yarn install
+
+      - name: Download dugite ARM64 binary
+        working-directory: static/node_modules/dugite
+        env:
+          npm_config_arch: arm64
+        run: node script/download-git.js
+
+      - name: Install rsapi ARM64 binary
+        shell: pwsh
+        run: |
+          $rsapiDir = "static/node_modules/@logseq/rsapi"
+          Copy-Item "rsapi-arm64/rsapi.win32-arm64-msvc.node" -Destination "$rsapiDir/"
+
+      - name: Build Electron ARM64
+        working-directory: static
+        env:
+          npm_config_arch: arm64
+        run: yarn electron:make-win-arm64
+
+      - name: Prepare artifacts
+        run: |
+          mkdir builds
+          move static\out\make\squirrel.windows\arm64\*.nupkg builds\
+          move static\out\make\zip\win32\arm64\*.zip builds\
+          move static\out\make\wix\arm64\Logseq.msi builds\Logsidian-win-arm64.msi
+        shell: cmd
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: logsidian-win-arm64
+          path: builds/
+
+  # ===========================================================================
+  # NEW: E2E Tests (runs on built app)
+  # ===========================================================================
+  e2e-tests:
+    name: E2E Tests
+    needs: [build-windows-x64, build-sidecar-jar, build-jre-x64]
+    if: |
+      !inputs.skip_e2e &&
+      !inputs.skip_x64 &&
+      needs.build-windows-x64.result == 'success' &&
+      (inputs.skip_sidecar || needs.build-sidecar-jar.result == 'success')
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download Electron app (x64)
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: builds/
+
+      - name: Extract Electron app
+        shell: pwsh
+        run: |
+          $zip = Get-ChildItem builds/*.zip | Select-Object -First 1
+          Expand-Archive $zip.FullName -DestinationPath electron-app/
+
+      - name: Download sidecar JAR
+        if: ${{ !inputs.skip_sidecar }}
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-jar
+          path: sidecar/target/
+
+      - name: Download JRE x64
+        if: ${{ !inputs.skip_sidecar }}
+        uses: actions/download-artifact@v4
+        with:
+          name: jre-x64
+          path: jre-x64/
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Install Playwright
+        run: npx playwright install --with-deps
+
+      - name: Start sidecar
+        if: ${{ !inputs.skip_sidecar }}
+        shell: pwsh
+        run: |
+          Start-Process -FilePath "jre-x64/bin/java.exe" `
+                        -ArgumentList "-jar", "sidecar/target/logsidian-sidecar.jar" `
+                        -NoNewWindow `
+                        -RedirectStandardOutput "sidecar-stdout.log" `
+                        -RedirectStandardError "sidecar-stderr.log"
+          Start-Sleep -Seconds 5
+
+      - name: Run E2E tests
+        run: npx playwright test --config e2e-electron/playwright.config.ts
+        env:
+          ELECTRON_APP_PATH: electron-app/
+
+      - name: Upload screenshots on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-screenshots
+          path: |
+            e2e-electron/screenshots/
+            clj-e2e/error-reports/playwright-electron/
+            sidecar-*.log
+
+      - name: Upload test report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-report
+          path: clj-e2e/error-reports/playwright-electron/
+
+  # ===========================================================================
+  # Test Release (manual trigger with test_release=true)
+  # ===========================================================================
+  test-release:
+    needs: [compile-cljs, build-windows-x64, build-windows-arm64, e2e-tests]
+    runs-on: ubuntu-22.04
+    if: |
+      github.event_name == 'workflow_dispatch' &&
+      inputs.test_release == true &&
+      always() && !cancelled()
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.compile-cljs.outputs.version }}
+      BRANCH: ${{ github.ref_name }}
+    steps:
+      - name: Download x64 artifacts
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: ./x64/
+
+      - name: Download ARM64 artifacts
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-arm64
+          path: ./arm64/
+
+      - name: Prepare files
+        run: |
+          mkdir -p release
+          [ -d x64 ] && mv x64/* release/ || true
+          [ -d arm64 ] && mv arm64/* release/ || true
+          ls -la release/
+
+      - name: Create test release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: test-${{ env.BRANCH }}-${{ github.run_number }}
+          name: "TEST: ${{ env.BRANCH }} v${{ env.VERSION }} (#${{ github.run_number }})"
+          prerelease: true
+          files: release/*
+          body: |
+            ## TEST BUILD - ${{ env.BRANCH }}
+
+            **Version:** v${{ env.VERSION }}
+            **Branch:** `${{ env.BRANCH }}`
+            **Run:** #${{ github.run_number }}
+
+            This is a **test release** from a feature branch.
+
+            ### Artifacts
+            - **x64**: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' && '✅' || '⏭️ Skipped' }}
+            - **ARM64**: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' && '✅' || '⏭️ Skipped' }}
+            - **Sidecar**: ${{ !inputs.skip_sidecar && '✅ Included' || '⏭️ Not included' }}
+            - **E2E Tests**: ${{ !inputs.skip_e2e && needs.e2e-tests.result == 'success' && '✅ Passed' || '⏭️ Skipped or failed' }}
+
+            ### Installation
+            - **x64 MSI**: `Logsidian-win-x64.msi`
+            - **ARM64 MSI**: `Logsidian-win-arm64.msi`
+
+  # ===========================================================================
+  # Production Release (on master push)
+  # ===========================================================================
+  release:
+    needs: [compile-cljs, build-windows-x64, build-windows-arm64, e2e-tests]
+    runs-on: ubuntu-22.04
+    if: |
+      github.ref == 'refs/heads/master' &&
+      (github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.test_release != true)) &&
+      always() && !cancelled()
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.compile-cljs.outputs.version }}
+    steps:
+      - name: Download x64 artifacts
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-x64
+          path: ./x64/
+
+      - name: Download ARM64 artifacts
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: logsidian-win-arm64
+          path: ./arm64/
+
+      - name: Prepare x64 release
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        run: mkdir -p release-x64 && mv x64/* release-x64/
+
+      - name: Prepare ARM64 release
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        run: mkdir -p release-arm64 && mv arm64/* release-arm64/
+
+      - name: Create x64 versioned release
+        if: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}-win64
+          name: Windows x64 v${{ env.VERSION }}
+          prerelease: false
+          files: release-x64/*
+          body: |
+            ## Logsidian Windows x64 v${{ env.VERSION }}
+
+            A high-performance fork of Logseq focused on file-based graphs.
+            "Obsidian's speed with Logseq's blocks, files stay yours."
+
+            **Included:**
+            - Core note-taking, local files, whiteboards, plugins
+            - Logseq Sync (rsapi)
+            - Git integration (dugite)
+            - **JVM Sidecar** for lazy-loading large graphs
+
+            ### Installation
+            - **MSI installer** (recommended): `Logsidian-win-x64.msi`
+            - **Portable ZIP**: `Logsidian-win32-x64-*.zip`
+
+      - name: Create ARM64 versioned release
+        if: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' }}
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.VERSION }}-arm64
+          name: Windows ARM64 v${{ env.VERSION }}
+          prerelease: false
+          files: release-arm64/*
+          body: |
+            ## Logsidian Windows ARM64 v${{ env.VERSION }}
+
+            A high-performance fork of Logseq focused on file-based graphs.
+            "Obsidian's speed with Logseq's blocks, files stay yours."
+
+            **Included:**
+            - Core note-taking, local files, whiteboards, plugins
+            - Logseq Sync (rsapi compiled for ARM64)
+            - Git integration (dugite with ARM64 binary)
+            - **JVM Sidecar** for lazy-loading large graphs (ARM64 JRE)
+
+            ### Installation
+            - **MSI installer** (recommended): `Logsidian-win-arm64.msi`
+            - **Portable ZIP**: `Logsidian-win32-arm64-*.zip`
+
+      - name: Prepare rolling release
+        run: |
+          mkdir -p release-latest
+          [ -d release-x64 ] && cp release-x64/* release-latest/ || true
+          [ -d release-arm64 ] && cp release-arm64/* release-latest/ || true
+
+      - name: Update latest rolling release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: win-latest
+          name: Windows Latest (v${{ env.VERSION }})
+          prerelease: true
+          files: release-latest/*
+          body: |
+            ## Logsidian Windows Latest
+
+            **Current version:** v${{ env.VERSION }}
+
+            This rolling release always contains the latest Windows builds.
+
+            ### Available Architectures
+            - **x64**: ${{ !inputs.skip_x64 && needs.build-windows-x64.result == 'success' && '✅' || '⏭️ Not included' }}
+            - **ARM64**: ${{ !inputs.skip_arm64 && needs.build-windows-arm64.result == 'success' && '✅' || '⏭️ Not included' }}
+
+            ### E2E Test Status
+            - **Smoke Tests**: ${{ needs.e2e-tests.result == 'success' && '✅ Passed' || (needs.e2e-tests.result == 'skipped' && '⏭️ Skipped' || '❌ Failed') }}
+
+            ### Installation
+            - `Logsidian-win-x64.msi` - Windows x64
+            - `Logsidian-win-arm64.msi` - Windows ARM64 (Surface Pro X, etc.)

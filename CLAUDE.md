@@ -109,9 +109,21 @@ npx playwright test --config e2e-electron/playwright.config.ts
 | Workflow | Trigger |
 |----------|---------|
 | `build-windows.yml` | `version.cljs` changes or manual |
+| `test-sidecar-ci.yml` | Push to `feature-sidecar-cicd` or manual |
 | `sync-upstream.yml` | Weekly (Mon 6:00 UTC) or manual |
 
 Manual options: `test_release`, `skip_x64`, `skip_arm64`
+
+### What CI Builds
+
+The `build-windows.yml` workflow produces:
+- **Sidecar JAR** (~27 MB) - JVM backend
+- **Minimal JRE** (~35 MB) - Custom runtime via jlink
+- **MSI Installer** (~310 MB) - Includes bundled JRE (no Java required)
+
+### Bundled JRE
+
+The app automatically finds the bundled JRE at `{resources}/jre/bin/java.exe`. Falls back to `JAVA_HOME` or system `PATH` if not found.
 
 ---
 

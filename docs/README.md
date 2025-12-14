@@ -74,6 +74,8 @@ Detailed research findings, library comparisons, and technical investigations. R
 - [hybrid-architecture-search.md](research/hybrid-architecture-search.md) - Vector search compatibility analysis
 - [edge-architecture-pivot.md](research/edge-architecture-pivot.md) - Edge computing pivot feasibility (~10-15 days, not massive!)
 - [hosting-comparison.md](research/hosting-comparison.md) - Fly.io vs Cloudflare Workers comparison and recommendation
+- [github-actions-sidecar-cicd.md](research/github-actions-sidecar-cicd.md) - **Comprehensive CI/CD research** for sidecar builds including job dependencies, JRE bundling with jlink, E2E test strategy, TDD implementation plan, cost analysis, and security considerations
+- [github-actions-complete-workflow.yml](research/github-actions-complete-workflow.yml) - Target workflow YAML showing final integrated state
 
 ### `/decisions`
 Architecture Decision Records (ADRs) documenting key technical decisions.
