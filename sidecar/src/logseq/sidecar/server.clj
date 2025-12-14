@@ -315,12 +315,10 @@
     ;; The second element (value) should stay as-is
     (and (vector? eid) (= 2 (count eid)))
     (let [[attr val] eid
-          normalized-attr (if (and (string? attr) (clojure.string/includes? attr "/"))
-                            (let [[ns name] (clojure.string/split attr #"/" 2)]
-                              (keyword ns name))
-                            (if (string? attr)
-                              (keyword attr)
-                              attr))]
+          ;; keyword handles "ns/name" automatically, no need to split
+          normalized-attr (if (string? attr)
+                            (keyword attr)
+                            attr)]
       [normalized-attr val])
 
     ;; Other - try generic normalization (might be an entity map or something)
@@ -696,28 +694,30 @@
           (let [[repo page-name _opts] (:args payload)]
             (if-let [conn (get-conn server repo)]
               (let [db @conn
-                    ;; Find page by name
-                    page-id (d/q '[:find ?e .
-                                   :in $ ?name
-                                   :where [?e :block/name ?name]]
-                                 db (clojure.string/lower-case page-name))]
-                (if page-id
-                  (let [;; Find all blocks belonging to this page
-                        block-ids (d/q '[:find [?b ...]
-                                         :in $ ?page-id
-                                         :where [?b :block/page ?page-id]]
-                                       db page-id)
-                        ;; Retract page and all its blocks
-                        retractions (concat
-                                     [[:db.fn/retractEntity page-id]]
-                                     (map (fn [bid] [:db.fn/retractEntity bid]) block-ids))]
+                    lowered-name (clojure.string/lower-case page-name)
+                    ;; Find page and all its blocks in a single query using or-join
+                    eids-to-retract (d/q '[:find [?e ...]
+                                           :in $ ?page-name
+                                           :where
+                                           (or-join [?e ?page-id]
+                                             (and [?page-id :block/name ?page-name]
+                                                  [(identity ?page-id) ?e])
+                                             (and [?page-id :block/name ?page-name]
+                                                  [?e :block/page ?page-id]))]
+                                         db lowered-name)]
+                (if (seq eids-to-retract)
+                  (let [;; Find page-id for logging (first entity with :block/name)
+                        page-id (d/q '[:find ?e . :in $ ?name :where [?e :block/name ?name]]
+                                     db lowered-name)
+                        blocks-deleted (dec (count eids-to-retract))
+                        retractions (mapv (fn [eid] [:db.fn/retractEntity eid]) eids-to-retract)]
                     (d/transact! conn retractions)
                     (log/info "Deleted page from sidecar" {:page page-name
                                                            :page-id page-id
-                                                           :blocks-deleted (count block-ids)})
+                                                           :blocks-deleted blocks-deleted})
                     (protocol/make-response op {:deleted true
                                                 :page-id page-id
-                                                :blocks-deleted (count block-ids)} id))
+                                                :blocks-deleted blocks-deleted} id))
                   ;; Page not found, just return success (idempotent)
                   (do
                     (log/debug "Page not found in sidecar for deletion" {:page page-name})
