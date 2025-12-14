@@ -17,7 +17,8 @@
    ;; For file deletions:
    (file-sync/sync-file-delete! repo page-name)
    ```"
-  (:require [datascript.core :as d]
+  (:require [clojure.string :as string]
+            [datascript.core :as d]
             [frontend.db :as db]
             [frontend.db.file-based.model :as file-model]
             [frontend.sidecar.core :as sidecar]
@@ -46,7 +47,7 @@
         page-id (d/q '[:find ?e .
                        :in $ ?name
                        :where [?e :block/name ?name]]
-                     db (clojure.string/lower-case page-name))
+                     db (string/lower-case page-name))
         ;; Get all blocks belonging to this page
         block-ids (when page-id
                     (d/q '[:find [?b ...]

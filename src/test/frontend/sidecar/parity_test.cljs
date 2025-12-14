@@ -101,10 +101,10 @@
                            {:block/uuid page2-uuid :block/name "page2"}
                            {:block/uuid page3-uuid :block/name "page3"}]})
             ;; Query page entity IDs
-            page-ids (client/send-request :thread-api/q
-                       {:graph-id graph-id
-                        :query '[:find ?e ?name
-                                 :where [?e :block/name ?name]]})
+            _page-ids (client/send-request :thread-api/q
+                        {:graph-id graph-id
+                         :query '[:find ?e ?name
+                                  :where [?e :block/name ?name]]})
             ;; Create block with multiple refs
             _ (client/send-request :thread-api/transact
                 {:graph-id graph-id
@@ -240,10 +240,10 @@
             child-uuid (random-uuid)
             _ (client/send-request :create-graph {:graph-id graph-id})
             ;; Create parent page first
-            tx1-result (client/send-request :thread-api/transact
-                         {:graph-id graph-id
-                          :tx-data [{:block/uuid parent-uuid
-                                     :block/name "parent-page"}]})
+            _tx1-result (client/send-request :thread-api/transact
+                          {:graph-id graph-id
+                           :tx-data [{:block/uuid parent-uuid
+                                      :block/name "parent-page"}]})
             ;; Create child block with parent ref
             _ (client/send-request :thread-api/transact
                 {:graph-id graph-id

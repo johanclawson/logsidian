@@ -137,7 +137,7 @@
   (when (exists? js/performance.memory)
     (/ (.-usedJSHeapSize js/performance.memory) (* 1024 1024))))
 
-(defn- measure-memory-delta
+(defn- _measure-memory-delta
   "Measure memory change during operation (returns nil if not available)"
   [operation-fn]
   (when (exists? js/performance.memory)
@@ -153,7 +153,7 @@
 
 (deftest ^:benchmark graph-generation-benchmark
   (testing "Graph data generation performance"
-    (let [{:keys [time result]} (util/with-time
+    (let [{:keys [time _result]} (util/with-time
                                   (generate-test-graph-data SMALL-GRAPH-PAGES
                                                             SMALL-GRAPH-BLOCKS-PER-PAGE))]
       (record-benchmark! "generation"

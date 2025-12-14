@@ -70,7 +70,7 @@
   [op response]
   (swap! *ipc-responses assoc op response))
 
-(defn- get-ipc-calls
+(defn- _get-ipc-calls
   "Get all recorded IPC calls."
   []
   @*ipc-calls)
@@ -85,7 +85,7 @@
   [op]
   (some #(= op (first %)) @*ipc-calls))
 
-(defn- ipc-call-count
+(defn- _ipc-call-count
   "Count how many times an IPC operation was called."
   [op]
   (count (filter #(= op (first %)) @*ipc-calls)))

@@ -228,7 +228,6 @@
 
    Options:
    - :prefer-sidecar? - Whether to also start sidecar (default: true when available)
-   - :fallback-on-error? - Continue with worker-only if sidecar fails (default: true)
    - :on-backend-ready - Callback when backend is ready
    - :start-web-worker-fn - Function to start the web worker (required)
 
@@ -237,9 +236,8 @@
    - {:type :hybrid :worker true :sidecar :websocket} - Worker + WebSocket sidecar
    - {:type :worker} - Worker only"
   ([] (start-db-backend! {}))
-  ([{:keys [prefer-sidecar? fallback-on-error? on-backend-ready start-web-worker-fn]
-     :or {prefer-sidecar? true
-          fallback-on-error? true}}]
+  ([{:keys [prefer-sidecar? on-backend-ready start-web-worker-fn]
+     :or {prefer-sidecar? true}}]
    (let [use-ipc-sidecar? (and prefer-sidecar? (sidecar-enabled?))
          use-ws-sidecar? (and prefer-sidecar? (websocket-sidecar-enabled?))
 

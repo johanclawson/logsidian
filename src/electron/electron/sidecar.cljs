@@ -15,11 +15,9 @@
   (:require ["child_process" :as child-process]
             ["fs" :as fs]
             ["net" :as net]
-            ["os" :as os]
             ["path" :as node-path]
             [cljs-bean.core :as bean]
             [electron.logger :as logger]
-            [electron.utils :as utils]
             [electron.window :as window]
             [logseq.db :as ldb]
             [promesa.core :as p]))
@@ -56,8 +54,8 @@
   "Write a length-prefixed message to the socket.
    Format: <byte-length>\\n<message>\\n"
   [socket msg-str]
-  (let [bytes (js/Buffer.from msg-str "utf8")
-        len-line (str (.-length bytes) "\n")
+  (let [msg-buf (js/Buffer.from msg-str "utf8")
+        len-line (str (.-length msg-buf) "\n")
         msg-line (str msg-str "\n")]
     (.write socket len-line)
     (.write socket msg-line)))
