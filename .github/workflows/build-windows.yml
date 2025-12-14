@@ -21,7 +21,144 @@ on:
         type: boolean
         default: false
 
+env:
+  JAVA_VERSION: '21'
+  CLOJURE_VERSION: '1.11.1.1435'
+
 jobs:
+  # ============================================================
+  # Sidecar JAR Build (runs in parallel with compile-cljs)
+  # ============================================================
+  build-sidecar-jar:
+    name: Build Sidecar JAR
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Setup Clojure
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: ${{ env.CLOJURE_VERSION }}
+
+      - name: Cache Clojure dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-clojure-sidecar-${{ hashFiles('sidecar/deps.edn') }}
+          restore-keys: ${{ runner.os }}-clojure-sidecar-
+
+      - name: Build sidecar uberjar
+        run: cd sidecar && clojure -T:build uberjar
+
+      - name: Verify JAR
+        run: |
+          test -f sidecar/target/logsidian-sidecar.jar
+          SIZE=$(stat -c %s sidecar/target/logsidian-sidecar.jar)
+          SIZE_MB=$((SIZE / 1024 / 1024))
+          echo "Sidecar JAR size: ${SIZE_MB} MB"
+
+      - name: Upload sidecar JAR
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-jar
+          path: sidecar/target/logsidian-sidecar.jar
+          if-no-files-found: error
+
+  # ============================================================
+  # JRE x64 Build (needs sidecar JAR for verification)
+  # ============================================================
+  build-jre-x64:
+    name: Build JRE x64
+    needs: [build-sidecar-jar]
+    runs-on: windows-latest
+    if: ${{ !inputs.skip_x64 }}
+    steps:
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'microsoft'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: Download sidecar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-jar
+          path: sidecar/
+
+      - name: Create minimal JRE with jlink
+        shell: pwsh
+        run: |
+          $modules = "java.base,java.logging,java.sql,java.naming,java.management"
+          Write-Host "Creating minimal JRE with modules: $modules"
+
+          jlink --module-path "$env:JAVA_HOME/jmods" `
+                --add-modules $modules `
+                --output jre-x64 `
+                --strip-debug `
+                --compress=2 `
+                --no-header-files `
+                --no-man-pages
+
+      - name: Verify JRE
+        shell: pwsh
+        run: |
+          # Check JRE exists and works
+          if (-not (Test-Path "jre-x64/bin/java.exe")) {
+            throw "java.exe not found in JRE"
+          }
+          & ./jre-x64/bin/java.exe -version
+
+          # Check size
+          $size = (Get-ChildItem -Recurse jre-x64 | Measure-Object -Sum Length).Sum
+          $sizeMB = [math]::Round($size/1MB, 2)
+          Write-Host "JRE size: $sizeMB MB"
+
+      - name: Verify sidecar runs with JRE
+        shell: pwsh
+        run: |
+          $proc = Start-Process -FilePath "./jre-x64/bin/java.exe" `
+                                -ArgumentList "-jar", "sidecar/logsidian-sidecar.jar" `
+                                -WindowStyle Hidden `
+                                -PassThru
+
+          # Wait for startup
+          $maxWait = 15
+          $connected = $false
+          for ($i = 1; $i -le $maxWait; $i++) {
+            Start-Sleep -Seconds 1
+            try {
+              $client = New-Object System.Net.Sockets.TcpClient
+              $client.Connect("127.0.0.1", 47632)
+              $connected = $true
+              $client.Close()
+              Write-Host "Sidecar listening on port 47632"
+              break
+            } catch {
+              Write-Host "Waiting for sidecar... ($i/$maxWait)"
+            }
+          }
+
+          Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
+
+          if (-not $connected) {
+            throw "Sidecar failed to start with bundled JRE"
+          }
+
+      - name: Upload JRE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jre-win32-x64
+          path: jre-x64/
+
+
   # First, build rsapi for ARM64 using native ARM64 runner
   build-rsapi-arm64:
     name: Build rsapi ARM64
@@ -145,7 +282,7 @@ jobs:
 
   # Build Windows x64
   build-windows-x64:
-    needs: [compile-cljs]
+    needs: [compile-cljs, build-sidecar-jar, build-jre-x64]
     runs-on: windows-latest
     if: ${{ !inputs.skip_x64 }}
     steps:
@@ -156,6 +293,18 @@ jobs:
         with:
           name: cljs-static
           path: static/
+
+      - name: Download sidecar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-jar
+          path: static/
+
+      - name: Download JRE x64
+        uses: actions/download-artifact@v4
+        with:
+          name: jre-win32-x64
+          path: static/jre/
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -192,8 +341,10 @@ jobs:
           path: builds/
 
   # Build Windows ARM64
+  # NOTE: JRE ARM64 is not built (windows-11-arm runners unavailable for private repos).
+  # The sidecar JAR is included but requires system Java or x64 JRE with emulation.
   build-windows-arm64:
-    needs: [compile-cljs, build-rsapi-arm64]
+    needs: [compile-cljs, build-rsapi-arm64, build-sidecar-jar]
     runs-on: windows-latest
     if: ${{ !inputs.skip_arm64 }}
     steps:
@@ -203,6 +354,12 @@ jobs:
         uses: actions/download-artifact@v4
         with:
           name: cljs-static
+          path: static/
+
+      - name: Download sidecar JAR
+        uses: actions/download-artifact@v4
+        with:
+          name: sidecar-jar
           path: static/
 
       - name: Download rsapi ARM64 binary
