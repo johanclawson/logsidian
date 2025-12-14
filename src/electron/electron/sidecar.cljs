@@ -184,22 +184,43 @@
               jar-path))
           candidates)))
 
+(defn- find-bundled-java
+  "Find the bundled JRE.
+   Search order:
+   1. {resourcesPath}/jre/bin/java[.exe]
+   2. {resourcesPath}/jre-win32-x64/bin/java[.exe] (platform-specific)"
+  []
+  (let [resources-path (get-resources-path)
+        platform (.-platform js/process)
+        arch (.-arch js/process)
+        java-exe (if (= platform "win32") "java.exe" "java")
+        candidates [(.join node-path resources-path "jre" "bin" java-exe)
+                    (.join node-path resources-path (str "jre-" platform "-" arch) "bin" java-exe)]]
+    (logger/debug "Searching for bundled JRE" {:candidates candidates})
+    (some (fn [java-path]
+            (when (.existsSync fs java-path)
+              (logger/info "Found bundled JRE" {:path java-path})
+              java-path))
+          candidates)))
+
 (defn- find-java
   "Find the Java executable.
    Search order:
-   1. JAVA_HOME environment variable
-   2. System PATH (just 'java')"
+   1. Bundled JRE in app resources (preferred)
+   2. JAVA_HOME environment variable
+   3. System PATH (just 'java')"
   []
-  (let [java-home (.-JAVA_HOME js/process.env)
-        java-exe (if (= (.-platform js/process) "win32") "java.exe" "java")]
-    (if java-home
-      (let [java-path (.join node-path java-home "bin" java-exe)]
-        (if (.existsSync fs java-path)
-          (do (logger/info "Found Java via JAVA_HOME" {:path java-path})
-              java-path)
-          (do (logger/debug "JAVA_HOME set but java not found" {:path java-path})
-              java-exe)))
-      java-exe)))
+  (or (find-bundled-java)
+      (let [java-home (.-JAVA_HOME js/process.env)
+            java-exe (if (= (.-platform js/process) "win32") "java.exe" "java")]
+        (if java-home
+          (let [java-path (.join node-path java-home "bin" java-exe)]
+            (if (.existsSync fs java-path)
+              (do (logger/info "Found Java via JAVA_HOME" {:path java-path})
+                  java-path)
+              (do (logger/debug "JAVA_HOME set but java not found" {:path java-path})
+                  java-exe)))
+          java-exe))))
 
 ;; =============================================================================
 ;; TCP Socket Connection
