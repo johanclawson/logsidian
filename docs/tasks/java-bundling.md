@@ -1,190 +1,134 @@
-# Phase 5.5: Java Runtime Bundling for MSIX
+# Java Runtime Bundling
 
-**Worktree:** `C:\Users\johan\repos\_worktrees\logsidian-bundling`
-**Branch:** `feature-sidecar-bundling`
-**Status:** Not Started
-**Priority:** 3
-**Estimate:** 3-4 hours
-**Depends on:** Phase 5 (Performance Benchmarks)
+**Status:** ✅ Basic Bundling Complete | ⏳ AppCDS Optimization Pending
+**Branch:** `feature-sidecar-cicd`
 
 ## Goal
 
-Bundle a minimal JRE with the MSIX installer so users don't need to install Java separately.
+Bundle a minimal JRE with the installer so users don't need to install Java separately.
 
-## Strategy: jlink + AppCDS
+## What's Implemented ✅
 
-### 1. Create Minimal JRE with jlink
+### 1. Minimal JRE Creation (jlink)
 
-```bash
-# Creates ~50-80MB runtime instead of ~200MB full JRE
-jlink --module-path $JAVA_HOME/jmods \
-      --add-modules java.base,java.logging,java.sql,java.naming,java.management \
-      --output jre-minimal \
-      --strip-debug \
-      --compress=2 \
-      --no-header-files \
-      --no-man-pages
-```
-
-### 2. Create AppCDS Archive for Fast Startup
-
-```bash
-# One-time: Generate class list
-java -Xshare:off -XX:DumpLoadedClassList=classes.lst -jar logsidian-sidecar.jar --dry-run
-
-# Build: Create AppCDS archive
-java -Xshare:dump -XX:SharedClassListFile=classes.lst \
-     -XX:SharedArchiveFile=logsidian-sidecar.jsa -jar logsidian-sidecar.jar
-
-# Result: ~100-200ms startup instead of ~500ms
-```
-
-### 3. Bundle Structure in MSIX
-
-```
-Logsidian.msix (total ~250-300MB)
-├── Logseq.exe (Electron app ~150MB)
-├── resources/
-│   ├── logsidian-sidecar.jar (~30MB)
-│   └── logsidian-sidecar.jsa (AppCDS archive ~5MB)
-└── jre-minimal/ (~50-80MB)
-    ├── bin/java.exe
-    └── lib/modules
-```
-
-## Implementation Steps
-
-### Step 1: Create jlink Script
-
-**File:** `scripts/build-jre.ps1`
+**CI Job:** `build-jre-x64` in `build-windows.yml`
 
 ```powershell
-param(
-    [ValidateSet("x64", "arm64")]
-    [string]$Arch = "x64"
-)
-
-$javaHome = $env:JAVA_HOME
-$modules = "java.base,java.logging,java.sql,java.naming,java.management"
-$output = "jre-$Arch"
-
-jlink --module-path "$javaHome/jmods" `
-      --add-modules $modules `
-      --output $output `
-      --strip-debug `
-      --compress=2 `
-      --no-header-files `
-      --no-man-pages
-
-Write-Host "Created minimal JRE at: $output"
-Write-Host "Size: $((Get-ChildItem $output -Recurse | Measure-Object -Property Length -Sum).Sum / 1MB) MB"
+jlink --module-path "$env:JAVA_HOME/jmods" `
+      --add-modules java.base,java.logging,java.sql,java.naming,java.management `
+      --output jre-win32-x64 `
+      --strip-debug --compress=2 --no-header-files --no-man-pages
 ```
 
-### Step 2: Update Electron Config
+**Result:** ~35 MB JRE (vs ~300 MB full JDK)
 
-**File:** `static/forge.config.js`
-
-```javascript
-module.exports = {
-  packagerConfig: {
-    extraResource: [
-      // Sidecar JAR
-      '../sidecar/target/logsidian-sidecar.jar',
-      // Platform-specific JRE (set by CI)
-      process.env.JRE_PATH || '../jre-minimal'
-    ]
-  }
-};
-```
-
-### Step 3: Modify Sidecar to Find Bundled Java
+### 2. Bundled JRE Discovery
 
 **File:** `src/electron/electron/sidecar.cljs`
 
-```clojure
-(defn- find-bundled-java
-  "Find the bundled Java executable in app resources"
-  []
-  (let [resources-path (.-resourcesPath js/process)
-        platform (.-platform js/process)
-        java-exe (if (= platform "win32") "java.exe" "java")
-        bundled-path (.join node-path resources-path "jre-minimal" "bin" java-exe)]
-    (if (.existsSync fs bundled-path)
-      (do (logger/info "Using bundled JRE" {:path bundled-path})
-          bundled-path)
-      ;; Fall back to system Java
-      (do (logger/warn "Bundled JRE not found, falling back to system Java")
-          "java"))))
+The `find-java` function checks for bundled JRE first:
+1. `{resources}/jre/bin/java.exe`
+2. `{resources}/jre-{platform}-{arch}/bin/java.exe`
+3. Falls back to `JAVA_HOME` or system `PATH`
+
+### 3. CI/CD Integration
+
+The build workflow:
+1. Builds sidecar JAR (~27 MB)
+2. Creates minimal JRE (~35 MB)
+3. Downloads both to `static/` folder
+4. Electron Forge packages them into the MSI
+
+### 4. Bundle Structure
+
+```
+Logsidian-win-x64.msi (~310 MB total)
+├── Logseq.exe (Electron app)
+├── resources/
+│   ├── logsidian-sidecar.jar (~27 MB)
+│   └── jre/
+│       ├── bin/java.exe
+│       └── lib/modules (~35 MB)
 ```
 
-### Step 4: Create AppCDS Generation Script
+## What's Pending ⏳
 
-**File:** `scripts/build-appcds.ps1`
+### AppCDS (Class Data Sharing)
+
+Would reduce JVM startup from ~2s to ~500ms.
+
+**Not yet implemented because:**
+- Requires generating class list at build time
+- Adds complexity to CI pipeline
+- Basic startup is acceptable for now
+
+**Implementation when needed:**
 
 ```powershell
-param(
-    [string]$JarPath = "sidecar/target/logsidian-sidecar.jar"
-)
-
-# Generate class list
-java -Xshare:off -XX:DumpLoadedClassList=classes.lst -jar $JarPath --dry-run
+# Generate class list (one-time)
+java -Xshare:off -XX:DumpLoadedClassList=classes.lst -jar logsidian-sidecar.jar --dry-run
 
 # Create AppCDS archive
 java -Xshare:dump -XX:SharedClassListFile=classes.lst `
-     -XX:SharedArchiveFile=logsidian-sidecar.jsa -jar $JarPath
+     -XX:SharedArchiveFile=sidecar.jsa -jar logsidian-sidecar.jar
 
-Write-Host "Created AppCDS archive: logsidian-sidecar.jsa"
+# Use at runtime
+java -Xshare:on -XX:SharedArchiveFile=sidecar.jsa -jar logsidian-sidecar.jar
 ```
 
-## Files to Create/Modify
+### ARM64 JRE
 
-| File | Action |
-|------|--------|
-| `scripts/build-jre.ps1` | Create - jlink script |
-| `scripts/build-appcds.ps1` | Create - AppCDS script |
-| `static/forge.config.js` | Modify - add extraResource |
-| `src/electron/electron/sidecar.cljs` | Modify - find bundled Java |
+**Blocked:** `windows-11-arm` runners not available for private repos.
 
-## Platform Support
-
-| Platform | JDK Distribution | Status |
-|----------|------------------|--------|
-| Windows x64 | Microsoft OpenJDK 21 | Ready |
-| Windows ARM64 | Microsoft OpenJDK 21 | Ready |
-| macOS (future) | Temurin/Zulu 21 | Planned |
+When available, add `build-jre-arm64` job to CI.
 
 ## Size Impact
 
 | Component | Size |
 |-----------|------|
-| Electron app | ~150MB |
-| Sidecar JAR | ~30MB |
-| AppCDS archive | ~5MB |
-| Minimal JRE | ~50-80MB |
-| **Total added** | **~85-115MB** |
+| Electron app (existing) | ~150 MB |
+| Sidecar JAR | ~27 MB |
+| Minimal JRE | ~35 MB |
+| **Total added** | **~62 MB** |
+| **MSI total** | **~310 MB** |
 
-## Startup Time Targets
+## Startup Time
 
-| Configuration | Cold Start | Warm Start |
-|---------------|------------|------------|
-| Full JRE, no cache | ~800ms | ~500ms |
-| jlink JRE + AppCDS | **~200ms** | **~100ms** |
+| Configuration | Time |
+|---------------|------|
+| Current (no AppCDS) | ~2s |
+| With AppCDS (future) | ~500ms |
 
-## Success Criteria
+## jlink Modules
 
-- [ ] jlink script creates minimal JRE (~50-80MB)
-- [ ] AppCDS archive reduces startup to <200ms
-- [ ] Electron config bundles JAR and JRE
-- [ ] Sidecar finds and uses bundled Java
-- [ ] Works on clean Windows (no Java installed)
-- [ ] Works on Windows ARM64
+```
+java.base          # Core (always required)
+java.logging       # For tools.logging
+java.sql           # For next.jdbc, sqlite-jdbc
+java.naming        # For sqlite-jdbc JNDI
+java.management    # For logback JMX
+```
 
 ## Testing
 
 ```bash
-# Test on clean Windows VM
-1. Install MSIX (no Java installed)
-2. Launch app
-3. Verify sidecar starts with bundled JRE
-4. Check startup time < 200ms
+# Verify MSI works without system Java
+1. Uninstall Java from system
+2. Install Logsidian-win-x64.msi
+3. Launch app
+4. Verify sidecar connects (check logs)
 ```
+
+## Success Criteria
+
+- [x] jlink creates minimal JRE (~35 MB)
+- [x] Electron finds and uses bundled Java
+- [x] MSI works on clean Windows (no Java)
+- [ ] AppCDS reduces startup to <500ms (future)
+- [ ] ARM64 JRE bundled (blocked)
+
+## References
+
+- [GitHub Actions CI/CD](./github-actions.md) - Full CI implementation
+- [jlink Documentation](https://docs.oracle.com/en/java/javase/21/docs/specs/man/jlink.html)
+- [AppCDS Guide](https://docs.oracle.com/en/java/javase/21/vm/class-data-sharing.html)
