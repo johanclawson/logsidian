@@ -9,6 +9,16 @@ name: Test Sidecar CI Components
 #   - Once all components pass, integrate into build-windows.yml
 
 on:
+  # Trigger on push to feature branch for TDD testing
+  push:
+    branches:
+      - feature-sidecar-cicd
+    paths:
+      - '.github/workflows/test-sidecar-ci.yml'
+      - 'sidecar/**'
+      - 'scripts/build-jre-test.ps1'
+      - 'scripts/test-sidecar-jre.ps1'
+
   workflow_dispatch:
     inputs:
       test_component:
@@ -39,7 +49,7 @@ jobs:
   test-sidecar-jar:
     name: 'TEST: Sidecar JAR Build'
     runs-on: ubuntu-22.04
-    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'sidecar-jar' }}
+    if: ${{ !inputs.test_component || inputs.test_component == 'all' || inputs.test_component == 'sidecar-jar' }}
     outputs:
       jar-size-mb: ${{ steps.verify.outputs.size }}
     steps:
@@ -115,7 +125,7 @@ jobs:
   test-jre-x64:
     name: 'TEST: JRE x64 Build'
     runs-on: windows-latest
-    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'jre-x64' }}
+    if: ${{ !inputs.test_component || inputs.test_component == 'all' || inputs.test_component == 'jre-x64' }}
     outputs:
       jre-size-mb: ${{ steps.verify.outputs.size }}
     steps:
@@ -201,7 +211,7 @@ jobs:
   test-jre-arm64:
     name: 'TEST: JRE ARM64 Build'
     runs-on: windows-11-arm
-    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'jre-arm64' }}
+    if: ${{ !inputs.test_component || inputs.test_component == 'all' || inputs.test_component == 'jre-arm64' }}
     outputs:
       jre-size-mb: ${{ steps.verify.outputs.size }}
     steps:
@@ -278,7 +288,7 @@ jobs:
   test-sidecar-tests:
     name: 'TEST: Sidecar Unit Tests'
     runs-on: ubuntu-22.04
-    if: ${{ inputs.test_component == 'all' || inputs.test_component == 'sidecar-tests' }}
+    if: ${{ !inputs.test_component || inputs.test_component == 'all' || inputs.test_component == 'sidecar-tests' }}
     steps:
       - uses: actions/checkout@v4
 
@@ -318,7 +328,7 @@ jobs:
     name: 'TEST: Sidecar + JRE Integration'
     needs: [test-sidecar-jar, test-jre-x64]
     runs-on: windows-latest
-    if: ${{ inputs.test_component == 'all' }}
+    if: ${{ !inputs.test_component || inputs.test_component == 'all' }}
     steps:
       - name: Download sidecar JAR
         uses: actions/download-artifact@v4
