@@ -91,3 +91,27 @@ frontend.common.missionary/background-task-running?
 ;; defonce
 mobile.components.popup/native-sheet-listener
 mobile.bottom-tabs/add-tab-listeners!
+;; Sidecar public API and constants
+electron.sidecar/RECONNECT_DELAY_MS
+electron.sidecar/connected?
+electron.sidecar/running?
+electron.sidecar/register-shutdown-handler!
+frontend.sidecar.core/force-disable-sidecar!
+frontend.sidecar.core/force-enable-sidecar!
+frontend.sidecar.core/force-enable-websocket-sidecar!
+frontend.sidecar.core/stop-sidecar!
+frontend.sidecar.core/sidecar-running?
+frontend.sidecar.core/stop-websocket-sidecar!
+frontend.sidecar.core/websocket-sidecar-running?
+frontend.sidecar.file-sync/sync-files-change!
+frontend.sidecar.initial-sync/register-sync-on-graph-added!
+frontend.sidecar.initial-sync/sync-tx-report!
+frontend.sidecar.websocket-client/RECONNECT_DELAY_MS
+frontend.sidecar.websocket-client/register-push-handler!
+frontend.sidecar.websocket-client/status
+;; Test helpers
+frontend.sidecar.baseline-benchmark-test/_measure-memory-delta
+frontend.sidecar.baseline-benchmark-test/format-results-markdown
+frontend.sidecar.baseline-benchmark-test/print-results-summary
+frontend.sidecar.ipc-test/_get-ipc-calls
+frontend.sidecar.ipc-test/_ipc-call-count
