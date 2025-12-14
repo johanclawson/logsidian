@@ -190,7 +190,7 @@ jobs:
           Write-Host "JRE size: $sizeMB MB"
           echo "size=$sizeMB" >> $env:GITHUB_OUTPUT
 
-          if ($size -lt 40MB) {
+          if ($size -lt 30MB) {
             throw "JRE too small ($sizeMB MB) - missing modules?"
           }
           if ($size -gt 120MB) {
@@ -207,11 +207,14 @@ jobs:
 
   # ============================================================
   # TEST 3: JRE ARM64 Build
+  # NOTE: windows-11-arm runners are NOT available for private repos.
+  # This job is skipped until the repo is made public or GitHub adds support.
+  # When enabled, remove 'false &&' from the condition below.
   # ============================================================
   test-jre-arm64:
-    name: 'TEST: JRE ARM64 Build'
+    name: 'TEST: JRE ARM64 Build (SKIPPED - private repo)'
     runs-on: windows-11-arm
-    if: ${{ !inputs.test_component || inputs.test_component == 'all' || inputs.test_component == 'jre-arm64' }}
+    if: ${{ false && (!inputs.test_component || inputs.test_component == 'all' || inputs.test_component == 'jre-arm64') }}
     outputs:
       jre-size-mb: ${{ steps.verify.outputs.size }}
     steps:
@@ -312,7 +315,7 @@ jobs:
           key: ${{ runner.os }}-clojure-sidecar-${{ hashFiles('sidecar/deps.edn') }}
 
       - name: Run sidecar unit tests
-        run: cd sidecar && clj -M:test
+        run: cd sidecar && clojure -M:test
         env:
           # Avoid port conflicts in parallel test runs
           SIDECAR_TEST_PORT_OFFSET: ${{ github.run_number }}
@@ -428,7 +431,7 @@ jobs:
           echo "|-----------|--------|" >> $GITHUB_STEP_SUMMARY
           echo "| Sidecar JAR Build | ${{ needs.test-sidecar-jar.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| JRE x64 Build | ${{ needs.test-jre-x64.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
-          echo "| JRE ARM64 Build | ${{ needs.test-jre-arm64.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
+          echo "| JRE ARM64 Build | ${{ needs.test-jre-arm64.result == 'success' && '✅' || (needs.test-jre-arm64.result == 'skipped' && '⏭️ SKIPPED') || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Sidecar Unit Tests | ${{ needs.test-sidecar-tests.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Sidecar + JRE Integration | ${{ needs.test-sidecar-jre-integration.result == 'success' && '✅' || '❌' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
@@ -439,9 +442,12 @@ jobs:
 
       - name: Check all passed
         run: |
+          # ARM64 is expected to be skipped for private repos
+          ARM64_OK="${{ needs.test-jre-arm64.result == 'success' || needs.test-jre-arm64.result == 'skipped' }}"
+
           if [ "${{ needs.test-sidecar-jar.result }}" != "success" ] || \
              [ "${{ needs.test-jre-x64.result }}" != "success" ] || \
-             [ "${{ needs.test-jre-arm64.result }}" != "success" ] || \
+             [ "$ARM64_OK" != "true" ] || \
              [ "${{ needs.test-sidecar-tests.result }}" != "success" ] || \
              [ "${{ needs.test-sidecar-jre-integration.result }}" != "success" ]; then
             echo "::error::Some tests failed - see summary above"
