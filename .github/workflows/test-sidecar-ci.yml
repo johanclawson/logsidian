@@ -345,74 +345,80 @@ jobs:
           name: test-jre-x64
           path: jre-x64/
 
-      # TDD Assertions
-      - name: '[ASSERT] Sidecar runs with minimal JRE'
+      # TDD Assertions - Combined startup and connection test in one step
+      - name: '[ASSERT] Sidecar runs and listens on TCP port'
         shell: pwsh
         run: |
-          Write-Host "Starting sidecar with minimal JRE..."
+          Write-Host "=== Starting sidecar with minimal JRE ==="
 
-          # Start sidecar in background
+          # Start sidecar as a background process
+          # Use -WindowStyle Hidden instead of -NoNewWindow for better CI compatibility
           $proc = Start-Process -FilePath "./jre-x64/bin/java.exe" `
                                 -ArgumentList "-jar", "sidecar/logsidian-sidecar.jar" `
-                                -NoNewWindow `
-                                -PassThru `
-                                -RedirectStandardOutput "sidecar-stdout.log" `
-                                -RedirectStandardError "sidecar-stderr.log"
+                                -WindowStyle Hidden `
+                                -PassThru
 
           Write-Host "Sidecar PID: $($proc.Id)"
+          $proc.Id | Out-File -FilePath "sidecar-pid.txt"
 
-          # Wait for startup
-          Start-Sleep -Seconds 5
-
-          # Check if process is still running
-          if ($proc.HasExited) {
-            Write-Host "Sidecar stdout:"
-            Get-Content sidecar-stdout.log
-            Write-Host "Sidecar stderr:"
-            Get-Content sidecar-stderr.log
-            throw "Sidecar process exited unexpectedly"
-          }
-
-          Write-Host "Sidecar is running!"
-
-      - name: '[ASSERT] Sidecar TCP port is listening'
-        shell: pwsh
-        run: |
-          # Check TCP port 47632
-          $maxAttempts = 10
-          $attempt = 0
+          # Wait for startup and test connection
+          $maxWait = 20
+          $waited = 0
           $connected = $false
 
-          while ($attempt -lt $maxAttempts -and -not $connected) {
+          while ($waited -lt $maxWait -and -not $connected) {
+            Start-Sleep -Seconds 1
+            $waited++
+
+            # Check if process is still running
+            $proc.Refresh()
+            if ($proc.HasExited) {
+              Write-Host "Sidecar process exited with code: $($proc.ExitCode)"
+              throw "Sidecar process exited unexpectedly"
+            }
+
+            # Check if port is listening via netstat
+            $listening = netstat -an | Select-String ":47632.*LISTENING"
+            if ($listening) {
+              Write-Host "Port 47632 is listening according to netstat"
+            }
+
+            # Try TCP connection
             try {
               $client = New-Object System.Net.Sockets.TcpClient
               $client.Connect("127.0.0.1", 47632)
               $connected = $true
               $client.Close()
-              Write-Host "Connected to sidecar on port 47632"
+              Write-Host "SUCCESS: Connected to sidecar on port 47632!"
             } catch {
-              $attempt++
-              Write-Host "Attempt $attempt/$maxAttempts - waiting for sidecar..."
-              Start-Sleep -Seconds 1
+              Write-Host "Attempt $waited/$maxWait - waiting for sidecar to accept connections..."
             }
           }
 
           if (-not $connected) {
-            throw "Failed to connect to sidecar on port 47632"
+            # Debug info before failing
+            Write-Host "=== Debug: Listening ports ==="
+            netstat -an | Select-String "LISTENING" | Select-Object -First 30
+            Write-Host "=== Debug: Java processes ==="
+            Get-Process -Name java -ErrorAction SilentlyContinue | Format-Table Id, ProcessName, StartTime
+
+            throw "Failed to connect to sidecar on port 47632 after $waited seconds"
           }
 
-      - name: Show sidecar logs
+          Write-Host "Sidecar is running and accepting connections!"
+
+      - name: Cleanup sidecar process
         if: always()
         shell: pwsh
         run: |
-          Write-Host "=== Sidecar stdout ==="
-          if (Test-Path sidecar-stdout.log) {
-            Get-Content sidecar-stdout.log -Tail 50
+          if (Test-Path "sidecar-pid.txt") {
+            $pid = Get-Content "sidecar-pid.txt"
+            Write-Host "Stopping sidecar process (PID: $pid)"
+            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
           }
-          Write-Host "=== Sidecar stderr ==="
-          if (Test-Path sidecar-stderr.log) {
-            Get-Content sidecar-stderr.log -Tail 50
-          }
+
+          # Also kill any remaining java processes
+          Get-Process -Name java -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 
   # ============================================================
   # Summary Job
