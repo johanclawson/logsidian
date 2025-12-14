@@ -412,9 +412,9 @@ jobs:
         shell: pwsh
         run: |
           if (Test-Path "sidecar-pid.txt") {
-            $pid = Get-Content "sidecar-pid.txt"
-            Write-Host "Stopping sidecar process (PID: $pid)"
-            Stop-Process -Id $pid -Force -ErrorAction SilentlyContinue
+            $sidecarPid = Get-Content "sidecar-pid.txt"
+            Write-Host "Stopping sidecar process (PID: $sidecarPid)"
+            Stop-Process -Id $sidecarPid -Force -ErrorAction SilentlyContinue
           }
 
           # Also kill any remaining java processes
