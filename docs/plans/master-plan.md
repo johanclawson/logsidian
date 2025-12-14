@@ -63,6 +63,8 @@
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
+**Note:** Vector/semantic search runs entirely in the Web Worker (not sidecar) and is unaffected by the hybrid architecture. See Section 2.5.6 and `docs/research/hybrid-architecture-search.md` for details.
+
 ---
 
 ## Testing Pyramid
@@ -411,6 +413,58 @@ npx playwright test --config e2e-electron/playwright.config.ts
 - Remove `test.skip` from "can create a new page"
 - Remove `test.skip` from "can create a block"
 - Verify they pass
+
+### 2.5.6 Search and Embedding Compatibility
+
+**Research Reference:** See `docs/research/hybrid-architecture-search.md` for detailed analysis.
+
+**Key Finding:** Vector/semantic search is **100% compatible** with hybrid architecture. No changes needed.
+
+**Why Vec-Search Operations Are Worker-Only:**
+
+The embedding pipeline runs entirely in the Web Worker because:
+1. **Transformers.js** requires browser environment (WebGPU/WASM)
+2. **HNSW index** is stored in IndexedDB (browser storage)
+3. **Embedding metadata** (`hnsw-label-updated-at`) is local to worker
+4. **Search result lookup** uses local DataScript (not sidecar)
+
+**Architecture:**
+```
+┌──────────────────────────────────────────────────────────────┐
+│                       Web Worker                              │
+│  embedding.cljs ──────────────────────────────────────────┐  │
+│        │                                                   │  │
+│        ▼                                                   │  │
+│  Local DataScript    ──Comlink──>    Inference Worker     │  │
+│  (stale blocks)                      (Transformers.js)    │  │
+│        │                                   │              │  │
+│        │                                   ▼              │  │
+│        │                            HNSW Index            │  │
+│        │                            (IndexedDB)           │  │
+│        ▼                                   │              │  │
+│  Search result lookup <────────────────────┘              │  │
+│  (d/entity @conn label)                                   │  │
+└──────────────────────────────────────────────────────────────┘
+                         │
+                    sync-datoms (one-way)
+                         ▼
+┌──────────────────────────────────────────────────────────────┐
+│                      JVM Sidecar                              │
+│  DataScript (copy) - For UI queries only, NOT embedding      │
+└──────────────────────────────────────────────────────────────┘
+```
+
+**Sidecar Vec-Search Stubs:**
+
+The sidecar has stubbed vec-search operations (`server.clj:804-871`) that return empty defaults. These were designed for a pure-sidecar approach but are **not needed** for hybrid architecture.
+
+**Decision:** Keep stubs as-is (no harm, useful for future pure-sidecar if ever needed).
+
+**E2E Test Verification (Post-Hybrid):**
+- [ ] Embedding model loads successfully
+- [ ] Blocks are embedded without errors
+- [ ] Semantic search returns results
+- [ ] Search works after app restart (IndexedDB persistence)
 
 ---
 
@@ -1034,6 +1088,20 @@ test.describe('Sidecar Electron Smoke Tests', () => {
 });
 ```
 
+### 3.8 Search E2E Tests (Post-Hybrid)
+
+**File:** `e2e-electron/tests/search.spec.ts` (to be created after hybrid works)
+
+**Dependencies:** Requires Phase 2.5 (hybrid architecture) to be complete.
+
+| Test | Description |
+|------|-------------|
+| Embedding model loads | App loads without embedding errors |
+| Search returns results | Keyword and semantic search work |
+| Search survives restart | IndexedDB persistence verified |
+
+**Note:** These tests should be added after Phase 2.5 (hybrid architecture) is complete, since search depends on having blocks parsed and available. See Section 2.5.6 for search architecture details.
+
 ### 3.2 Console Error Assertion Fixture
 
 **File:** `clj-e2e/src/logseq/e2e/error_collector.clj`
@@ -1560,8 +1628,14 @@ module.exports = {
   - [ ] Page creation
   - [ ] Block editing
   - [ ] Navigation
-  - [ ] Search
+  - [ ] Search (see details below)
   - [ ] Graph with 10k+ blocks
+- [ ] Search verification (see Section 2.5.6):
+  - [ ] Embedding model loads without errors
+  - [ ] Semantic search returns relevant results
+  - [ ] Keyword search works
+  - [ ] Search survives app restart (IndexedDB persistence)
+  - [ ] No console errors related to vec-search
 
 ### 6.2 Platform Testing
 
