@@ -17,7 +17,7 @@ export default defineConfig({
   retries: 0,
   workers: 1,  // Run tests serially - Electron doesn't support parallel
   reporter: [
-    ['html', { outputFolder: '../clj-e2e/error-reports/playwright-electron' }],
+    ['html', { outputFolder: '../clj-e2e/error-reports/playwright-electron', open: 'never' }],
     ['list']
   ],
   use: {

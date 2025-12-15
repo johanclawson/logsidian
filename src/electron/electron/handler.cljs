@@ -674,21 +674,40 @@
 (defmethod handle :window/open-blank-callback [^js win [_ _type]]
   (win/setup-window-listeners! win) nil)
 
+(defn- error->ipc-error
+  "Convert a CLJS error to a plain JS object for IPC serialization.
+   CLJS ExceptionInfo objects can't be cloned by Electron's structured cloning."
+  [e]
+  (let [data (ex-data e)
+        is-ex-info? (some? data)]
+    #js {:__ipc_error__ true
+         :message (or (ex-message e) (str e))
+         :data (when is-ex-info? (bean/->js data))
+         :type (if is-ex-info? "ExceptionInfo" "Error")}))
+
 (defn set-ipc-handler! [window]
   (let [main-channel "main"]
     (.handle ipcMain main-channel
              (fn [^js event args-js]
                (try
-                 (let [message (bean/->clj args-js)]
-                   ;; Be careful with the return values of `handle` defmethods.
-                   ;; Values that are not non-JS objects will cause this
-                   ;; exception -
-                   ;; https://www.electronjs.org/docs/latest/breaking-changes#behavior-changed-sending-non-js-objects-over-ipc-now-throws-an-exception
-                   (bean/->js (handle (or (utils/get-win-from-sender event) window) message)))
+                 (let [message (bean/->clj args-js)
+                       ;; Be careful with the return values of `handle` defmethods.
+                       ;; Values that are not non-JS objects will cause this
+                       ;; exception -
+                       ;; https://www.electronjs.org/docs/latest/breaking-changes#behavior-changed-sending-non-js-objects-over-ipc-now-throws-an-exception
+                       result (bean/->js (handle (or (utils/get-win-from-sender event) window) message))]
+                   ;; Wrap promise results to catch rejections with CLJS objects
+                   (if (and result (.-then result))
+                     (-> result
+                         (p/catch (fn [e]
+                                    (when-not (contains? #{"mkdir" "stat"} (nth args-js 0))
+                                      (logger/error "IPC promise error: " {:args args-js} e))
+                                    (error->ipc-error e))))
+                     result))
                  (catch :default e
                    (when-not (contains? #{"mkdir" "stat"} (nth args-js 0))
                      (logger/error "IPC error: " {:event event
                                                   :args args-js}
                                    e))
-                   e))))
+                   (error->ipc-error e)))))
     #(.removeHandler ipcMain main-channel)))

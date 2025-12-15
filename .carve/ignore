@@ -103,6 +103,9 @@ frontend.sidecar.core/stop-sidecar!
 frontend.sidecar.core/sidecar-running?
 frontend.sidecar.core/stop-websocket-sidecar!
 frontend.sidecar.core/websocket-sidecar-running?
+frontend.sidecar.core/enable-strict-mode!
+frontend.sidecar.core/disable-strict-mode!
+frontend.sidecar.core/strict-mode?
 frontend.sidecar.file-sync/sync-files-change!
 frontend.sidecar.initial-sync/register-sync-on-graph-added!
 frontend.sidecar.initial-sync/sync-tx-report!

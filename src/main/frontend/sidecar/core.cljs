@@ -33,6 +33,26 @@
 (defonce ^:private *sidecar-enabled? (atom nil))
 (defonce ^:private *websocket-sidecar-enabled? (atom nil))
 
+;; Strict mode: when true, sidecar failures throw instead of falling back to worker-only
+;; Use for E2E testing to ensure sidecar is actually working
+(defonce ^:private *strict-mode? (atom false))
+
+(defn enable-strict-mode!
+  "Enable strict mode - sidecar failures will throw instead of falling back.
+   Use for E2E testing to ensure sidecar is actually working."
+  []
+  (reset! *strict-mode? true))
+
+(defn disable-strict-mode!
+  "Disable strict mode - sidecar failures will fall back to worker-only."
+  []
+  (reset! *strict-mode? false))
+
+(defn strict-mode?
+  "Check if strict mode is enabled."
+  []
+  @*strict-mode?)
+
 (defn sidecar-enabled?
   "Check if sidecar mode is enabled (Electron IPC path).
 
@@ -250,9 +270,16 @@
                                                 (log/info :hybrid-sidecar-connected {:type :ipc})
                                                 :ipc))
                                       (p/catch (fn [err]
-                                                 (log/warn :hybrid-sidecar-failed
-                                                           {:type :ipc :error (str err)})
-                                                 nil)))
+                                                 (if (strict-mode?)
+                                                   (do
+                                                     (log/error :hybrid-sidecar-failed-strict
+                                                                {:type :ipc :error (str err)})
+                                                     (throw (ex-info "Sidecar IPC connection failed (strict mode)"
+                                                                     {:type :ipc :error err})))
+                                                   (do
+                                                     (log/warn :hybrid-sidecar-failed
+                                                               {:type :ipc :error (str err)})
+                                                     nil)))))
 
                                   use-ws-sidecar?
                                   (-> (start-websocket-sidecar!)
@@ -260,9 +287,16 @@
                                                 (log/info :hybrid-sidecar-connected {:type :websocket})
                                                 :websocket))
                                       (p/catch (fn [err]
-                                                 (log/warn :hybrid-sidecar-failed
-                                                           {:type :websocket :error (str err)})
-                                                 nil)))
+                                                 (if (strict-mode?)
+                                                   (do
+                                                     (log/error :hybrid-sidecar-failed-strict
+                                                                {:type :websocket :error (str err)})
+                                                     (throw (ex-info "Sidecar WebSocket connection failed (strict mode)"
+                                                                     {:type :websocket :error err})))
+                                                   (do
+                                                     (log/warn :hybrid-sidecar-failed
+                                                               {:type :websocket :error (str err)})
+                                                     nil)))))
 
                                   :else
                                   (p/resolved nil)))]
