@@ -469,7 +469,11 @@ test.describe('Sidecar Electron Smoke Tests', () => {
 
     await page.waitForTimeout(300);
 
-    // Type some content (this should create/edit a block)
+    // Press Enter first to create a new block (instead of editing existing block content)
+    await page.keyboard.press('Enter');
+    await page.waitForTimeout(300);
+
+    // Type some content in the new block
     const blockContent = `E2E test ${Date.now()}`;
     await page.keyboard.type(blockContent);
     await page.waitForTimeout(500);
@@ -477,7 +481,7 @@ test.describe('Sidecar Electron Smoke Tests', () => {
     // Take screenshot after typing
     await page.screenshot({ path: 'e2e-electron/screenshots/after-typing.png' });
 
-    // Press Enter to confirm the block
+    // Press Enter to confirm the block and create another (optional, just to ensure content is saved)
     await page.keyboard.press('Enter');
     await page.waitForTimeout(500);
 
