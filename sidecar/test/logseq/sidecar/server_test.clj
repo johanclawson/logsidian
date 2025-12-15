@@ -410,3 +410,57 @@
               (pipes/disconnect-client client))))
         (finally
           (server/stop-server srv))))))
+
+;; =============================================================================
+;; View Data Tests (for journal rendering)
+;; =============================================================================
+
+(deftest ^:server get-view-data-journals-test
+  (testing "get-view-data returns journal IDs when journals? is true"
+    (let [srv (server/start-server {:port *test-port*})]
+      (try
+        (let [graph-id (server/create-graph srv "journal-graph" {})]
+          ;; Transact some journal pages with journal-day attribute
+          (server/transact! srv graph-id
+                            [{:db/id -1
+                              :block/uuid (random-uuid)
+                              :block/name "dec 15th, 2025"
+                              :block/original-name "Dec 15th, 2025"
+                              :block/journal? true
+                              :block/journal-day 20251215}
+                             {:db/id -2
+                              :block/uuid (random-uuid)
+                              :block/name "dec 14th, 2025"
+                              :block/original-name "Dec 14th, 2025"
+                              :block/journal? true
+                              :block/journal-day 20251214}
+                             {:db/id -3
+                              :block/uuid (random-uuid)
+                              :block/name "regular page"
+                              :block/original-name "Regular Page"}])
+
+          ;; Get view data for journals
+          (let [result (server/handle-get-view-data srv graph-id nil {:journals? true})]
+            (is (map? result) "Should return a map")
+            (is (= 2 (:count result)) "Should have 2 journals")
+            (is (= 2 (count (:data result))) "Data should have 2 IDs")
+            ;; Verify the IDs are valid entity IDs (positive integers)
+            (is (every? pos-int? (:data result)) "All IDs should be positive integers")
+            ;; Pull the first entity to verify it's the most recent
+            (let [first-id (first (:data result))
+                  first-entity (server/pull srv graph-id [:block/journal-day] first-id)]
+              (is (= 20251215 (:block/journal-day first-entity))
+                  "Most recent journal should be first"))))
+        (finally
+          (server/stop-server srv))))))
+
+(deftest ^:server get-view-data-non-journals-test
+  (testing "get-view-data returns nil for non-journal views in file graphs"
+    (let [srv (server/start-server {:port *test-port*})]
+      (try
+        (let [graph-id (server/create-graph srv "view-graph" {})]
+          ;; get-view-data without journals? flag should return nil
+          (let [result (server/handle-get-view-data srv graph-id 123 {})]
+            (is (nil? result) "Non-journal view data should return nil")))
+        (finally
+          (server/stop-server srv))))))

@@ -53,30 +53,47 @@
     (is (contains? routing/worker-only-ops :thread-api/rtc-stop))
     (is (contains? routing/worker-only-ops :thread-api/rtc-sync-graph!))))
 
-(deftest sidecar-preferred-ops-queries
-  (testing "Query operations should prefer sidecar"
-    (is (contains? routing/sidecar-preferred-ops :thread-api/q)
-        "Datalog queries benefit from sidecar lazy loading")
-    (is (contains? routing/sidecar-preferred-ops :thread-api/pull)
-        "Entity pull benefits from sidecar")
-    (is (contains? routing/sidecar-preferred-ops :thread-api/pull-many)
-        "Batch pull benefits from sidecar")
-    (is (contains? routing/sidecar-preferred-ops :thread-api/datoms)
-        "Datoms access benefits from sidecar")))
+;; TEMPORARILY DISABLED: Query routing to sidecar is disabled during development.
+;; Re-enable these tests once initial sync is reliable.
+#_(deftest sidecar-preferred-ops-queries
+    (testing "Query operations should prefer sidecar"
+      (is (contains? routing/sidecar-preferred-ops :thread-api/q)
+          "Datalog queries benefit from sidecar lazy loading")
+      (is (contains? routing/sidecar-preferred-ops :thread-api/pull)
+          "Entity pull benefits from sidecar")
+      (is (contains? routing/sidecar-preferred-ops :thread-api/pull-many)
+          "Batch pull benefits from sidecar")
+      (is (contains? routing/sidecar-preferred-ops :thread-api/datoms)
+          "Datoms access benefits from sidecar")))
 
-(deftest sidecar-preferred-ops-outliner
-  (testing "Outliner operations should prefer sidecar"
-    (is (contains? routing/sidecar-preferred-ops :thread-api/transact)
-        "Transactions benefit from sidecar")
-    (is (contains? routing/sidecar-preferred-ops :thread-api/apply-outliner-ops)
-        "Outliner ops benefit from sidecar")))
+#_(deftest sidecar-preferred-ops-outliner
+    (testing "Outliner operations should prefer sidecar"
+      (is (contains? routing/sidecar-preferred-ops :thread-api/transact)
+          "Transactions benefit from sidecar")
+      (is (contains? routing/sidecar-preferred-ops :thread-api/apply-outliner-ops)
+          "Outliner ops benefit from sidecar")))
 
-(deftest sidecar-preferred-ops-graph
-  (testing "Graph management operations should prefer sidecar"
-    (is (contains? routing/sidecar-preferred-ops :thread-api/create-or-open-db))
-    (is (contains? routing/sidecar-preferred-ops :thread-api/list-db))
-    (is (contains? routing/sidecar-preferred-ops :thread-api/db-exists))
-    (is (contains? routing/sidecar-preferred-ops :thread-api/get-initial-data))))
+;; TEMPORARILY DISABLED: Graph management ops go to web worker for file parsing
+#_(deftest sidecar-preferred-ops-graph
+    (testing "Graph management operations still route to sidecar"
+      (is (contains? routing/sidecar-preferred-ops :thread-api/create-or-open-db))
+      (is (contains? routing/sidecar-preferred-ops :thread-api/list-db))
+      (is (contains? routing/sidecar-preferred-ops :thread-api/db-exists))))
+
+;; Note: get-view-data is NOT in sidecar-preferred-ops because the sidecar DB
+;; may be empty during initial graph loading (files parsed in web worker).
+;; Once initial sync is reliable, this test can be re-enabled.
+#_(deftest sidecar-preferred-ops-view
+    (testing "View data operations should prefer sidecar (for journal rendering)"
+      (is (contains? routing/sidecar-preferred-ops :thread-api/get-view-data)
+          "get-view-data should route to sidecar for journal data")))
+
+(deftest get-view-data-routes-to-worker
+  (testing "get-view-data should currently route to worker (sidecar DB may be empty during init)"
+    (is (= :worker (routing/route-operation :thread-api/get-view-data true))
+        "get-view-data routes to worker even when sidecar available")
+    (is (= :worker (routing/route-operation :thread-api/get-view-data false))
+        "get-view-data routes to worker when sidecar unavailable")))
 
 ;; =============================================================================
 ;; Test: Routing Logic
@@ -91,21 +108,31 @@
     (is (= :worker (routing/route-operation :thread-api/vec-search-search true))
         "vec-search routes to worker even when sidecar available")))
 
-(deftest route-operation-sidecar-preferred-available
-  (testing "Sidecar-preferred ops route to sidecar when available"
-    (is (= :sidecar (routing/route-operation :thread-api/q true))
-        "Query routes to sidecar when available")
-    (is (= :sidecar (routing/route-operation :thread-api/pull true))
-        "Pull routes to sidecar when available")
-    (is (= :sidecar (routing/route-operation :thread-api/transact true))
-        "Transact routes to sidecar when available")))
+;; TEMPORARILY DISABLED: Query routing to sidecar is disabled during development.
+#_(deftest route-operation-sidecar-preferred-available
+    (testing "Sidecar-preferred ops route to sidecar when available"
+      (is (= :sidecar (routing/route-operation :thread-api/q true))
+          "Query routes to sidecar when available")
+      (is (= :sidecar (routing/route-operation :thread-api/pull true))
+          "Pull routes to sidecar when available")
+      (is (= :sidecar (routing/route-operation :thread-api/transact true))
+          "Transact routes to sidecar when available")))
 
-(deftest route-operation-sidecar-preferred-unavailable
-  (testing "Sidecar-preferred ops fall back to worker when sidecar unavailable"
-    (is (= :worker (routing/route-operation :thread-api/q false))
-        "Query falls back to worker when sidecar unavailable")
-    (is (= :worker (routing/route-operation :thread-api/pull false))
-        "Pull falls back to worker when sidecar unavailable")))
+#_(deftest route-operation-sidecar-preferred-unavailable
+    (testing "Sidecar-preferred ops fall back to worker when sidecar unavailable"
+      (is (= :worker (routing/route-operation :thread-api/q false))
+          "Query falls back to worker when sidecar unavailable")
+      (is (= :worker (routing/route-operation :thread-api/pull false))
+          "Pull falls back to worker when sidecar unavailable")))
+
+(deftest query-ops-route-to-worker
+  (testing "Query operations currently route to worker (sidecar DB empty during init)"
+    (is (= :worker (routing/route-operation :thread-api/q true))
+        "Query routes to worker even when sidecar available")
+    (is (= :worker (routing/route-operation :thread-api/pull true))
+        "Pull routes to worker even when sidecar available")
+    (is (= :worker (routing/route-operation :thread-api/transact true))
+        "Transact routes to worker even when sidecar available")))
 
 (deftest route-operation-unknown-ops
   (testing "Unknown/unclassified ops default to worker"

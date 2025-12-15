@@ -60,22 +60,40 @@
     :thread-api/write-log
     :thread-api/mobile-get-logs})
 
+;; TEMPORARY: Sidecar routing is disabled during initial development.
+;; The issue is that the sidecar DB is empty during initial graph loading
+;; (files are parsed by web worker, sync-datoms hasn't run yet).
+;; Queries to an empty sidecar return nil, causing blank content.
+;;
+;; TODO: Re-enable sidecar routing once initial sync is reliable.
+;; This requires ensuring sync-graph-to-sidecar! completes before
+;; the UI starts querying.
+;;
+;; CRITICAL: Graph management ops (create-or-open-db, list-db, db-exists)
+;; MUST go to web worker so it can set up its local DataScript database
+;; for file parsing. If these go to sidecar only, the web worker's DB
+;; is never initialized and file parsing fails silently.
+;;
+;; For now, all operations go to the web worker (single-worker mode).
 (def sidecar-preferred-ops
-  "Operations that PREFER sidecar when available (for lazy loading performance)"
-  #{:thread-api/q
-    :thread-api/pull
-    :thread-api/pull-many
-    :thread-api/datoms
-    :thread-api/transact
-    :thread-api/apply-outliner-ops
-    :thread-api/get-page-trees
-    :thread-api/get-file-writes
-    :thread-api/delete-page
-    :thread-api/sync-datoms
-    :thread-api/create-or-open-db
-    :thread-api/list-db
-    :thread-api/db-exists
-    :thread-api/get-initial-data})
+  "Operations that PREFER sidecar when available (for lazy loading performance).
+   CURRENTLY DISABLED - all operations go to web worker."
+  #{;; ALL OPERATIONS DISABLED for now.
+    ;; The hybrid architecture requires careful orchestration:
+    ;; 1. Web worker must create its graph first (create-or-open-db)
+    ;; 2. Files are parsed by web worker (mldoc)
+    ;; 3. Only THEN can data be synced to sidecar (sync-datoms)
+    ;; 4. Queries can only go to sidecar after sync is complete
+    ;;
+    ;; Since this orchestration isn't implemented yet, all operations
+    ;; go to the web worker for reliability.
+    ;;
+    ;; TODO: Implement proper orchestration in initial_sync.cljs:
+    ;; - After graph/added event completes
+    ;; - Call create-or-open-db in sidecar
+    ;; - Then sync all datoms
+    ;; - Then re-enable query routing
+    })
 
 (defn route-operation
   "Determine which backend to use for an operation.

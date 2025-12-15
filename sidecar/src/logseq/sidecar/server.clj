@@ -527,6 +527,41 @@
     ;; Return nil if graph doesn't exist yet - frontend will handle
     nil))
 
+(defn handle-get-view-data
+  "Get view data for rendering.
+   For journals? true, returns list of journal page IDs sorted by date descending.
+   This mirrors db-view/get-view-data in the frontend."
+  [^SidecarServer server repo _view-id {:keys [journals?] :as _opts}]
+  (if journals?
+    ;; Get latest journals from DataScript
+    (let [conn (get-conn server repo)]
+      (log/debug "get-view-data" {:repo repo :journals? journals? :conn? (some? conn)})
+      (if conn
+        (let [db @conn
+              ;; Get today's date as YYYYMMDD integer
+              today (let [now (java.time.LocalDate/now)]
+                      (+ (* (.getYear now) 10000)
+                         (* (.getMonthValue now) 100)
+                         (.getDayOfMonth now)))
+              ;; Get all journal-day datoms for debugging
+              all-journal-datoms (d/datoms db :avet :block/journal-day)
+              _ (log/debug "get-view-data all journal datoms" {:total (count (seq all-journal-datoms))})
+              ;; Query datoms with :block/journal-day, filter to <= today, sort desc
+              ids (->> all-journal-datoms
+                       (filter (fn [d] (<= (:v d) today)))
+                       (sort-by :v >)  ; descending by date
+                       (mapv :e))]     ; get entity IDs
+          (log/debug "get-view-data journals" {:count (count ids) :today today})
+          {:count (count ids)
+           :data ids})
+        ;; No connection - return empty
+        (do
+          (log/warn "get-view-data: no connection for repo" {:repo repo
+                                                              :graphs (keys (.graphs server))})
+          {:count 0 :data []})))
+    ;; Non-journal views not supported in file graphs
+    nil))
+
 ;; Accessors for testing
 (defn get-app-state [_server] @*app-state)
 (defn get-context [_server] @*context)
@@ -888,11 +923,11 @@
             (log/debug "Stub op called (unsupported):" op)
             (protocol/make-response op nil id))
 
-          ;; View data - used for DB-based views, not applicable to file graphs
+          ;; View data - journals are supported, other views return nil
           :thread-api/get-view-data
-          (do
-            (log/debug "Stub op called (unsupported):" op)
-            (protocol/make-response op nil id))
+          (let [[repo view-id opts] (:args payload)
+                result (handle-get-view-data server repo view-id opts)]
+            (protocol/make-response op result id))
 
           ;; Unknown operation (log at debug level for discovery)
           (do
