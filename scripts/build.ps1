@@ -243,16 +243,29 @@ if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 # Step 5a: Copy pre-built native binaries if they exist
 # This handles cases where npm install doesn't provide working binaries
-$nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-x64"
+# Detect architecture (arm64 vs x64)
+$arch = if ([System.Environment]::Is64BitOperatingSystem -and [System.Runtime.InteropServices.RuntimeInformation]::ProcessArchitecture -eq [System.Runtime.InteropServices.Architecture]::Arm64) { "arm64" } else { "x64" }
+Write-Host "Detected architecture: $arch" -ForegroundColor Cyan
+
+$nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-$arch"
+# Fallback to x64 if arm64 directory doesn't exist
+if (-not (Test-Path $nativeBinDir)) {
+    $nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-x64"
+    Write-Host "Note: Using x64 binaries as fallback" -ForegroundColor Yellow
+}
+
 if (Test-Path $nativeBinDir) {
     Write-Host "`n=== Step 5a: Installing pre-built native binaries ===" -ForegroundColor Cyan
 
-    # rsapi - copy to @logseq/rsapi package
-    $rsapiSrc = Join-Path $nativeBinDir "rsapi.win32-x64-msvc.node"
+    # rsapi - copy to @logseq/rsapi package (architecture-specific filename)
+    $rsapiFilename = "rsapi.win32-$arch-msvc.node"
+    $rsapiSrc = Join-Path $nativeBinDir $rsapiFilename
     $rsapiDest = Join-Path $PWD "node_modules/@logseq/rsapi"
     if ((Test-Path $rsapiSrc) -and (Test-Path $rsapiDest)) {
-        Write-Host "Copying rsapi native binary..."
+        Write-Host "Copying rsapi native binary ($rsapiFilename)..."
         Copy-Item $rsapiSrc -Destination $rsapiDest -Force
+    } elseif (-not (Test-Path $rsapiSrc)) {
+        Write-Host "Warning: rsapi binary not found at $rsapiSrc" -ForegroundColor Yellow
     }
 
     # keytar - copy to keytar package
@@ -362,20 +375,29 @@ if ($appDir) {
 
     # Verify/copy native binaries to the final app
     $appResourcesDir = Join-Path $appDir.FullName "resources/app/node_modules"
-    $nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-x64"
+    # Detect architecture from app directory name (e.g., Logseq-win32-arm64)
+    $appArch = if ($appDir.Name -match "arm64") { "arm64" } else { "x64" }
+    $nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-$appArch"
+    # Fallback to x64 if arch-specific directory doesn't exist
+    if (-not (Test-Path $nativeBinDir)) {
+        $nativeBinDir = Join-Path $ProjectRoot "native-binaries/win32-x64"
+    }
 
     if ((Test-Path $nativeBinDir) -and (Test-Path $appResourcesDir)) {
-        Write-Host "`n=== Verifying native binaries in final app ===" -ForegroundColor Cyan
+        Write-Host "`n=== Verifying native binaries in final app (arch: $appArch) ===" -ForegroundColor Cyan
 
-        # rsapi
-        $rsapiDest = Join-Path $appResourcesDir "@logseq/rsapi/rsapi.win32-x64-msvc.node"
+        # rsapi (architecture-specific filename)
+        $rsapiFilename = "rsapi.win32-$appArch-msvc.node"
+        $rsapiDest = Join-Path $appResourcesDir "@logseq/rsapi/$rsapiFilename"
         if (-not (Test-Path $rsapiDest)) {
-            $rsapiSrc = Join-Path $nativeBinDir "rsapi.win32-x64-msvc.node"
+            $rsapiSrc = Join-Path $nativeBinDir $rsapiFilename
             if (Test-Path $rsapiSrc) {
-                Write-Host "Copying rsapi to final app..."
+                Write-Host "Copying rsapi ($rsapiFilename) to final app..."
                 $rsapiDestDir = Join-Path $appResourcesDir "@logseq/rsapi"
                 if (-not (Test-Path $rsapiDestDir)) { New-Item -ItemType Directory -Force -Path $rsapiDestDir | Out-Null }
                 Copy-Item $rsapiSrc -Destination $rsapiDestDir -Force
+            } else {
+                Write-Host "Warning: rsapi binary not found at $rsapiSrc" -ForegroundColor Yellow
             }
         } else {
             Write-Host "rsapi binary present in final app" -ForegroundColor Green

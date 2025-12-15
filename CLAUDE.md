@@ -46,6 +46,20 @@ Options: `-SkipInstall`, `-ElectronOnly`, `-Help`
 
 > **Note:** See global CLAUDE.md for detailed path corruption issues with yarn/npm in Claude Code's bash environment.
 
+### Native Binaries (arm64/x64)
+
+Pre-built native binaries are stored in `native-binaries/`:
+- `native-binaries/win32-arm64/` - ARM64 binaries
+- `native-binaries/win32-x64/` - x64 binaries
+
+**Critical binary:** `rsapi.win32-{arch}-msvc.node` - Required for file parsing.
+
+The build script auto-detects architecture and copies the correct binaries. If E2E tests fail with rsapi errors, manually copy:
+```bash
+# For arm64:
+cp native-binaries/win32-arm64/rsapi.win32-arm64-msvc.node static/out/Logseq-win32-arm64/resources/app/node_modules/@logseq/rsapi/
+```
+
 ---
 
 ## Architecture

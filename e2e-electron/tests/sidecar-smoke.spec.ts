@@ -368,15 +368,20 @@ test.describe('Sidecar Electron Smoke Tests', () => {
     // Take screenshot after typing
     await page.screenshot({ path: 'e2e-electron/screenshots/search-typed.png' });
 
-    // Look for "Create page" option
-    const createOption = page.locator('text=/Create.*page/i, text=/New page/i').first();
-    if (await createOption.isVisible({ timeout: 2000 }).catch(() => false)) {
-      await createOption.click();
+    // Look for "Create page" option and click it
+    const createOption = page.locator('text=/Create.*page/i, text=/New page/i, [data-value="create"]').first();
+    if (await createOption.isVisible({ timeout: 3000 }).catch(() => false)) {
+      await createOption.scrollIntoViewIfNeeded();
+      await createOption.click({ force: true, timeout: 5000 });
     } else {
       // Press Enter to create/navigate
       await page.keyboard.press('Enter');
     }
-    await page.waitForTimeout(1500);
+    await page.waitForTimeout(2000);
+
+    // Close search modal if still open by pressing Escape
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(500);
 
     // Take screenshot after navigation
     await page.screenshot({ path: 'e2e-electron/screenshots/after-create-page.png' });
@@ -398,18 +403,36 @@ test.describe('Sidecar Electron Smoke Tests', () => {
     // Take screenshot to see current state
     await page.screenshot({ path: 'e2e-electron/screenshots/before-block-create.png' });
 
-    // Use keyboard shortcut to go to journals (g then j in Logseq)
-    // Or try clicking - but scroll into view first
+    // First, ensure the sidebar is visible by clicking the hamburger menu
+    const sidebar = page.locator('.left-sidebar-inner, .cp__sidebar-left-layout, nav.left-sidebar');
+    const sidebarVisible = await sidebar.isVisible({ timeout: 1000 }).catch(() => false);
+
+    if (!sidebarVisible) {
+      console.log('Sidebar not visible, opening via hamburger menu...');
+      // Click hamburger menu to open sidebar
+      const hamburger = page.locator('.cp__header-menu-trigger, button[aria-label="Menu"], .menu-trigger').first();
+      if (await hamburger.isVisible({ timeout: 2000 }).catch(() => false)) {
+        await hamburger.click();
+        await page.waitForTimeout(1000);
+      }
+    }
+
+    // Take screenshot after trying to open sidebar
+    await page.screenshot({ path: 'e2e-electron/screenshots/after-sidebar-open.png' });
+
+    // Try keyboard shortcut to go to journals (g then j in Logseq)
+    console.log('Navigating to journals via keyboard shortcut...');
+    await page.keyboard.press('g');
+    await page.waitForTimeout(200);
+    await page.keyboard.press('j');
+    await page.waitForTimeout(1000);
+
+    // If keyboard didn't work, try clicking the Journals link
     const journalsLink = page.locator('a:has-text("Journals"), [data-testid="nav-journals"]').first();
     if (await journalsLink.isVisible({ timeout: 2000 }).catch(() => false)) {
+      console.log('Found Journals link, clicking...');
       await journalsLink.scrollIntoViewIfNeeded();
       await journalsLink.click({ force: true });
-      await page.waitForTimeout(500);
-    } else {
-      // Try keyboard navigation: press 'g' then 'j' for go-to-journals
-      await page.keyboard.press('g');
-      await page.waitForTimeout(100);
-      await page.keyboard.press('j');
       await page.waitForTimeout(500);
     }
 

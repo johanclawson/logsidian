@@ -91,7 +91,21 @@
                   (if (.-isError (.-value ^js data))
                     (do (js/console.error "Unexpected webworker error:" (-> data bean/->clj (get-in [:value :value])))
                         (js/console.log (get-in (bean/->clj data) [:value :value :stack])))
-                    (js/console.error "Unexpected webworker error :" data))
+                    ;; Non-Error thrown value - extract useful info
+                    (let [value (.-value ^js data)
+                          clj-value (try (bean/->clj value) (catch :default _ nil))
+                          ;; Try to get ex-info message and data
+                          ex-message (or (.-message value)
+                                         (when (map? clj-value) (:message clj-value))
+                                         (when (map? clj-value) (get-in clj-value [:value :message])))
+                          ex-data (or (when (map? clj-value) (:data clj-value))
+                                      (when (map? clj-value) (get-in clj-value [:value :data]))
+                                      clj-value)]
+                      (js/console.error "Unexpected webworker error (non-Error):"
+                                        (or ex-message "unknown"))
+                      (js/console.error "Error data:" (pr-str ex-data))
+                      (js/console.error "Raw value:" (try (js/JSON.stringify value nil 2)
+                                                          (catch :default _ (str value))))))
                   (if (string? data)
                     (let [[e payload] (ldb/read-transit-str data)]
                       (handle (keyword e) wrapped-worker payload))
