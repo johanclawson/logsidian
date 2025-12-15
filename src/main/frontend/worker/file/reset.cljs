@@ -8,7 +8,8 @@
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]
             [logseq.graph-parser :as graph-parser]
-            [logseq.graph-parser.db :as gp-db]))
+            [logseq.graph-parser.db :as gp-db]
+            [logseq.graph-parser.mldoc :as gp-mldoc]))
 
 (defn- page-exists-in-another-file
   "Conflict of files towards same page"
@@ -49,6 +50,30 @@
   (validate-existing-file repo conn file-page file-path)
   (graph-parser/get-blocks-to-delete @conn file-page file-path retain-uuid-blocks))
 
+;; =============================================================================
+;; AST Streaming to Sidecar (Optional)
+;; =============================================================================
+;; When sidecar is enabled, we can send parsed AST directly to sidecar
+;; for extraction. This provides an alternative to datom sync and
+;; enables future optimization where worker doesn't need DataScript.
+
+(defn- send-ast-to-sidecar!
+  "Send parsed AST to sidecar for extraction and transaction.
+   This is called in addition to local transact for now.
+   Returns nil (fire-and-forget for performance)."
+  [repo file-path content format]
+  (try
+    (let [config (gp-mldoc/default-config format)
+          ast (gp-mldoc/->edn content config)]
+      (when (seq ast)
+        ;; Post message to main process for sidecar forwarding
+        ;; The main process will check if sidecar is available
+        (worker-util/post-message :sidecar-extract-and-transact
+                                  [repo file-path {:ast ast :format format}])))
+    (catch :default e
+      ;; Don't fail the main flow if sidecar send fails
+      (js/console.warn "Failed to send AST to sidecar:" e))))
+
 (defn- reset-file!*
   "Parse file.
    Decide how to treat the parsed file based on the file's triggering event
@@ -60,20 +85,27 @@
   (graph-parser/parse-file db-conn file-path content options))
 
 (defn reset-file!
-  "Main fn for updating a db with the results of a parsed file"
+  "Main fn for updating a db with the results of a parsed file.
+   Also optionally sends AST to sidecar for extraction (if enabled)."
   ([repo conn file-path content]
    (reset-file! repo conn file-path content {}))
-  ([repo conn file-path content {:keys [verbose _ctime _mtime] :as options}]
+  ([repo conn file-path content {:keys [verbose _ctime _mtime send-ast-to-sidecar?] :as options}]
    (let [config (worker-state/get-config repo)
-         options (merge (dissoc options :verbose)
+         format (or (common-util/get-format file-path) :markdown)
+         options (merge (dissoc options :verbose :send-ast-to-sidecar?)
                         {:delete-blocks-fn (partial validate-and-get-blocks-to-delete repo conn)
                          ;; Options here should also be present in gp-cli/parse-graph
                          :extract-options (merge
                                            {:user-config config
                                             :date-formatter (worker-state/get-date-formatter repo)
-                                            :block-pattern (common-config/get-block-pattern
-                                                            (or (common-util/get-format file-path) :markdown))
+                                            :block-pattern (common-config/get-block-pattern format)
                                             :filename-format (:file/name-format config)}
                                            ;; To avoid skipping the `:or` bounds for keyword destructuring
-                                           (when (some? verbose) {:verbose verbose}))})]
-     (:tx (reset-file!* conn file-path content options)))))
+                                           (when (some? verbose) {:verbose verbose}))})
+         {:keys [tx ast]} (reset-file!* conn file-path content options)]
+     ;; Optionally send AST to sidecar for extraction
+     ;; This is in addition to local transact for now
+     (when (and send-ast-to-sidecar? (seq ast))
+       (worker-util/post-message :sidecar-extract-and-transact
+                                 [repo file-path {:ast ast :format format}]))
+     tx)))

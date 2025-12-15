@@ -28,9 +28,12 @@
   http-kit/http-kit {:mvn/version "2.8.0"}
 
   ;; GraalJS for running mldoc.js (JavaScript parser)
-  ;; Using 23.0.x for better compatibility with standard OpenJDK
-  org.graalvm.js/js {:mvn/version "23.0.5"}
-  org.graalvm.js/js-scriptengine {:mvn/version "23.0.5"}}
+  ;; ARCHIVED: GraalJS interpreter mode too slow for production use
+  ;; See sidecar/archive/graaljs-experiment/README.md for details
+  ;; Now using AST streaming: worker parses with V8, sidecar extracts
+  ;; org.graalvm.polyglot/polyglot {:mvn/version "25.0.1"}
+  ;; org.graalvm.polyglot/js {:mvn/version "25.0.1" :extension "pom"}
+  }
 
  ;; Test-only dependencies (Java WebSocket client for testing)
  ;; Note: Java-WebSocket is only needed for tests, not runtime

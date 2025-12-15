@@ -92,7 +92,9 @@ clj-e2e/                    # Browser E2E tests (Wally)
 | Server & handlers | `sidecar/src/logseq/sidecar/server.clj` |
 | IStorage/SQLite | `sidecar/src/logseq/sidecar/storage.clj` |
 | Outliner ops | `sidecar/src/logseq/sidecar/outliner.clj` |
+| AST extraction | `sidecar/src/logseq/sidecar/extract.clj` |
 | File export | `sidecar/src/logseq/sidecar/file_export.clj` |
+| Operation routing | `src/main/frontend/sidecar/routing.cljs` |
 | Initial sync | `src/main/frontend/sidecar/initial_sync.cljs` |
 | File sync | `src/main/frontend/sidecar/file_sync.cljs` |
 
@@ -175,20 +177,80 @@ The app automatically finds the bundled JRE at `{resources}/jre/bin/java.exe`. F
 
 ```clojure
 ;; Graph management
-:thread-api/list-db, :thread-api/sync-datoms
+:thread-api/list-db, :thread-api/create-or-open-db, :thread-api/sync-datoms
 
-;; Queries
-:thread-api/q, :thread-api/pull, :thread-api/datoms
+;; Queries (routed to sidecar after sync completes)
+:thread-api/q, :thread-api/pull, :thread-api/pull-many, :thread-api/datoms
 
-;; Outliner operations
-:thread-api/apply-outliner-ops
+;; Transactions
+:thread-api/transact, :thread-api/apply-outliner-ops
+
+;; Outliner operations (via apply-outliner-ops)
 ;; Ops: :save-block, :insert-blocks, :delete-blocks, :move-blocks,
 ;;      :move-blocks-up-down, :indent-outdent-blocks,
 ;;      :create-page, :rename-page, :delete-page, :batch-import-edn
 
 ;; File sync
 :thread-api/delete-page, :thread-api/get-page-trees, :thread-api/get-file-writes
+
+;; AST extraction
+:thread-api/extract-and-transact
 ```
+
+### Operation Routing
+
+Operations are automatically routed based on sync status (see `routing.cljs`):
+- **Worker-only ops:** File parsing (mldoc), WebGPU vec-search, RTC
+- **Sidecar-preferred ops:** Queries, transactions, outliner ops (after sync completes)
+- **During initial sync:** All operations go to worker
+- **After sync completes:** Query operations routed to sidecar
+
+### Current Test Status
+
+- **Sidecar unit tests:** 122 tests, 374 assertions (all passing)
+- **E2E tests:** 3 of 4 passing (1 skipped due to UI issue)
+
+---
+
+## Debugging
+
+### Sidecar Debug Logging
+
+Enable verbose logging for the JVM sidecar:
+
+```bash
+# Via environment variable
+LOGSIDIAN_DEBUG=true java -jar sidecar/target/logsidian-sidecar.jar
+
+# Via JVM system property
+java -Dlogsidian.debug=true -jar sidecar/target/logsidian-sidecar.jar
+```
+
+Debug output goes to:
+- Console: `[DEBUG] OPERATION-NAME {...}`
+- File: `sidecar-debug.log` (pretty-printed EDN)
+
+Logged operations: `REQUEST-RAW`, `QUERY-RECEIVED`, `QUERY-NORMALIZED`, `QUERY-SUCCESS`, `QUERY-ERROR`, `RULES-INSPECTION`
+
+### Frontend Routing Debug
+
+Enable routing decision logging in the browser DevTools console:
+
+```javascript
+// Enable - shows routing decisions for sidecar-preferred ops
+frontend.sidecar.routing.enable_debug_BANG_()
+
+// Disable
+frontend.sidecar.routing.disable_debug_BANG_()
+```
+
+Output format:
+- `[ROUTING->SIDECAR] {:op :thread-api/q :repo "..."}` - Query routed to sidecar
+- `[ROUTING->WORKER] {:op :thread-api/q :repo "..." :reason :sync-incomplete}` - Query routed to worker (with reason)
+
+Reasons for worker routing:
+- `:sidecar-not-ready` - Sidecar not connected
+- `:sync-incomplete` - Initial sync not finished for this repo
 
 ---
 

@@ -4,6 +4,7 @@
             [clojure.string :as string]
             [frontend.handler.file-based.file :as file-handler]
             [frontend.handler.notification :as notification]
+            [frontend.sidecar.routing :as routing]
             [frontend.state :as state]
             [frontend.undo-redo :as undo-redo]
             [lambdaisland.glogi :as log]
@@ -69,6 +70,20 @@
 
 (defmethod handle :notify-existing-file  [_ _worker data]
   (state/pub-event! [:graph/notify-existing-file data]))
+
+(defmethod handle :sidecar-extract-and-transact [_ _worker data]
+  ;; Forward AST to sidecar for extraction and transaction
+  ;; data is [repo file-path {:ast ast :format format}]
+  (when (routing/sidecar-ready?)
+    (let [[repo file-path ast-data] data]
+      (-> (routing/<invoke-sidecar :thread-api/extract-and-transact false repo file-path ast-data)
+          (p/then (fn [result]
+                    (log/debug :sidecar-extract-success {:file file-path
+                                                          :pages (:page-count result)
+                                                          :blocks (:block-count result)})))
+          (p/catch (fn [error]
+                     (log/warn :sidecar-extract-failed {:file file-path
+                                                         :error (str error)})))))))
 
 (defmethod handle :remote-graph-gone []
   (state/pub-event! [:rtc/remote-graph-gone]))

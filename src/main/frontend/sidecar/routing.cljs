@@ -29,6 +29,47 @@
 (defonce ^:private *sidecar-worker (atom nil))
 (defonce ^:private *sidecar-ready? (atom false))
 
+;; Debug logging enabled during development
+;; TODO: Set to false by default before release
+;; Toggle in browser console: frontend.sidecar.routing.enable_debug_BANG_() / disable_debug_BANG_()
+(defonce ^:private *debug-routing* (atom true))
+
+(defn enable-debug! [] (reset! *debug-routing* true))
+(defn disable-debug! [] (reset! *debug-routing* false))
+
+;; Track per-repo sync completion status
+;; Key: repo URL, Value: true when initial sync is complete
+(defonce ^:private *sync-complete-repos (atom #{}))
+
+;; =============================================================================
+;; Sync State Management
+;; =============================================================================
+
+(defn mark-sync-complete!
+  "Mark initial sync as complete for a repo.
+   Called by initial_sync after all datoms are transferred to sidecar."
+  [repo]
+  (log/info :routing-sync-complete {:repo repo})
+  (swap! *sync-complete-repos conj repo))
+
+(defn mark-sync-incomplete!
+  "Mark sync as incomplete for a repo.
+   Called when a graph is closed or needs re-sync."
+  [repo]
+  (log/info :routing-sync-incomplete {:repo repo})
+  (swap! *sync-complete-repos disj repo))
+
+(defn sync-complete?
+  "Check if initial sync is complete for a repo.
+   Returns true only after sync-graph-to-sidecar! has finished."
+  [repo]
+  (contains? @*sync-complete-repos repo))
+
+(defn clear-all-sync-state!
+  "Clear all sync state. Used during testing and shutdown."
+  []
+  (reset! *sync-complete-repos #{}))
+
 ;; =============================================================================
 ;; Operation Classification
 ;; =============================================================================
@@ -60,57 +101,54 @@
     :thread-api/write-log
     :thread-api/mobile-get-logs})
 
-;; TEMPORARY: Sidecar routing is disabled during initial development.
-;; The issue is that the sidecar DB is empty during initial graph loading
-;; (files are parsed by web worker, sync-datoms hasn't run yet).
-;; Queries to an empty sidecar return nil, causing blank content.
-;;
-;; TODO: Re-enable sidecar routing once initial sync is reliable.
-;; This requires ensuring sync-graph-to-sidecar! completes before
-;; the UI starts querying.
+;; Operations that benefit from sidecar's lazy loading and persistent storage.
+;; These ops are routed to sidecar ONLY when:
+;; 1. Sidecar is connected and ready
+;; 2. Initial sync for the repo is complete (data exists in sidecar)
 ;;
 ;; CRITICAL: Graph management ops (create-or-open-db, list-db, db-exists)
 ;; MUST go to web worker so it can set up its local DataScript database
 ;; for file parsing. If these go to sidecar only, the web worker's DB
 ;; is never initialized and file parsing fails silently.
-;;
-;; For now, all operations go to the web worker (single-worker mode).
 (def sidecar-preferred-ops
   "Operations that PREFER sidecar when available (for lazy loading performance).
-   CURRENTLY DISABLED - all operations go to web worker."
-  #{;; ALL OPERATIONS DISABLED for now.
-    ;; The hybrid architecture requires careful orchestration:
-    ;; 1. Web worker must create its graph first (create-or-open-db)
-    ;; 2. Files are parsed by web worker (mldoc)
-    ;; 3. Only THEN can data be synced to sidecar (sync-datoms)
-    ;; 4. Queries can only go to sidecar after sync is complete
-    ;;
-    ;; Since this orchestration isn't implemented yet, all operations
-    ;; go to the web worker for reliability.
-    ;;
-    ;; TODO: Implement proper orchestration in initial_sync.cljs:
-    ;; - After graph/added event completes
-    ;; - Call create-or-open-db in sidecar
-    ;; - Then sync all datoms
-    ;; - Then re-enable query routing
-    })
+   Only routed to sidecar after initial sync completes for the repo."
+  #{;; Query operations benefit from sidecar lazy loading
+    :thread-api/q
+    :thread-api/pull
+    :thread-api/pull-many
+    :thread-api/datoms
+    ;; Write operations for single source of truth
+    :thread-api/transact
+    :thread-api/apply-outliner-ops})
 
 (defn route-operation
   "Determine which backend to use for an operation.
-   Returns :worker, :sidecar, or :worker (fallback when sidecar unavailable)."
-  [qkw sidecar-available?]
-  (cond
-    ;; Worker-only ops always go to worker
-    (contains? worker-only-ops qkw)
-    :worker
+   Returns :worker, :sidecar, or :worker (fallback when sidecar unavailable).
 
-    ;; Sidecar-preferred ops go to sidecar when available
-    (and sidecar-available? (contains? sidecar-preferred-ops qkw))
-    :sidecar
+   Arguments:
+   - qkw: Operation keyword (e.g., :thread-api/q)
+   - sidecar-available?: Whether sidecar is connected and ready
+   - repo: (optional) Repository URL for sync-complete checking"
+  ([qkw sidecar-available?]
+   (route-operation qkw sidecar-available? nil))
+  ([qkw sidecar-available? repo]
+   (cond
+     ;; Worker-only ops always go to worker
+     (contains? worker-only-ops qkw)
+     :worker
 
-    ;; Default: use worker
-    :else
-    :worker))
+     ;; Sidecar-preferred ops go to sidecar when:
+     ;; 1. Sidecar is available
+     ;; 2. Initial sync is complete for this repo (or no repo specified)
+     (and sidecar-available?
+          (contains? sidecar-preferred-ops qkw)
+          (or (nil? repo) (sync-complete? repo)))
+     :sidecar
+
+     ;; Default: use worker
+     :else
+     :worker)))
 
 ;; =============================================================================
 ;; Worker Management
@@ -151,35 +189,42 @@
 
 (defn <invoke
   "Invoke an operation on the appropriate backend.
-   Routes based on operation type and sidecar availability.
+   Routes based on operation type, sidecar availability, and sync status.
 
    qkw - Operation keyword (e.g., :thread-api/q)
    direct-pass? - Whether to pass args directly
-   args - Operation arguments
+   args - Operation arguments (first arg is typically repo URL)
 
    Returns a promise with the result."
   [qkw direct-pass? args]
-  (let [sidecar-available? (sidecar-ready?)
-        target (route-operation qkw sidecar-available?)
+  (let [;; First arg is typically the repo URL for most operations
+        repo (first args)
+        sidecar-available? (sidecar-ready?)
+        target (route-operation qkw sidecar-available? repo)
         web-worker @*web-worker
         sidecar-worker @*sidecar-worker
         worker (case target
                  :sidecar sidecar-worker
                  :worker web-worker)]
-    ;; Debug logging to track routing decisions
-    (when (= qkw :thread-api/reset-file)
-      (log/info :routing-reset-file {:op qkw
-                                      :target target
-                                      :web-worker? (some? web-worker)
-                                      :sidecar-worker? (some? sidecar-worker)}))
+    ;; Debug logging to track routing decisions for sidecar-preferred ops
+    ;; Enable with: frontend.sidecar.routing.enable_debug_BANG_() in browser console
+    (when (and @*debug-routing* (contains? sidecar-preferred-ops qkw))
+      (if (= target :sidecar)
+        (js/console.warn "[ROUTING->SIDECAR]" (pr-str {:op qkw :repo repo}))
+        (js/console.warn "[ROUTING->WORKER]" (pr-str {:op qkw :repo repo
+                                                       :reason (cond
+                                                                 (not sidecar-available?) :sidecar-not-ready
+                                                                 (not (sync-complete? repo)) :sync-incomplete
+                                                                 :else :unknown)}))))
     (when (nil? worker)
       (log/error :routing-no-worker {:op qkw
                                       :target target
+                                      :repo repo
                                       :web-worker? (some? web-worker)
                                       :sidecar-worker? (some? sidecar-worker)})
       (throw (ex-info "No worker available for operation"
                       {:op qkw :target target :sidecar-ready? sidecar-available?})))
-    (log/debug :routing-invoke {:op qkw :target target})
+    (log/debug :routing-invoke {:op qkw :target target :repo repo})
     (apply worker qkw direct-pass? args)))
 
 ;; =============================================================================

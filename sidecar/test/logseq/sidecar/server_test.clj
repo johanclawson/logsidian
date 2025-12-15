@@ -464,3 +464,161 @@
             (is (nil? result) "Non-journal view data should return nil")))
         (finally
           (server/stop-server srv))))))
+
+;; =============================================================================
+;; Query Normalization Tests
+;; =============================================================================
+
+(deftest ^:server normalize-cljs-data-query-variables-test
+  (testing "normalize-cljs-data preserves query variable symbols"
+    (let [result (server/normalize-cljs-data ["?e" "?name" "_" "?block"])]
+      (is (= '[?e ?name _ ?block] result)
+          "Query variables should become symbols"))))
+
+(deftest ^:server normalize-cljs-data-database-refs-test
+  (testing "normalize-cljs-data preserves database reference symbols"
+    (let [result (server/normalize-cljs-data ["$" "$1" "$db"])]
+      (is (= '[$ $1 $db] result)
+          "Database references should become symbols"))))
+
+(deftest ^:server normalize-cljs-data-rules-placeholder-test
+  (testing "normalize-cljs-data preserves % rules placeholder"
+    (let [result (server/normalize-cljs-data ["in" "$" "?start" "%"])]
+      (is (= '[:in $ ?start %] result)
+          "Rules placeholder % should become symbol"))))
+
+(deftest ^:server normalize-cljs-data-function-names-test
+  (testing "normalize-cljs-data preserves function names as symbols"
+    ;; Comparison functions
+    (is (= '[>= ?a ?b] (server/normalize-cljs-data [">=" "?a" "?b"])))
+    (is (= '[<= ?a ?b] (server/normalize-cljs-data ["<=" "?a" "?b"])))
+    (is (= '[> ?a ?b] (server/normalize-cljs-data [">" "?a" "?b"])))
+    (is (= '[< ?a ?b] (server/normalize-cljs-data ["<" "?a" "?b"])))
+    ;; contains? function
+    (is (= '[contains? ?set ?val] (server/normalize-cljs-data ["contains?" "?set" "?val"])))
+    ;; Custom rule predicates
+    (is (= '[task ?b ?markers] (server/normalize-cljs-data ["task" "?b" "?markers"])))))
+
+(deftest ^:server normalize-cljs-data-clause-names-test
+  (testing "normalize-cljs-data converts clause names to keywords"
+    (let [result (server/normalize-cljs-data ["find" "?e" "in" "$" "where"])]
+      (is (= '[:find ?e :in $ :where] result)
+          "Clause names should become keywords"))))
+
+(deftest ^:server normalize-cljs-data-attributes-test
+  (testing "normalize-cljs-data converts namespaced strings to keywords"
+    (let [result (server/normalize-cljs-data ["block/name" "block/uuid" "db/id"])]
+      (is (= '[:block/name :block/uuid :db/id] result)
+          "Namespaced strings should become keywords"))))
+
+(deftest ^:server normalize-cljs-data-full-query-test
+  (testing "normalize-cljs-data handles a complete query with rules"
+    (let [input ["find" ["pull" "?h" ["*" "db/id"]]
+                 "in" "$" "?start" "?today" "%"
+                 "where" ["task" "?h" ["NOW" "DOING"]]]
+          result (server/normalize-cljs-data input)]
+      ;; Check key parts of the normalized query
+      (is (= :find (first result)) "Should have :find keyword")
+      (is (= :in (nth result 2)) "Should have :in keyword")
+      (is (= '$ (nth result 3)) "Should have $ symbol")
+      (is (= '% (nth result 6)) "Should have % symbol")
+      (is (= :where (nth result 7)) "Should have :where keyword")
+      ;; Check the task rule usage is a symbol
+      (is (= 'task (first (nth result 8))) "task should be a symbol"))))
+
+(deftest ^:server query-with-rules-test
+  (testing "Query with rules placeholder works end-to-end"
+    (let [srv (server/start-server {:port *test-port*})]
+      (try
+        (let [graph-id (server/create-graph srv "rules-graph" {})
+              uuid1 (random-uuid)]
+          ;; Transact a block with marker
+          (server/transact! srv graph-id
+                            [{:block/uuid uuid1
+                              :block/name "task-page"
+                              :block/marker "TODO"}])
+
+          ;; Query with rules (simulating what frontend sends)
+          ;; This is a simplified query that uses a rule
+          (let [query '[:find ?e
+                        :in $ %
+                        :where (has-marker ?e)]
+                rules '[[(has-marker ?e)
+                         [?e :block/marker _]]]
+                result (server/query srv graph-id query [rules])]
+            (is (= 1 (count result)) "Should find 1 block with marker")))
+        (finally
+          (server/stop-server srv))))))
+
+(deftest ^:server normalize-cljs-data-function-expr-nesting-test
+  (testing "normalize-cljs-data preserves vector nesting for function expressions"
+    ;; Double-wrapped function expressions stay double-wrapped
+    ;; This is correct for DataScript rule syntax: [(fn args)]
+    (is (= '[[contains? ?a ?b]]
+           (server/normalize-cljs-data [["contains?" "?a" "?b"]]))
+        "Double-wrapped function expression stays wrapped (correct for rule syntax)")
+
+    ;; Single-level function expression
+    (is (= '[contains? ?a ?b]
+           (server/normalize-cljs-data ["contains?" "?a" "?b"]))
+        "Single function expression normalizes correctly")
+
+    ;; Normal vector should not be changed
+    (is (= '["foo" "bar"]
+           (server/normalize-cljs-data ["foo" "bar"]))
+        "Normal string vectors remain unchanged")
+
+    ;; Query variable pattern preserves nesting
+    ;; [[?e :block/name ?name]] is a valid WHERE clause
+    (is (= '[[?e :block/name ?name]]
+           (server/normalize-cljs-data [["?e" "block/name" "?name"]]))
+        "Query patterns preserve nesting")))
+
+;; =============================================================================
+;; Sync Datoms Tests
+;; =============================================================================
+
+(deftest ^:server sync-datoms-normalizes-string-attributes-test
+  (testing "sync-datoms normalizes string attributes to keywords"
+    (let [srv (server/start-server {:port *test-port*})]
+      (try
+        (let [graph-id (server/create-graph srv "sync-test-graph" {})]
+          ;; Sync datoms with STRING attributes (as they come from Transit)
+          ;; Format: [entity-id attribute value tx added?]
+          (server/sync-datoms srv graph-id
+                              [[1 "block/name" "test-page" 536870914 true]
+                               [1 "block/title" "Test Page" 536870914 true]
+                               [1 "block/type" "page" 536870914 true]]
+                              {:full-sync? true})
+
+          ;; Query using KEYWORD attributes (as queries are normalized)
+          (let [result (server/query srv graph-id
+                                     '[:find ?name ?title
+                                       :where
+                                       [?e :block/name ?name]
+                                       [?e :block/title ?title]]
+                                     [])]
+            (is (= 1 (count result)) "Should find the synced page")
+            (is (= #{["test-page" "Test Page"]} (set result))
+                "Should return correct page data")))
+        (finally
+          (server/stop-server srv))))))
+
+(deftest ^:server sync-datoms-preserves-keyword-attributes-test
+  (testing "sync-datoms handles already-keyword attributes correctly"
+    (let [srv (server/start-server {:port *test-port*})]
+      (try
+        (let [graph-id (server/create-graph srv "keyword-sync-graph" {})]
+          ;; Sync datoms with keyword attributes (shouldn't happen but be safe)
+          (server/sync-datoms srv graph-id
+                              [[1 :block/name "keyword-page" 536870914 true]]
+                              {:full-sync? true})
+
+          ;; Query should work
+          (let [result (server/query srv graph-id
+                                     '[:find ?name
+                                       :where [?e :block/name ?name]]
+                                     [])]
+            (is (= #{["keyword-page"]} (set result)))))
+        (finally
+          (server/stop-server srv))))))

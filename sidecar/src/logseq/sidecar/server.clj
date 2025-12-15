@@ -11,15 +11,47 @@
    - Incoming requests are routed based on :op field
    - Each operation is dispatched to the appropriate handler"
   (:require [clojure.tools.logging :as log]
+            [clojure.pprint :as pp]
             [datascript.core :as d]
+            [logseq.sidecar.extract :as extract]
             [logseq.sidecar.file-export :as file-export]
             [logseq.sidecar.outliner :as outliner]
             [logseq.sidecar.pipes :as pipes]
             [logseq.sidecar.protocol :as protocol]
             [logseq.sidecar.storage :as storage]
             [logseq.sidecar.websocket :as websocket])
-  (:import [java.util.concurrent ConcurrentHashMap])
+  (:import [java.util.concurrent ConcurrentHashMap]
+           [java.io FileWriter])
   (:gen-class))
+
+;; =============================================================================
+;; Debug Logging
+;; =============================================================================
+
+;; Debug logging enabled during development
+;; TODO: Disable by default and enable with LOGSIDIAN_DEBUG=true before release
+(def ^:private ^:dynamic *debug-enabled* true)
+(def ^:private debug-log-file "sidecar-debug.log")
+
+(defn- debug-log!
+  "Write debug information to both console and file for later analysis."
+  [operation data]
+  (when *debug-enabled*
+    (let [timestamp (java.time.LocalDateTime/now)
+          entry {:timestamp (str timestamp)
+                 :operation operation
+                 :data data}
+          formatted (with-out-str (pp/pprint entry))]
+      ;; Log to console
+      (log/info (str "[DEBUG] " operation) (pr-str (select-keys data [:graph-id :op :type])))
+      ;; Append to file
+      (try
+        (with-open [w (FileWriter. debug-log-file true)]
+          (.write w (str "=== " timestamp " - " operation " ===\n"))
+          (.write w formatted)
+          (.write w "\n"))
+        (catch Exception e
+          (log/warn "Could not write to debug log:" (.getMessage e)))))))
 
 ;; =============================================================================
 ;; Configuration
@@ -189,15 +221,26 @@
   "Known Datalog clause names that should be keywords."
   #{"find" "where" "in" "with" "keys" "strs" "syms"})
 
+(def ^:private datalog-function-names
+  "Known Datalog/Clojure function names that should be symbols, not keywords."
+  #{">" "<" ">=" "<=" "=" "!=" "not=" "not"
+    "contains?" "get" "get-in" "count" "str" "re-find" "re-matches"
+    "and" "or" "identity" "ground" "missing?" "tuple"
+    ;; Custom rule predicates from Logseq
+    "task"})
+
 (defn- query-variable?
   "Check if s looks like a Datalog query variable or special symbol."
   [s]
   (let [s-str (str s)]
     (or (clojure.string/starts-with? s-str "?")
+        (clojure.string/starts-with? s-str "$")  ;; Database reference ($, $1, etc.)
         (= s-str "_")      ;; Wildcard
         (= s-str "...")    ;; Spread operator
         (= s-str "pull")   ;; Pull keyword in query
-        (= s-str "*"))))   ;; Wildcard for pull patterns
+        (= s-str "*")      ;; Wildcard for pull patterns
+        (= s-str "%")      ;; Rules placeholder in queries
+        (contains? datalog-function-names s-str))))  ;; Known function names
 
 (defn normalize-cljs-data
   "Recursively normalize CLJS data that may have lost type information.
@@ -278,13 +321,54 @@
 (defn query
   "Execute a Datalog query on a graph."
   [^SidecarServer server graph-id query-form inputs]
-  (let [normalized (normalize-query query-form)]
-    (log/debug "query" {:graph-id graph-id
-                        :original query-form
-                        :normalized normalized
-                        :query-type (type query-form)})
+  (let [normalized (normalize-query query-form)
+        ;; Also normalize inputs (especially rules which contain symbols)
+        normalized-inputs (mapv normalize-cljs-data inputs)]
+    ;; Comprehensive debug logging for query analysis
+    (debug-log! "QUERY-RECEIVED"
+                {:graph-id graph-id
+                 :query-form-raw query-form
+                 :query-form-type (type query-form)
+                 :inputs-raw inputs
+                 :inputs-types (mapv type inputs)})
+    (debug-log! "QUERY-NORMALIZED"
+                {:graph-id graph-id
+                 :query-normalized normalized
+                 :query-normalized-type (type normalized)
+                 :inputs-normalized normalized-inputs
+                 :inputs-normalized-types (mapv type normalized-inputs)
+                 :changed-query? (not= query-form normalized)
+                 :changed-inputs? (not= inputs normalized-inputs)})
+    ;; Deep type inspection for rules (usually the last input)
+    ;; Rules are vectors of vectors: [[[rule-head clause1 clause2] ...]]
+    ;; Skip inspection if the input doesn't look like rules (e.g., pull patterns)
+    (when (seq inputs)
+      (let [rules-candidate (last inputs)]
+        (when (and (vector? rules-candidate)
+                   (seq rules-candidate)
+                   (vector? (first rules-candidate))  ;; Rules are nested vectors
+                   (vector? (ffirst rules-candidate))) ;; First rule is also a vector
+          (debug-log! "RULES-INSPECTION"
+                      {:rules-raw rules-candidate
+                       :rules-normalized (last normalized-inputs)
+                       :first-rule-raw (first rules-candidate)
+                       :first-rule-normalized (first (last normalized-inputs))}))))
     (if-let [conn (get-conn server graph-id)]
-      (apply d/q normalized @conn inputs)
+      (try
+        (let [result (apply d/q normalized @conn normalized-inputs)]
+          (debug-log! "QUERY-SUCCESS"
+                      {:graph-id graph-id
+                       :result-count (count result)
+                       :result-sample (take 3 result)})
+          result)
+        (catch Exception e
+          (debug-log! "QUERY-ERROR"
+                      {:graph-id graph-id
+                       :error-class (type e)
+                       :error-message (.getMessage e)
+                       :query-form normalized
+                       :inputs normalized-inputs})
+          (throw e)))
       (throw (ex-info "Graph not found" {:graph-id graph-id})))))
 
 (defn transact!
@@ -372,14 +456,28 @@
 ;; Datom Sync Operations
 ;; =============================================================================
 
+(defn- normalize-attribute
+  "Normalize a datom attribute from string to keyword.
+   Handles Transit serialization where :block/name becomes \"block/name\"."
+  [attr]
+  (cond
+    (keyword? attr) attr
+    (string? attr)  (if (clojure.string/includes? attr "/")
+                      (let [[ns name] (clojure.string/split attr #"/" 2)]
+                        (keyword ns name))
+                      (keyword attr))
+    :else attr))
+
 (defn- datom-vec->tx-data
   "Convert a datom vector [e a v tx added?] to transaction data.
+   Normalizes the attribute from string to keyword.
    For assertions (added?=true): [:db/add e a v]
    For retractions (added?=false): [:db/retract e a v]"
   [[e a v _tx added?]]
-  (if added?
-    [:db/add e a v]
-    [:db/retract e a v]))
+  (let [normalized-attr (normalize-attribute a)]
+    (if added?
+      [:db/add e normalized-attr v]
+      [:db/retract e normalized-attr v])))
 
 (defn sync-datoms
   "Sync datom batches from the main process into the sidecar's DataScript database.
@@ -587,6 +685,11 @@
    IMPORTANT: Thread-API operations receive args as {:args [arg1 arg2 ...]}
    from the sidecar client wrapper, not as named keys."
   [^SidecarServer server request]
+  ;; Debug log all incoming requests
+  (debug-log! "REQUEST-RAW" {:request request
+                              :request-type (type request)
+                              :op (:op request)
+                              :type (:type request)})
   ;; Handle handshake messages specially - they use :type instead of :op
   (if (= :handshake (:type request))
     (let [client-version (get request :version "1.0.0")
@@ -621,9 +724,18 @@
           ;; Web worker signature: [repo inputs] where inputs = [query & query-inputs]
           (let [[repo inputs] (:args payload)
                 query-form (first inputs)
-                query-inputs (rest inputs)
-                result (query server repo query-form query-inputs)]
-            (protocol/make-response op (vec result) id))
+                query-inputs (rest inputs)]
+            (debug-log! "THREAD-API/Q-ARGS"
+                        {:repo repo
+                         :payload-args (:args payload)
+                         :inputs inputs
+                         :query-form query-form
+                         :query-form-type (type query-form)
+                         :query-inputs query-inputs
+                         :query-inputs-count (count query-inputs)
+                         :query-inputs-types (mapv type query-inputs)})
+            (let [result (query server repo query-form query-inputs)]
+              (protocol/make-response op (vec result) id)))
 
           :thread-api/transact
           ;; Web worker signature: [repo tx-data tx-meta context]
@@ -707,6 +819,41 @@
           (let [[repo datoms opts] (:args payload)
                 result (sync-datoms server repo datoms (or opts {}))]
             (protocol/make-response op result id))
+
+          ;; ============================================
+          ;; AST Extraction and Transaction
+          ;; ============================================
+
+          :thread-api/extract-and-transact
+          ;; Receive parsed AST from worker, extract pages/blocks, transact
+          ;; Signature: [repo file-path {:ast <mldoc-ast> :format :markdown/:org}]
+          ;; Returns: {:success bool :page-count N :block-count N}
+          (let [[repo file-path ast-data] (:args payload)
+                ast (:ast ast-data)
+                format (or (:format ast-data) :markdown)]
+            (if-let [conn (get-conn server repo)]
+              (try
+                (let [;; Extract pages and blocks from AST
+                      {:keys [pages blocks]} (extract/extract-from-ast file-path ast {:format format})
+                      ;; Build transaction data
+                      tx-data (concat pages blocks)
+                      ;; Transact to DataScript
+                      _ (when (seq tx-data)
+                          (d/transact! conn tx-data))
+                      result {:success true
+                              :page-count (count pages)
+                              :block-count (count blocks)}]
+                  (log/debug "extract-and-transact completed" {:file file-path
+                                                               :pages (count pages)
+                                                               :blocks (count blocks)})
+                  (protocol/make-response op result id))
+                (catch Exception e
+                  (log/error e "extract-and-transact failed" {:file file-path})
+                  (protocol/make-response op {:success false
+                                              :error (.getMessage e)} id)))
+              (protocol/make-error-response :graph-not-found
+                                            (str "Graph not found: " repo)
+                                            id)))
 
           ;; ============================================
           ;; Database existence check

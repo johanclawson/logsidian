@@ -5,9 +5,10 @@
    1. Collects all datoms from the frontend database
    2. Batches them for efficient transfer
    3. Sends to sidecar via sync-datoms
+   4. Signals routing module that sync is complete
 
    This ensures the sidecar has the same data as the frontend after
-   parsing is complete.
+   parsing is complete, and enables query routing to sidecar.
 
    Usage:
    ```clojure
@@ -16,6 +17,7 @@
    ```"
   (:require [datascript.core :as d]
             [frontend.db :as db]
+            [frontend.sidecar.routing :as routing]
             [frontend.state :as state]
             [lambdaisland.glogi :as log]
             [promesa.core :as p]))
@@ -59,18 +61,22 @@
 
 (defn- send-datom-batch!
   "Send a batch of datoms to the sidecar.
+   Uses direct sidecar invoke (bypasses routing) since sync
+   must always go to sidecar, never to web worker.
    Returns a promise."
   [repo batch opts]
-  (state/<invoke-db-worker :thread-api/sync-datoms
+  (routing/<invoke-sidecar :thread-api/sync-datoms false
                            repo (vec batch) opts))
 
 (defn sync-graph-to-sidecar!
   "Sync all graph data to the sidecar.
 
    This function:
-   1. Creates/opens the graph in sidecar
-   2. Extracts all datoms from the frontend DB
-   3. Sends datoms in batches to sidecar
+   1. Marks sync as incomplete (to prevent routing during sync)
+   2. Creates/opens the graph in sidecar
+   3. Extracts all datoms from the frontend DB
+   4. Sends datoms in batches to sidecar
+   5. Marks sync as complete (enables query routing to sidecar)
 
    Arguments:
    - repo: Repository URL (graph identifier)
@@ -81,6 +87,8 @@
    Returns a promise that resolves when sync is complete."
   ([repo] (sync-graph-to-sidecar! repo {}))
   ([repo {:keys [on-progress storage-path] :or {storage-path ":memory:"}}]
+   ;; Mark sync as incomplete during transfer to prevent query routing
+   (routing/mark-sync-incomplete! repo)
    (log/info :initial-sync-starting {:repo repo})
    (let [conn (db/get-db repo false)]
      (if-not conn
@@ -98,13 +106,16 @@
                     :batch-count total-batches})
          (->
           (p/let [;; Create/open graph in sidecar with storage
-                  _ (state/<invoke-db-worker :thread-api/create-or-open-db
+                  ;; Uses direct sidecar invoke (bypasses routing)
+                  _ (routing/<invoke-sidecar :thread-api/create-or-open-db false
                                              repo {:storage-path storage-path
                                                    :ref-type :soft})]
             ;; Send first batch with full-sync flag
             (if (empty? batches)
               (do
                 (log/info :initial-sync-empty {:repo repo})
+                ;; Even with empty sync, mark as complete
+                (routing/mark-sync-complete! repo)
                 {:datom-count 0 :batch-count 0})
               (p/loop [remaining-batches batches
                        batch-num 1]
@@ -118,16 +129,19 @@
                   (p/let [_ (send-datom-batch! repo batch opts)]
                     (if-let [next-batches (next remaining-batches)]
                       (p/recur next-batches (inc batch-num))
-                      ;; Done
+                      ;; Done - signal routing module that queries can go to sidecar
                       (do
+                        (routing/mark-sync-complete! repo)
                         (log/info :initial-sync-complete
                                   {:repo repo
                                    :datom-count total-datoms
-                                   :batch-count total-batches})
+                                   :batch-count total-batches
+                                   :routing-enabled? true})
                         {:datom-count total-datoms
                          :batch-count total-batches})))))))
           (p/catch (fn [err]
                      (log/error :initial-sync-failed {:repo repo :error err})
+                     ;; Keep sync incomplete on failure so queries go to worker
                      (throw err)))))))))
 
 ;; =============================================================================

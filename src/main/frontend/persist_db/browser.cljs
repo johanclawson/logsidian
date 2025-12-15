@@ -14,6 +14,7 @@
             [frontend.handler.worker :as worker-handler]
             [frontend.persist-db.protocol :as protocol]
             [frontend.sidecar.core :as sidecar]
+            [frontend.sidecar.initial-sync :as initial-sync]
             [frontend.sidecar.routing :as routing]
             [frontend.state :as state]
             [frontend.undo-redo :as undo-redo]
@@ -198,7 +199,41 @@
                       ;; Register sidecar with routing so queries go there
                       (when sidecar-worker-fn
                         (routing/set-sidecar-worker! sidecar-worker-fn)
-                        (log/info :routing-sidecar-registered {:type type :sidecar sidecar}))
+                        (js/console.warn "[SIDECAR] Registered sidecar worker" (pr-str {:type type :sidecar sidecar}))
+                        (log/info :routing-sidecar-registered {:type type :sidecar sidecar})
+                        ;; If a file-based graph is already loaded AND parsed, sync it to sidecar
+                        ;; This handles the case where sidecar connects after graph was parsed
+                        ;; Note: Skip DB-based graphs (e.g. logseq_db_local) - sidecar is for file-based only
+                        (letfn [(try-sync! [repo attempt]
+                                  (let [db-based? (config/db-based-graph? repo)
+                                        db-ready? (some? (db/get-db repo false))]
+                                    (js/console.warn "[SIDECAR] Checking graph" (pr-str {:repo repo :db-based? db-based? :db-ready? db-ready? :attempt attempt}))
+                                    (cond
+                                      db-based?
+                                      (js/console.warn "[SIDECAR] Skipping sync - DB-based graph")
+
+                                      (not db-ready?)
+                                      (if (< attempt 5)
+                                        (do
+                                          (js/console.warn "[SIDECAR] DB not ready, retrying in 1s...")
+                                          (js/setTimeout #(try-sync! repo (inc attempt)) 1000))
+                                        (js/console.warn "[SIDECAR] DB still not ready after retries, giving up"))
+
+                                      :else
+                                      (do
+                                        (log/info :sidecar-sync-existing-graph {:repo repo})
+                                        (-> (initial-sync/sync-graph-to-sidecar! repo {:storage-path ":memory:"})
+                                            (p/then (fn [result]
+                                                      (js/console.warn "[SIDECAR] Sync complete!" (pr-str result))
+                                                      (log/info :sidecar-sync-existing-complete
+                                                                {:repo repo
+                                                                 :datom-count (:datom-count result)})))
+                                            (p/catch (fn [err]
+                                                       (js/console.warn "[SIDECAR] Sync failed!" (str err))
+                                                       (log/error :sidecar-sync-existing-failed
+                                                                  {:repo repo :error (str err)}))))))))]
+                          (when-let [repo (state/get-current-repo)]
+                            (try-sync! repo 1))))
                       ;; Sidecar needs some additional setup that web worker handles internally
                       (sync-app-state!)
                       (sync-ui-state!)

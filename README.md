@@ -36,6 +36,36 @@ yarn watch
 yarn release
 ```
 
+## Debugging
+
+### Sidecar Debug Logging
+
+Enable verbose logging for the JVM sidecar to diagnose sync and query issues:
+
+```bash
+# Via environment variable
+LOGSIDIAN_DEBUG=true java -jar sidecar/target/logsidian-sidecar.jar
+
+# Via JVM system property
+java -Dlogsidian.debug=true -jar sidecar/target/logsidian-sidecar.jar
+```
+
+Debug output goes to console and `sidecar-debug.log` file.
+
+### Frontend Routing Debug
+
+Enable routing decision logging in the browser console:
+
+```javascript
+// Enable debug logging
+frontend.sidecar.routing.enable_debug_BANG_()
+
+// Disable debug logging
+frontend.sidecar.routing.disable_debug_BANG_()
+```
+
+Shows `[ROUTING->SIDECAR]` or `[ROUTING->WORKER]` for each operation.
+
 ## License
 
 AGPL-3.0 - Based on [Logseq](https://github.com/logseq/logseq)

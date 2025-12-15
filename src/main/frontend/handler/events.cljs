@@ -70,24 +70,30 @@
             (async/<! (sync/<sync-stop))))
 
 (defmethod handle :graph/added [[_ repo {:keys [empty-graph?]}]]
+  (js/console.warn "[SIDECAR-DEBUG] graph/added event" (pr-str {:repo repo :empty-graph? empty-graph?}))
+  (log/info :graph-added-event {:repo repo :empty-graph? empty-graph?})
   (search-handler/rebuild-indices!)
   (plugin-handler/hook-plugin-app :graph-after-indexed {:repo repo :empty-graph? empty-graph?})
   (route-handler/redirect-to-home!)
   (when-let [dir-name (and (not (config/db-based-graph? repo)) (config/get-repo-dir repo))]
     (fs/watch-dir! dir-name))
   (file-sync-restart!)
-  ;; Sync graph data to sidecar if enabled
-  (when (or (sidecar/sidecar-enabled?)
-            (sidecar/websocket-sidecar-enabled?))
-    (log/info :sidecar-initial-sync-starting {:repo repo})
-    (-> (initial-sync/sync-graph-to-sidecar! repo {:storage-path ":memory:"})
-        (p/then (fn [result]
-                  (log/info :sidecar-initial-sync-complete
-                            {:repo repo
-                             :datom-count (:datom-count result)
-                             :batch-count (:batch-count result)})))
-        (p/catch (fn [err]
-                   (log/error :sidecar-initial-sync-failed {:repo repo :error err}))))))
+  ;; Sync graph data to sidecar if enabled (file-based graphs only)
+  (let [sidecar-enabled (sidecar/sidecar-enabled?)
+        ws-enabled (sidecar/websocket-sidecar-enabled?)
+        db-based? (config/db-based-graph? repo)]
+    (js/console.warn "[SIDECAR-DEBUG] sidecar enabled check" (pr-str {:sidecar sidecar-enabled :ws ws-enabled :db-based? db-based?}))
+    (when (and (or sidecar-enabled ws-enabled) (not db-based?))
+      (js/console.warn "[SIDECAR-DEBUG] starting initial sync for" repo)
+      (log/info :sidecar-initial-sync-starting {:repo repo})
+      (-> (initial-sync/sync-graph-to-sidecar! repo {:storage-path ":memory:"})
+          (p/then (fn [result]
+                    (log/info :sidecar-initial-sync-complete
+                              {:repo repo
+                               :datom-count (:datom-count result)
+                               :batch-count (:batch-count result)})))
+          (p/catch (fn [err]
+                     (log/error :sidecar-initial-sync-failed {:repo repo :error err})))))))
 
 (defmethod handle :init/commands [_]
   (page-handler/init-commands!))
@@ -111,17 +117,19 @@
            ;; (rtc-handler/<rtc-start! graph)
       (file-sync-restart!)
       ;; Sync graph data to sidecar on graph switch
-      (when (or (sidecar/sidecar-enabled?)
-                (sidecar/websocket-sidecar-enabled?))
-        (log/info :sidecar-graph-switch-sync {:graph graph})
-        (-> (initial-sync/sync-graph-to-sidecar! graph {:storage-path ":memory:"})
+      (let [sidecar-enabled (sidecar/sidecar-enabled?)
+            ws-enabled (sidecar/websocket-sidecar-enabled?)]
+        (js/console.warn "[SIDECAR-DEBUG] graph-switch" (pr-str {:graph graph :sidecar sidecar-enabled :ws ws-enabled}))
+        (when (or sidecar-enabled ws-enabled)
+          (js/console.warn "[SIDECAR-DEBUG] starting graph-switch sync for" graph)
+          (-> (initial-sync/sync-graph-to-sidecar! graph {:storage-path ":memory:"})
             (p/then (fn [result]
                       (log/info :sidecar-graph-switch-sync-complete
                                 {:graph graph
                                  :datom-count (:datom-count result)
                                  :batch-count (:batch-count result)})))
             (p/catch (fn [err]
-                       (log/error :sidecar-graph-switch-sync-failed {:graph graph :error err}))))))
+                       (log/error :sidecar-graph-switch-sync-failed {:graph graph :error err})))))))
     (when-let [dir-name (and (not db-based?) (config/get-repo-dir graph))]
       (fs/watch-dir! dir-name))
     (graph-handler/settle-metadata-to-local! {:last-seen-at (js/Date.now)})))

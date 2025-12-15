@@ -6,6 +6,7 @@
    2. Host Bindings: Pass content/config as bindings, not escaped strings
    3. JSON→EDN: Convert mldoc JSON output to EDN on JVM side
    4. Thread Safety: Synchronized access to GraalJS context
+   5. Polyglot API: Uses modern GraalVM Polyglot API for best performance
 
    Usage:
    (require '[logseq.sidecar.mldoc :as mldoc])
@@ -15,7 +16,8 @@
             [clojure.data.json :as json]
             [clojure.string :as string]
             [clojure.tools.logging :as log])
-  (:import [javax.script ScriptEngineManager ScriptEngine Bindings ScriptContext]))
+  (:import [org.graalvm.polyglot Context Value Source Engine]
+           [org.graalvm.polyglot HostAccess]))
 
 ;; =============================================================================
 ;; Configuration
@@ -32,6 +34,8 @@
 ;; =============================================================================
 
 (defonce ^:private *engine (atom nil))
+(defonce ^:private *context (atom nil))
+(defonce ^:private *mldoc-source (atom nil))
 (defonce ^:private *initialized? (atom false))
 (defonce ^:private *lock (Object.))
 
@@ -45,37 +49,48 @@
         mldoc-search-paths))
 
 (defn- create-engine
-  "Create a new GraalJS ScriptEngine"
+  "Create a shared GraalVM Engine for better performance across contexts"
   []
-  (let [manager (ScriptEngineManager.)
-        engine (.getEngineByName manager "graal.js")]
-    (when-not engine
-      (let [available (mapv #(.getEngineName %) (.getEngineFactories manager))]
-        (throw (ex-info "GraalJS engine not found"
-                        {:available-engines available
-                         :hint "Ensure org.graalvm.js/js and js-scriptengine are on classpath"}))))
-    engine))
+  (-> (Engine/newBuilder (into-array String ["js"]))
+      (.option "engine.WarnInterpreterOnly" "false")
+      (.build)))
+
+(defn- create-context
+  "Create a new GraalJS Context with the shared engine"
+  [^Engine engine]
+  (-> (Context/newBuilder (into-array String ["js"]))
+      (.engine engine)
+      (.allowHostAccess HostAccess/ALL)
+      (.allowExperimentalOptions true)
+      (.option "js.ecmascript-version" "2024")
+      (.build)))
 
 (defn- load-mldoc!
-  "Load mldoc.js into the engine. Returns the engine."
-  [^ScriptEngine engine]
+  "Load mldoc.js into the context. Returns the context."
+  [^Context context]
   (let [mldoc-path (find-mldoc-js)]
     (when-not mldoc-path
       (throw (ex-info "Cannot find mldoc.js"
                       {:searched mldoc-search-paths
                        :hint "Run from repository root or set MLDOC_PATH"})))
     (log/info "Loading mldoc.js from:" mldoc-path)
-    (let [mldoc-content (slurp mldoc-path)]
+    (let [mldoc-content (slurp mldoc-path)
+          ;; Create a Source object for better caching
+          source (-> (Source/newBuilder "js" mldoc-content "mldoc.js")
+                     (.cached true)
+                     (.build))]
       ;; Create globalThis since mldoc (js_of_ocaml) expects it
-      (.eval engine "var globalThis = this;")
+      (.eval context "js" "var globalThis = this;")
       ;; Load mldoc.js
-      (.eval engine mldoc-content)
+      (.eval context source)
       ;; Verify Mldoc object exists
-      (let [mldoc-type (.eval engine "typeof Mldoc")]
-        (when-not (= "object" (str mldoc-type))
+      (let [mldoc-type (.eval context "js" "typeof Mldoc")]
+        (when-not (= "object" (.asString mldoc-type))
           (throw (ex-info "Mldoc not found after loading"
-                          {:type (str mldoc-type)}))))
-      engine)))
+                          {:type (.asString mldoc-type)}))))
+      ;; Store the source for potential reuse
+      (reset! *mldoc-source source)
+      context)))
 
 (defn- ensure-initialized!
   "Ensure GraalJS context is initialized with mldoc loaded.
@@ -84,10 +99,12 @@
   (when-not @*initialized?
     (locking *lock
       (when-not @*initialized?
-        (log/info "Initializing GraalJS mldoc context...")
-        (let [engine (create-engine)]
-          (load-mldoc! engine)
+        (log/info "Initializing GraalJS mldoc context (Polyglot API)...")
+        (let [engine (create-engine)
+              context (create-context engine)]
+          (load-mldoc! context)
           (reset! *engine engine)
+          (reset! *context context)
           (reset! *initialized? true)
           (log/info "GraalJS mldoc context initialized"))))))
 
@@ -98,7 +115,13 @@
   (locking *lock
     (when @*initialized?
       (log/info "Shutting down GraalJS mldoc context")
+      (when-let [ctx @*context]
+        (.close ctx))
+      (when-let [eng @*engine]
+        (.close eng))
+      (reset! *context nil)
       (reset! *engine nil)
+      (reset! *mldoc-source nil)
       (reset! *initialized? false))))
 
 (defn reinitialize!
@@ -147,26 +170,25 @@
 ;; =============================================================================
 
 (defn- call-mldoc
-  "Call a mldoc function with content and config using host bindings.
-   Thread-safe: synchronizes on the engine."
+  "Call a mldoc function with content and config using Polyglot bindings.
+   Thread-safe: synchronizes on the context."
   [fn-name content config-json]
   (ensure-initialized!)
   (locking *lock
-    (let [^ScriptEngine engine @*engine
-          ;; Get the engine's bindings (ENGINE_SCOPE) which has Mldoc loaded
-          bindings (.getBindings engine ScriptContext/ENGINE_SCOPE)]
-      ;; Set content and config in the engine's scope
-      (.put bindings "_content" content)
-      (.put bindings "_config" config-json)
+    (let [^Context context @*context
+          bindings (.getBindings context "js")]
+      ;; Set content and config in the JS scope
+      (.putMember bindings "_content" content)
+      (.putMember bindings "_config" config-json)
       ;; Call mldoc function
       (try
-        (let [result (.eval engine (str "Mldoc." fn-name "(_content, _config)"))]
-          (when result
-            (str result)))
+        (let [^Value result (.eval context "js" (str "Mldoc." fn-name "(_content, _config)"))]
+          (when-not (.isNull result)
+            (.asString result)))
         (finally
           ;; Clean up temporary bindings
-          (.remove bindings "_content")
-          (.remove bindings "_config"))))))
+          (.removeMember bindings "_content")
+          (.removeMember bindings "_config"))))))
 
 (defn parse-json
   "Parse content with mldoc, return EDN AST.
@@ -237,22 +259,22 @@
   ([ast format references]
    (ensure-initialized!)
    (locking *lock
-     (let [^ScriptEngine engine @*engine
-           bindings (.getBindings engine ScriptContext/ENGINE_SCOPE)
+     (let [^Context context @*context
+           bindings (.getBindings context "js")
            config (make-config format)
            config-json (config->json config)
            refs-json (json/write-str (or references {:embed_blocks [] :embed_pages []}))]
-       (.put bindings "_ast" (if (string? ast) ast (json/write-str ast)))
-       (.put bindings "_config" config-json)
-       (.put bindings "_refs" refs-json)
+       (.putMember bindings "_ast" (if (string? ast) ast (json/write-str ast)))
+       (.putMember bindings "_config" config-json)
+       (.putMember bindings "_refs" refs-json)
        (try
-         (let [result (.eval engine "Mldoc.astExportMarkdown(_ast, _config, _refs)")]
-           (when result
-             (str result)))
+         (let [^Value result (.eval context "js" "Mldoc.astExportMarkdown(_ast, _config, _refs)")]
+           (when-not (.isNull result)
+             (.asString result)))
          (finally
-           (.remove bindings "_ast")
-           (.remove bindings "_config")
-           (.remove bindings "_refs")))))))
+           (.removeMember bindings "_ast")
+           (.removeMember bindings "_config")
+           (.removeMember bindings "_refs")))))))
 
 ;; =============================================================================
 ;; Diagnostics
@@ -263,6 +285,7 @@
    Useful for health checks and debugging."
   []
   {:initialized? @*initialized?
+   :context-class (when @*context (class @*context))
    :engine-class (when @*engine (class @*engine))
    :mldoc-path (find-mldoc-js)})
 
