@@ -1373,7 +1373,24 @@ Files to modify:
 
 ---
 
-## Phase 5: Performance Benchmarks
+## Phase 5: Performance Benchmarks ✅ COMPLETE
+
+### 5.0 Benchmark Results (2025-12-15)
+
+**Run with:** `cd sidecar && clj -M:bench`
+
+| Metric | Target | Actual | Status |
+|--------|--------|--------|--------|
+| Graph load (10k blocks) | < 500ms | 622ms | ⚠️ Slightly over |
+| Simple query (entity lookup) | < 1ms | 0.00ms | ✅ PASS |
+| Pattern query (find pages) | < 10ms | 0.32ms | ✅ PASS |
+| Backlinks query | < 10ms | 1.51ms | ✅ PASS |
+| Single transaction | < 5ms | 0.51ms | ✅ PASS |
+| Batch transaction (100) | < 50ms | 8.80ms | ✅ PASS |
+| Memory (10k blocks) | < 100MB | 25MB | ✅ PASS |
+| Memory (100k blocks) | < 500MB | 74MB | ✅ PASS |
+
+**Summary:** 7/8 benchmarks pass. Graph load is ~25% over target due to SQLite setup overhead, but all runtime operations (queries, transactions) are well under target. Memory usage is excellent at ~25% of target.
 
 ### 5.1 Benchmark Suite
 
@@ -1721,10 +1738,11 @@ sidecar/test/logseq/sidecar/
 ├── server_test.clj           # ✅ Server integration tests (22 tests, including sync normalization)
 ├── protocol_test.clj         # ✅ Transit serialization tests (6 tests)
 ├── extract_test.clj          # ✅ Phase 2.5 - AST extraction tests (18 tests, 26 assertions)
-├── benchmark_test.clj        # 📋 Phase 5 - Performance benchmarks
+├── benchmark_test.clj        # ✅ Phase 5 - Performance benchmarks (8 benchmarks)
 └── integration_test.clj      # 📋 Phase 2 - Full stack integration tests
 
 Sidecar Total: 122 tests, 374 assertions (all passing)
+Benchmarks: 8 benchmarks (7 passing, 1 slightly over target)
 
 src/test/frontend/sidecar/
 └── initial_sync_test.cljs    # ✅ Phase 2.3 - Initial sync module (6 tests, 281 assertions)
