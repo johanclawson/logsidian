@@ -14,6 +14,7 @@
             [frontend.handler.worker :as worker-handler]
             [frontend.persist-db.protocol :as protocol]
             [frontend.sidecar.core :as sidecar]
+            [frontend.sidecar.routing :as routing]
             [frontend.state :as state]
             [frontend.undo-redo :as undo-redo]
             [frontend.util :as util]
@@ -116,7 +117,8 @@
 
 (defn- start-web-worker!
   "Start the web worker backend for database operations.
-   This is the original implementation, now internal."
+   This is the original implementation, now internal.
+   Returns a promise that resolves with the wrapped-worker function."
   []
   (when-not util/node-test?
     (p/do!
@@ -146,6 +148,8 @@
            t1 (util/time-ms)]
        (Comlink/expose #js{"remoteInvoke" thread-api/remote-function} worker)
        (worker-handler/handle-message! worker wrapped-worker)
+       ;; Register with routing (replaces direct state/*db-worker set)
+       (routing/set-web-worker! wrapped-worker)
        (reset! state/*db-worker wrapped-worker)
        (-> (p/let [_ (state/<invoke-db-worker :thread-api/init config/RTC-WS-URL)
                    _ (sync-app-state!)
@@ -159,7 +163,9 @@
                 (db-transact/transact transact!
                                       (if (string? repo) repo (state/get-current-repo))
                                       tx-data
-                                      (assoc tx-meta :client-id (:client-id @state/state))))))
+                                      (assoc tx-meta :client-id (:client-id @state/state)))))
+             ;; Return the worker function for hybrid mode
+             wrapped-worker)
            (p/catch (fn [error]
                       (log/error :init-sqlite-wasm-error ["Can't init SQLite wasm" error]))))))))
 
@@ -169,22 +175,30 @@
    On Electron desktop, attempts to start the JVM sidecar first for better
    performance with large graphs. Falls back to web worker if sidecar fails.
 
-   On web/mobile, always uses the web worker."
+   On web/mobile, always uses the web worker.
+
+   In hybrid mode, operations are routed based on type:
+   - File operations (mldoc parsing) -> web worker
+   - Queries, outliner ops -> sidecar (when available)"
   []
   (when-not util/node-test?
     (if (sidecar/sidecar-enabled?)
-      ;; Desktop with sidecar support
+      ;; Desktop with sidecar support - hybrid mode
       (-> (sidecar/start-db-backend!
            {:start-web-worker-fn start-web-worker!
             :fallback-on-error? true
             :on-backend-ready (fn [{:keys [type]}]
                                 (log/info :db-backend-started {:type type}))})
-          (p/then (fn [{:keys [type sidecar]}]
+          (p/then (fn [{:keys [type sidecar sidecar-worker-fn] :as result}]
                     ;; Run sidecar setup when sidecar is actually active:
                     ;; - Pure sidecar mode: {:type :sidecar :port 47632}
                     ;; - Hybrid mode: {:type :hybrid :sidecar :ipc} or {:sidecar :ws}
                     ;; Bug fix: Check for truthy sidecar key, not just :hybrid type
                     (when (or (= type :sidecar) sidecar)
+                      ;; Register sidecar with routing so queries go there
+                      (when sidecar-worker-fn
+                        (routing/set-sidecar-worker! sidecar-worker-fn)
+                        (log/info :routing-sidecar-registered {:type type :sidecar sidecar}))
                       ;; Sidecar needs some additional setup that web worker handles internally
                       (sync-app-state!)
                       (sync-ui-state!)
@@ -195,7 +209,8 @@
                          (db-transact/transact transact!
                                                (if (string? repo) repo (state/get-current-repo))
                                                tx-data
-                                               (assoc tx-meta :client-id (:client-id @state/state))))))))
+                                               (assoc tx-meta :client-id (:client-id @state/state))))))
+                    result))
           (p/catch (fn [error]
                      (log/error :start-db-backend-error {:error error}))))
       ;; Web/mobile - use web worker directly

@@ -18,6 +18,7 @@
      (start-web-worker!))
    ```"
   (:require [frontend.sidecar.client :as client]
+            [frontend.sidecar.routing :as routing]
             [frontend.sidecar.spawn :as spawn]
             [frontend.sidecar.websocket-client :as ws-client]
             [frontend.config :as config]
@@ -131,7 +132,10 @@
    Returns a promise that resolves when:
    1. The JVM process is running
    2. The TCP client is connected
-   3. state/*db-worker is set to route through sidecar
+   3. Sidecar worker function is created (but NOT set to state/*db-worker)
+
+   NOTE: In hybrid mode, state/*db-worker should remain pointing to the web worker.
+   The routing module handles directing operations to the appropriate backend.
 
    If sidecar startup fails, returns a rejected promise."
   ([] (start-sidecar! {}))
@@ -139,15 +143,16 @@
    (log/info :sidecar-starting-full {:port port})
    (-> (p/let [;; Start the JVM process (also auto-connects)
                _ (spawn/start! {:port port})
-               ;; Create and set the worker function using client/create-worker-fn
+               ;; Create the worker function using client/create-worker-fn
                ;; which properly deserializes Transit responses
                worker-fn (client/create-worker-fn)]
-         ;; Set as the db-worker
-         (reset! state/*db-worker worker-fn)
+         ;; NOTE: Don't set state/*db-worker here!
+         ;; In hybrid mode, web worker stays as the primary (for file ops with mldoc).
+         ;; Routing module will direct queries to sidecar when registered.
          ;; Register shutdown handler
          (spawn/register-shutdown-handler!)
          (log/info :sidecar-started {:port port})
-         {:type :sidecar :port port})
+         {:type :sidecar :port port :worker-fn worker-fn})
        (p/catch (fn [err]
                   (log/error :sidecar-start-failed {:error err})
                   ;; Clean up partial state
@@ -163,7 +168,8 @@
   (p/do!
    (client/disconnect!)
    (spawn/stop!)
-   (reset! state/*db-worker nil)
+   ;; Clear sidecar from routing (not state/*db-worker - that's the web worker)
+   (routing/clear-sidecar-worker!)
    (log/info :sidecar-stopped {})))
 
 (defn sidecar-running?
@@ -187,8 +193,11 @@
 
    Returns a promise that resolves when:
    1. The WebSocket is connected
-   2. state/*db-worker is set to route through WebSocket sidecar
+   2. Worker function is created (but NOT set to state/*db-worker)
    3. Current graph is initialized in sidecar
+
+   NOTE: In hybrid mode, state/*db-worker should remain pointing to the web worker.
+   The routing module handles directing operations to the appropriate backend.
 
    If connection fails, returns a rejected promise."
   ([] (start-websocket-sidecar! {}))
@@ -196,17 +205,21 @@
    (log/info :websocket-sidecar-starting {:url url})
    (-> (p/let [;; Connect via WebSocket
                _ (ws-client/connect! {:url url})
-               ;; Create and set the worker function
+               ;; Create the worker function
                worker-fn (ws-client/create-worker-fn)]
-         ;; Set as the db-worker
-         (reset! state/*db-worker worker-fn)
+         ;; NOTE: Don't set state/*db-worker here!
+         ;; In hybrid mode, web worker stays as the primary (for file ops with mldoc).
+         ;; Routing module will direct queries to sidecar when registered.
+
          ;; Initialize current repo in sidecar if one is open
+         ;; NOTE: We can't use state/<invoke-db-worker here since routing isn't set up yet
+         ;; Instead, call worker-fn directly
          (when-let [repo (state/get-current-repo)]
            (log/info :websocket-sidecar-init-repo {:repo repo})
-           ;; Create or open the graph in sidecar
-           (state/<invoke-db-worker :thread-api/create-or-open-db repo {}))
+           ;; Create or open the graph in sidecar directly
+           (worker-fn :thread-api/create-or-open-db false repo {}))
          (log/info :websocket-sidecar-started {:url url})
-         {:type :websocket-sidecar :url url})
+         {:type :websocket-sidecar :url url :worker-fn worker-fn})
        (p/catch (fn [err]
                   (log/error :websocket-sidecar-start-failed {:error err})
                   ;; Clean up partial state
@@ -220,7 +233,8 @@
   (log/info :websocket-sidecar-stopping {})
   (p/do!
    (ws-client/disconnect!)
-   (reset! state/*db-worker nil)
+   ;; Clear sidecar from routing (not state/*db-worker - that's the web worker)
+   (routing/clear-sidecar-worker!)
    (log/info :websocket-sidecar-stopped {})))
 
 (defn websocket-sidecar-running?
@@ -262,13 +276,14 @@
          use-ws-sidecar? (and prefer-sidecar? (websocket-sidecar-enabled?))
 
          ;; Start sidecar after worker is running (non-blocking, errors logged)
+         ;; Returns {:type :ipc/:websocket :worker-fn fn} on success, nil on failure
          start-sidecar-async! (fn []
                                 (cond
                                   use-ipc-sidecar?
                                   (-> (start-sidecar!)
-                                      (p/then (fn [_]
+                                      (p/then (fn [{:keys [worker-fn]}]
                                                 (log/info :hybrid-sidecar-connected {:type :ipc})
-                                                :ipc))
+                                                {:type :ipc :worker-fn worker-fn}))
                                       (p/catch (fn [err]
                                                  (if (strict-mode?)
                                                    (do
@@ -283,9 +298,9 @@
 
                                   use-ws-sidecar?
                                   (-> (start-websocket-sidecar!)
-                                      (p/then (fn [_]
+                                      (p/then (fn [{:keys [worker-fn]}]
                                                 (log/info :hybrid-sidecar-connected {:type :websocket})
-                                                :websocket))
+                                                {:type :websocket :worker-fn worker-fn}))
                                       (p/catch (fn [err]
                                                  (if (strict-mode?)
                                                    (do
@@ -309,11 +324,15 @@
                    _ (log/info :hybrid-worker-started {})
                    ;; Now start sidecar (if enabled) in parallel
                    ;; Note: Don't block on sidecar - worker is primary for parsing
-                   sidecar-type (when (or use-ipc-sidecar? use-ws-sidecar?)
-                                  (start-sidecar-async!))]
+                   sidecar-result (when (or use-ipc-sidecar? use-ws-sidecar?)
+                                    (start-sidecar-async!))]
              (let [result (cond
-                            sidecar-type
-                            {:type :hybrid :worker true :sidecar sidecar-type}
+                            sidecar-result
+                            ;; Return sidecar type and worker-fn for routing registration
+                            {:type :hybrid
+                             :worker true
+                             :sidecar (:type sidecar-result)
+                             :sidecar-worker-fn (:worker-fn sidecar-result)}
 
                             (or use-ipc-sidecar? use-ws-sidecar?)
                             ;; Sidecar was requested but failed - worker-only
@@ -321,7 +340,7 @@
 
                             :else
                             {:type :worker})]
-               (log/info :hybrid-backend-ready result)
+               (log/info :hybrid-backend-ready (dissoc result :sidecar-worker-fn))
                (when on-backend-ready
                  (on-backend-ready result))
                result))

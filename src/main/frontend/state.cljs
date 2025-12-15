@@ -12,6 +12,7 @@
             [frontend.db.conn-state :as db-conn-state]
             [frontend.flows :as flows]
             [frontend.mobile.util :as mobile-util]
+            [frontend.sidecar.routing :as routing]
             [frontend.spec.storage :as storage-spec]
             [frontend.storage :as storage]
             [frontend.util :as util]
@@ -43,12 +44,23 @@
        (m/eduction (map some?))))
 
 (defn- <invoke-db-worker*
+  "Invoke db-worker, routing to appropriate backend when sidecar is available.
+
+   Routing behavior:
+   - When sidecar is ready: Routes operations based on type
+     - Worker-only ops (reset-file, mldoc) -> web worker
+     - Query/outliner ops -> sidecar
+   - When sidecar not ready: Falls back to web worker for all ops"
   [qkw direct-pass? args-list]
-  (let [worker @*db-worker]
-    (when (nil? worker)
-      (prn :<invoke-db-worker-error qkw)
-      (throw (ex-info "db-worker has not been initialized" {})))
-    (apply worker qkw direct-pass? args-list)))
+  (if (routing/sidecar-ready?)
+    ;; Use routing to dispatch to appropriate backend
+    (routing/<invoke qkw direct-pass? args-list)
+    ;; Fallback to web worker directly
+    (let [worker @*db-worker]
+      (when (nil? worker)
+        (prn :<invoke-db-worker-error qkw)
+        (throw (ex-info "db-worker has not been initialized" {})))
+      (apply worker qkw direct-pass? args-list))))
 
 (defn <invoke-db-worker
   "invoke db-worker thread api"
