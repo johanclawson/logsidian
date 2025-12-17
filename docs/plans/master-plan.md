@@ -1725,6 +1725,125 @@ Before release, disable debug logging by default and enable via environment vari
 
 ---
 
+## Phase 7: Eager Sidecar Startup ✅ COMPLETE
+
+### 7.1 Motivation
+
+The JVM sidecar takes ~2-3 seconds to start due to Clojure runtime initialization. Previously, this startup happened when a graph was opened, causing a noticeable delay.
+
+**Solution:** Start the sidecar eagerly in the background when Electron launches, while the splash screen is visible. By the time the user opens a graph, the sidecar is already running and connected.
+
+### 7.2 Implementation
+
+**Change 1: Eager sidecar start in Electron main (`src/electron/electron/core.cljs`)**
+- Added `[electron.sidecar :as sidecar]` to ns requires
+- Added fire-and-forget sidecar start after `db/ensure-graphs-dir!` in `on-app-ready!`
+- Uses promesa to handle async without blocking app startup
+
+```clojure
+;; Eagerly start sidecar in background (don't await)
+(-> (sidecar/start! {})
+    (p/then (fn [_] (logger/info "Eager sidecar started")))
+    (p/catch (fn [err] (logger/warn "Eager sidecar start failed" {:error (str err)}))))
+```
+
+**Change 2: Handle already-running case (`src/main/frontend/sidecar/core.cljs`)**
+- Modified `start-sidecar!` to check `spawn/running?` before spawning
+- If already running, just creates `worker-fn` for routing (no spawn needed)
+
+```clojure
+(if (spawn/running?)
+  (do
+    (log/info :sidecar-already-running {:port port})
+    (p/let [worker-fn (client/create-worker-fn)]
+      {:type :sidecar :port port :worker-fn worker-fn :already-running true}))
+  ;; Not running - spawn it (existing code)
+  ...)
+```
+
+**Change 3: Dev mode JAR path fix (`src/electron/electron/sidecar.cljs`)**
+- Added `../sidecar/target/logsidian-sidecar.jar` to JAR search candidates
+- Supports running Electron from `static/` directory in development
+
+### 7.3 Result
+
+- JVM startup (~2-3s) happens in background during splash screen
+- When graph opens, sidecar is already connected and ready
+- No user-visible delay from JVM startup
+- Sidecar stays warm across graph switches (already worked - no change needed)
+
+---
+
+## Phase 8: Thin Worker Architecture Investigation (REJECTED)
+
+### 8.1 Investigation Summary
+
+**Date:** 2025-12-17
+**Outcome:** Architecture rejected as infeasible
+
+The "Thin Worker Architecture" was proposed to reduce memory usage by:
+- Removing full DataScript from the web worker
+- Using a small LRU cache (~1000 entities) in worker
+- Routing all queries to the JVM sidecar
+- Target: ~130MB RAM for 100k blocks (vs ~1GB current)
+
+### 8.2 Critical Blockers Discovered
+
+After extensive code analysis, **six critical blockers** were identified:
+
+| # | Blocker | Severity | Impact |
+|---|---------|----------|--------|
+| 1 | DataScript entity resolution is eager | CRITICAL | `d/entity` returns `nil` for missing refs, breaks reference chains |
+| 2 | Reactive query refresh only sees worker cache | CRITICAL | `get-affected-queries-keys` generates no keys for uncached entities |
+| 3 | Undo validation requires pinned entities | CRITICAL | Undo needs ~1000+ entities pinned, conflicts with LRU eviction |
+| 4 | One-way sync architecture | CRITICAL | No sidecar→worker push, cache invalidation impossible |
+| 5 | Multi-page transaction atomicity lost | HIGH | File syncs are per-page, not atomic |
+| 6 | Initial sync race condition | HIGH | Edits during sync not captured |
+
+### 8.3 Root Cause
+
+The codebase was **designed with worker as single source of truth**:
+
+- All components assume complete DataScript access
+- `d/entity` is eager, not lazy-loading
+- Reactive queries depend on worker-cached entities
+- Undo requires synchronous entity validation (<1ms)
+- Reference chains break silently with partial cache
+
+### 8.4 Decision
+
+**Thin worker architecture is NOT viable** with current codebase design. Required changes:
+- Rewrite reactive query system (~3-6 months)
+- Async undo validation (~2-4 weeks)
+- Bidirectional sync with push notifications (~2-4 weeks)
+- Reference-aware entity loading (~1-2 months)
+
+**Estimated total effort:** 6-12 months with significant risk.
+
+### 8.5 Path Forward
+
+1. **Fix current hybrid architecture issues** (see ADR-002):
+   - Incremental sync reaching sidecar
+   - Persistent SQLite storage
+   - Graceful fallback on sidecar failure
+
+2. **Optimize within existing constraints**:
+   - Query-level routing (expensive queries to sidecar)
+   - Selective sync (only opened pages)
+   - Memory profiling and optimization
+
+3. **Accept architectural limitations**:
+   - Worker needs substantial memory for large graphs
+   - Sidecar provides lazy loading for cold data
+   - Full re-architecture only if memory becomes critical blocker
+
+### 8.6 Documentation
+
+- **Post-mortem:** `docs/decisions/002-thin-worker-postmortem.md`
+- **Original plan:** `docs/plans/thin-worker-architecture.md` (historical reference)
+
+---
+
 ## Appendix: File Inventory
 
 ### Test Files Status
