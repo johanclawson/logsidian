@@ -363,3 +363,101 @@
                  all-block-ids
                  all-blocks
                  all-file-entities))))
+
+;; =============================================================================
+;; Step 11: Error Isolation (Per-File Results)
+;; =============================================================================
+
+(defn wrap-parse-result
+  "Wrap a parsing result with status metadata.
+   Used to isolate errors per-file instead of fail-fast."
+  [file-path result]
+  {:file-path file-path
+   :status :ok
+   :result result})
+
+(defn wrap-parse-error
+  "Wrap a parsing error with status metadata."
+  [file-path error]
+  {:file-path file-path
+   :status :error
+   :error error
+   :message (if (instance? ExceptionInfo error)
+              (ex-message error)
+              (str error))})
+
+(defn partition-parse-results
+  "Partition parse results into successful and failed groups.
+   Returns {:ok [...] :errors [...]}."
+  [results]
+  (let [{ok-results true error-results false}
+        (group-by #(= :ok (:status %)) results)]
+    {:ok (or ok-results [])
+     :errors (or error-results [])}))
+
+;; =============================================================================
+;; Step 12: Preflight Pipeline (Load Plan)
+;; =============================================================================
+
+(defn plan-graph-load
+  "Create a load plan from parse results. Does NOT commit to DB.
+   Validates all files and conflicts before any write operations.
+
+   Arguments:
+   - db: Database snapshot for conflict detection
+   - parse-results: Sequence of {:file-path ... :status ... :result/:error}
+
+   Returns:
+   {:status :ok
+    :parsed-files [...] ; successfully parsed files
+    :batch-count n}
+
+   or
+
+   {:status :error
+    :parse-errors [...] ; files that failed to parse
+    :conflicts [...] ; UUID or page conflicts
+    :parsed-files [...]} ; files that did parse successfully"
+  [db parse-results]
+  (let [{:keys [ok errors]} (partition-parse-results parse-results)
+        parsed-files (mapv :result ok)
+        ;; Only validate if we have any successful parses
+        validation (when (seq parsed-files)
+                     (validate-batch db parsed-files))
+        has-parse-errors? (seq errors)
+        has-conflicts? (and validation (not (:ok validation)))]
+    (cond
+      ;; Both parse errors and conflicts
+      (and has-parse-errors? has-conflicts?)
+      {:status :error
+       :parse-errors (mapv #(select-keys % [:file-path :error :message]) errors)
+       :conflicts (:errors validation)
+       :parsed-files parsed-files}
+
+      ;; Only parse errors
+      has-parse-errors?
+      {:status :error
+       :parse-errors (mapv #(select-keys % [:file-path :error :message]) errors)
+       :conflicts []
+       :parsed-files parsed-files}
+
+      ;; Only conflicts
+      has-conflicts?
+      {:status :error
+       :parse-errors []
+       :conflicts (:errors validation)
+       :parsed-files parsed-files}
+
+      ;; All good
+      :else
+      {:status :ok
+       :parsed-files parsed-files
+       :batch-count (count parsed-files)})))
+
+(defn create-batches
+  "Split parsed files into batches of specified size.
+   Returns sequence of parsed file batches."
+  [parsed-files batch-size]
+  (if (pos? batch-size)
+    (partition-all batch-size parsed-files)
+    [parsed-files]))

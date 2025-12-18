@@ -349,3 +349,87 @@
       ;; Entity counts should be the same (or very close due to ordering differences)
       (is (= count-seq count-batch)
           (str "Sequential (" count-seq ") should equal batch (" count-batch ")")))))
+
+;; =============================================================================
+;; Step 11: Error Isolation Tests
+;; =============================================================================
+
+(deftest ^:parallel wrap-parse-result-test
+  (testing "wrap-parse-result creates ok status wrapper"
+    (let [result {:pages [] :blocks []}
+          wrapped (batch/wrap-parse-result "test.md" result)]
+      (is (= :ok (:status wrapped)))
+      (is (= "test.md" (:file-path wrapped)))
+      (is (= result (:result wrapped))))))
+
+(deftest ^:parallel wrap-parse-error-test
+  (testing "wrap-parse-error creates error status wrapper"
+    (let [error (ex-info "Parse failed" {:reason :syntax})
+          wrapped (batch/wrap-parse-error "bad.md" error)]
+      (is (= :error (:status wrapped)))
+      (is (= "bad.md" (:file-path wrapped)))
+      (is (= error (:error wrapped)))
+      (is (= "Parse failed" (:message wrapped))))))
+
+(deftest ^:parallel partition-parse-results-test
+  (testing "partition-parse-results separates ok and error results"
+    (let [ok1 (batch/wrap-parse-result "a.md" {:pages []})
+          ok2 (batch/wrap-parse-result "b.md" {:pages []})
+          err1 (batch/wrap-parse-error "c.md" (ex-info "Bad" {}))
+          {:keys [ok errors]} (batch/partition-parse-results [ok1 err1 ok2])]
+      (is (= 2 (count ok)) "Two ok results")
+      (is (= 1 (count errors)) "One error result"))))
+
+;; =============================================================================
+;; Step 12: Load Plan Tests
+;; =============================================================================
+
+(deftest ^:parallel plan-graph-load-all-ok
+  (testing "plan-graph-load returns ok when all files parse successfully"
+    (let [db @(gp-db/start-conn)
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          parsed1 (parse-file db "file1.md" "- Block A" uuid-fn now-fn)
+          parsed2 (parse-file db "file2.md" "- Block B" uuid-fn now-fn)
+          results [(batch/wrap-parse-result "file1.md" parsed1)
+                   (batch/wrap-parse-result "file2.md" parsed2)]
+          plan (batch/plan-graph-load db results)]
+      (is (= :ok (:status plan)) "Status should be ok")
+      (is (= 2 (:batch-count plan)) "Should have 2 files")
+      (is (= 2 (count (:parsed-files plan))) "Should return parsed files"))))
+
+(deftest ^:parallel plan-graph-load-with-parse-errors
+  (testing "plan-graph-load reports parse errors"
+    (let [db @(gp-db/start-conn)
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          parsed1 (parse-file db "good.md" "- Block A" uuid-fn now-fn)
+          results [(batch/wrap-parse-result "good.md" parsed1)
+                   (batch/wrap-parse-error "bad.md" (ex-info "Syntax error" {}))]
+          plan (batch/plan-graph-load db results)]
+      (is (= :error (:status plan)) "Status should be error")
+      (is (= 1 (count (:parse-errors plan))) "Should have 1 parse error")
+      (is (= "bad.md" (:file-path (first (:parse-errors plan))))))))
+
+(deftest ^:parallel plan-graph-load-with-conflicts
+  (testing "plan-graph-load reports conflicts"
+    (let [db @(gp-db/start-conn)
+          shared-uuid #uuid "12345678-1234-1234-1234-123456789abc"
+          content1 (str "- Block 1\n  id:: " shared-uuid)
+          content2 (str "- Block 2\n  id:: " shared-uuid)
+          parsed1 (parse-file db "file1.md" content1)
+          parsed2 (parse-file db "file2.md" content2)
+          results [(batch/wrap-parse-result "file1.md" parsed1)
+                   (batch/wrap-parse-result "file2.md" parsed2)]
+          plan (batch/plan-graph-load db results)]
+      (is (= :error (:status plan)) "Status should be error due to UUID conflict")
+      (is (seq (:conflicts plan)) "Should have conflicts")
+      (is (empty? (:parse-errors plan)) "No parse errors"))))
+
+(deftest ^:parallel create-batches-test
+  (testing "create-batches splits files into groups"
+    (let [files (range 10)
+          batches (batch/create-batches files 3)]
+      (is (= 4 (count batches)) "Should have 4 batches")
+      (is (= [0 1 2] (vec (first batches))) "First batch has 3 items")
+      (is (= [9] (vec (last batches))) "Last batch has remainder"))))
