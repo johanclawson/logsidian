@@ -288,9 +288,10 @@
 
            (js-utils/disableXFrameOptions win)
 
-           (db/ensure-graphs-dir!)
+           ;; Logsidian: db/ensure-graphs-dir! deferred to did-finish-load for faster startup
 
-           (git/configure-auto-commit!)
+           ;; Logsidian: Git config deferred to after window load for faster startup
+           ;; (git/configure-auto-commit!) - moved to did-finish-load below
 
            (vreset! *setup-fn
                     (fn []
@@ -304,7 +305,10 @@
                         (.once (.-webContents win) "did-finish-load"
                                (fn []
                                  (close-splash-window!)
-                                 (.show win)))
+                                 (.show win)
+                                 ;; Logsidian: Deferred operations for faster startup
+                                 (db/ensure-graphs-dir!)
+                                 (git/configure-auto-commit!)))
 
                         (vreset! *teardown-fn
                                  #(doseq [f [t0 t1 t2 t3 t4 tt]]
