@@ -35,9 +35,6 @@
 (defonce *teardown-fn (volatile! nil))
 (defonce *quit-dirty? (volatile! true))
 
-;; Splash screen window atom
-(defonce *splash-win (atom nil))
-
 ;; Handle creating/removing shortcuts on Windows when installing/uninstalling.
 (when (js/require "electron-squirrel-startup") (.quit app))
 
@@ -239,31 +236,11 @@
              (when-let [win @*win]
                (open-url-handler win url))))))
 
-(defn- create-splash-window!
-  "Create a splash screen window that shows immediately on startup"
-  []
-  (let [splash (BrowserWindow. (clj->js {:width 300
-                                          :height 350
-                                          :frame false
-                                          :transparent true
-                                          :alwaysOnTop true
-                                          :skipTaskbar true
-                                          :resizable false
-                                          :center true
-                                          :show true
-                                          :webPreferences {:nodeIntegration false
-                                                           :contextIsolation true}}))]
-    (.loadFile splash (node-path/join js/__dirname "splash.html"))
-    (reset! *splash-win splash)
-    splash))
-
 (defn- close-splash-window!
-  "Close the splash screen if it exists"
+  "Close the splash screen created by electron-entry.js"
   []
-  (when-let [splash @*splash-win]
-    (when-not (.isDestroyed splash)
-      (.close splash))
-    (reset! *splash-win nil)))
+  (when-let [splash-api js/global.__logsidian_splash]
+    (.close splash-api)))
 
 (defn- on-app-ready!
   [^js app']
@@ -271,9 +248,8 @@
        (fn []
          (logger/info (str "Logseq App(" (.getVersion app') ") Starting... "))
 
-         ;; Show splash screen immediately (production only)
-         (when-not dev?
-           (create-splash-window!))
+         ;; Splash screen is now created earlier in electron-entry.js
+         ;; for faster perceived startup (before ClojureScript loads)
 
          ;; Add React developer tool
          (when-let [^js devtoolsInstaller (and dev? (js/require "electron-devtools-installer"))]

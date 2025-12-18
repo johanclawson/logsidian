@@ -1,18 +1,19 @@
 # Mobile Git Sync - Feature Specification
 
 > **Status**: Planning
-> **Last Updated**: 2025-12-09
+> **Last Updated**: 2025-12-18
 > **Target Platforms**: Android, iOS, Windows, macOS, Linux
 
 ## Executive Summary
 
-This document outlines the design for adding seamless Git-based synchronization to Logsidian, with a focus on making it work on mobile platforms (Android/iOS) where native Git is unavailable. The solution uses a GitHub App for authentication, isomorphic-git for cross-platform Git operations, and AI-powered conflict resolution to hide Git complexity from non-technical users.
+This document outlines the design for adding Git-based synchronization to Logsidian, with a focus on making it work on mobile platforms (Android/iOS) where native Git is unavailable. The solution uses **isomorphic-git** for cross-platform Git operations with user-provided credentials.
 
 **Key Principles:**
-- Git is invisible to users - they just see "sync"
-- Zero configuration for new users (sign up → download → works)
-- Seamless migration from existing Logseq installations
-- AI handles conflicts so users never see merge errors
+- Works with any Git provider (GitHub, GitLab, Gitea, self-hosted)
+- User owns and controls their credentials
+- No backend infrastructure required
+- Same library (isomorphic-git) across all platforms
+- Simple setup: enter remote URL + token
 
 ---
 
@@ -23,13 +24,10 @@ This document outlines the design for adding seamless Git-based synchronization 
 3. [Proposed Solution](#3-proposed-solution)
 4. [User Flows](#4-user-flows)
 5. [Technical Architecture](#5-technical-architecture)
-6. [Conflict Resolution System](#6-conflict-resolution-system)
-7. [Data Models](#7-data-models)
-8. [API Specifications](#8-api-specifications)
-9. [Security Considerations](#9-security-considerations)
-10. [Pricing & Limits](#10-pricing--limits)
-11. [Implementation Phases](#11-implementation-phases)
-12. [Tech Stack](#12-tech-stack)
+6. [Conflict Handling](#6-conflict-handling)
+7. [Security Considerations](#7-security-considerations)
+8. [Implementation Phases](#8-implementation-phases)
+9. [Tech Stack](#9-tech-stack)
 
 ---
 
@@ -126,45 +124,62 @@ Git Sync (Desktop Only)
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                    logsidian.com                             │
-│                   (Next.js + Auth.js)                        │
-├─────────────────────────────────────────────────────────────┤
-│  Backend (Cloudflare Workers or Vercel Edge)                │
-│  ├── GitHub App token management                            │
-│  ├── User database (free/paid status)                       │
-│  ├── Repo creation & size monitoring                        │
-│  ├── Conflict resolution queue                              │
-│  └── Download link generator with embedded config           │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 GitHub App: "Logsidian"                      │
-│  Permissions:                                                │
-│  ├── Repository: Read & Write (contents, metadata)          │
-│  ├── Administration: Read & Write (create repos)            │
-│  └── Scoped to user-selected repos only                     │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
 │              Logsidian App (All Platforms)                   │
-│  ├── isomorphic-git (pure JS Git implementation)            │
-│  ├── Cross-platform filesystem abstraction                  │
-│  ├── Token refresh via backend API                          │
-│  └── Conflict detection & reporting                         │
+│                                                              │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │                    Settings UI                        │    │
+│  │  Remote URL: [https://github.com/user/vault.git  ]   │    │
+│  │  Username:   [x-access-token_____________________ ]   │    │
+│  │  Token:      [ghp_xxxxxxxxxxxxxxxxxxxx___________ ]   │    │
+│  │              [Test Connection]  [Save]               │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                            │                                 │
+│                            ▼                                 │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              isomorphic-git (pure JS)                │    │
+│  │  ├── clone, fetch, pull, push, commit               │    │
+│  │  ├── Works identically on all platforms              │    │
+│  │  └── No native binaries required                     │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                            │                                 │
+│                            ▼                                 │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │           Platform Filesystem Adapter                │    │
+│  │  ├── Electron: Node.js fs                           │    │
+│  │  ├── Android:  @capacitor/filesystem                │    │
+│  │  └── iOS:      @capacitor/filesystem                │    │
+│  └─────────────────────────────────────────────────────┘    │
+│                            │                                 │
+│                            ▼                                 │
+│  ┌─────────────────────────────────────────────────────┐    │
+│  │              Secure Credential Storage               │    │
+│  │  ├── Electron: safeStorage API                      │    │
+│  │  ├── Android:  Android Keystore                     │    │
+│  │  └── iOS:      iOS Keychain                         │    │
+│  └─────────────────────────────────────────────────────┘    │
+└─────────────────────────────────────────────────────────────┘
+                            │
+                            ▼
+┌─────────────────────────────────────────────────────────────┐
+│              Any Git Provider (User's Choice)                │
+│  ├── GitHub (github.com)                                    │
+│  ├── GitLab (gitlab.com or self-hosted)                     │
+│  ├── Gitea (self-hosted)                                    │
+│  ├── Bitbucket                                              │
+│  └── Any Git server with HTTPS support                      │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 3.2 Why GitHub App (Not OAuth + PAT)
+### 3.2 Why User-Provided Credentials
 
-| Aspect | GitHub App | OAuth + PAT |
-|--------|------------|-------------|
-| **Token Lifecycle** | Auto-refresh (1 hour) | User manages (long-lived) |
-| **Scope** | Per-repo granular access | All repos or none |
-| **Security** | More secure, revocable | Less secure, manual revoke |
-| **User Experience** | One-click install | Must create/paste PAT |
-| **Audit** | GitHub tracks all access | Limited visibility |
+| Aspect | User-Provided Token | Backend Service |
+|--------|---------------------|-----------------|
+| **Complexity** | Simple - no backend | Complex - servers, DB, auth |
+| **Cost** | Free | Hosting + maintenance costs |
+| **Privacy** | Credentials stay on device | Token passes through our servers |
+| **Provider Support** | Any Git provider | Only supported providers |
+| **Offline Setup** | Works offline after setup | Requires internet for auth |
+| **User Control** | Full control over access | Delegated to our service |
 
 ### 3.3 Why Isomorphic-Git
 
@@ -175,7 +190,7 @@ Git Sync (Desktop Only)
 - **Full Git support**: Clone, fetch, push, merge, etc.
 
 ```javascript
-// Example: Clone with pre-configured token
+// Example: Clone with user-provided credentials
 import git from 'isomorphic-git';
 import http from 'isomorphic-git/http/web';
 
@@ -183,257 +198,148 @@ await git.clone({
   fs,
   http,
   dir: '/vault',
-  url: 'https://github.com/user/logsidian-vault',
+  url: 'https://github.com/user/my-notes.git',
   onAuth: () => ({
-    username: 'x-access-token',
-    password: installationToken
+    username: settings.git.username,  // e.g., 'x-access-token' for GitHub
+    password: settings.git.token      // User's PAT
   })
 });
 ```
+
+### 3.4 Supported Git Providers
+
+| Provider | Username | Token Type | Token Creation |
+|----------|----------|------------|----------------|
+| **GitHub** | `x-access-token` | Personal Access Token (classic or fine-grained) | Settings → Developer settings → Personal access tokens |
+| **GitLab** | Your username or `oauth2` | Personal Access Token | Settings → Access Tokens |
+| **Gitea** | Your username | Application Token | Settings → Applications |
+| **Bitbucket** | Your username | App Password | Settings → App passwords |
+| **Self-hosted** | Varies | Varies | Check your server docs |
+
+**Required token permissions:**
+- Read/write repository contents
+- (Optional) Create repositories
 
 ---
 
 ## 4. User Flows
 
-### 4.1 New User Signup Flow
+### 4.1 First-Time Setup Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   logsidian.com                              │
+│                 Logsidian App - First Launch                 │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│              Welcome to Logsidian                            │
-│     "Obsidian's speed with Logseq's blocks,                 │
-│              files stay yours"                               │
+│  Welcome to Logsidian!                                       │
 │                                                              │
-│         [ Sign in with GitHub ]                             │
+│  Choose how to get started:                                  │
 │                                                              │
-│  ✓ Your notes sync via your own GitHub repos                │
-│  ✓ You own your data - always                               │
-│  ✓ Works on all devices                                     │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  📁 Open Local Folder                                   │ │
+│  │     Start with a folder on this device (no sync)       │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  🔄 Clone from Git                                      │ │
+│  │     Sync notes across devices with your Git account    │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  📥 Import Existing Logseq Graph                        │ │
+│  │     Found 2 Logseq vaults on this device               │ │
+│  └────────────────────────────────────────────────────────┘ │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
-                            │
-                     User clicks button
-                            │
-                            ▼
+```
+
+### 4.2 Git Setup Flow (Clone from Git)
+
+```
+User clicks "Clone from Git"
+        │
+        ▼
 ┌─────────────────────────────────────────────────────────────┐
-│                   GitHub OAuth                               │
+│                    Git Repository Setup                      │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  Logsidian by @johanclawson wants to access your account    │
+│  Repository URL:                                             │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ https://github.com/username/my-notes.git               │ │
+│  └────────────────────────────────────────────────────────┘ │
 │                                                              │
-│  ○ Create repositories                                      │
-│  ○ Read and write repository contents                       │
+│  Authentication:                                             │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ Provider: [GitHub ▼]                                   │ │
+│  │                                                         │ │
+│  │ Username: [x-access-token____________________________] │ │
+│  │           (For GitHub, use "x-access-token")           │ │
+│  │                                                         │ │
+│  │ Token:    [ghp_xxxxxxxxxxxxxxxxxxxxxxxxxxxx__________] │ │
+│  │           🔗 How to create a token                     │ │
+│  └────────────────────────────────────────────────────────┘ │
 │                                                              │
-│         [ Authorize Logsidian ]                             │
+│  Local folder:                                               │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │ ~/Documents/Logsidian/my-notes          [Browse...]    │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│         [Test Connection]              [Clone & Open]       │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
-                            │
-                     User authorizes
-                            │
-                            ▼
+        │
+        ▼ (User clicks "Clone & Open")
 ┌─────────────────────────────────────────────────────────────┐
-│                   logsidian.com/setup                        │
+│                      Cloning...                              │
+│                                                              │
+│  ████████████████████░░░░░░░░░░  65%                        │
+│                                                              │
+│  Receiving objects: 1,234 / 1,899                           │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+        │
+        ▼
+   Vault opens, sync enabled!
+```
+
+### 4.3 Settings UI for Git Sync
+
+Users can configure/modify git settings from the app settings:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Settings > Git Sync                                        │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  Welcome, @johanclawson!                                    │
+│  ┌─ Current Repository ─────────────────────────────────┐   │
+│  │                                                       │   │
+│  │  Remote: https://github.com/user/my-notes.git        │   │
+│  │  Branch: main                                         │   │
+│  │  Status: ✓ Connected                                  │   │
+│  │                                                       │   │
+│  │  Last sync: 2 minutes ago                            │   │
+│  │  Local changes: 3 files modified                     │   │
+│  │                                                       │   │
+│  └───────────────────────────────────────────────────────┘   │
 │                                                              │
-│  Let's create your first vault:                             │
+│  Sync Settings:                                              │
+│  ├─ Auto-sync interval: [30 seconds ▼]                      │
+│  ├─ Sync on app open:   [✓]                                 │
+│  ├─ Sync on file save:  [✓]                                 │
+│  └─ Commit message:     [Auto-sync {timestamp}]             │
 │                                                              │
-│  Vault name: [ my-notes_____________ ]                      │
-│                                                              │
-│  This will create: github.com/johanclawson/logsidian-my-notes│
-│                                                              │
-│              [ Create Vault ]                               │
+│  Actions:                                                    │
+│  [Sync Now]  [View History]  [Change Repository]            │
 │                                                              │
 │  ─────────────────────────────────────────────────────────  │
 │                                                              │
-│  Or import existing Logseq vault:                           │
-│              [ I have an existing vault ]                   │
+│  Credentials:                                                │
+│  ├─ Username: x-access-token                                │
+│  └─ Token:    ghp_xxxx...xxxx (hidden)                      │
+│                                                              │
+│  [Update Credentials]  [Test Connection]                    │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
-                            │
-                     User creates vault
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   logsidian.com/download                     │
-├─────────────────────────────────────────────────────────────┤
-│                                                              │
-│  Your vault is ready!                                       │
-│                                                              │
-│  Download Logsidian for your device:                        │
-│                                                              │
-│  ┌──────────┐  ┌──────────┐  ┌──────────┐  ┌──────────┐   │
-│  │ Windows  │  │  macOS   │  │ Android  │  │   iOS    │   │
-│  │    ⊞     │  │    🍎     │  │    🤖    │  │    📱    │   │
-│  └──────────┘  └──────────┘  └──────────┘  └──────────┘   │
-│                                                              │
-│  Your download includes your account setup.                 │
-│  Just install and your vault will sync automatically!       │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 4.2 Download with Embedded Config
-
-**Download URL Structure:**
-```
-https://logsidian.com/download/windows?token=eyJhbGc...
-https://logsidian.com/download/android?token=eyJhbGc...
-```
-
-**Token Contents (JWT):**
-```json
-{
-  "user_id": "123",
-  "github_username": "johanclawson",
-  "vaults": [
-    {
-      "repo": "johanclawson/logsidian-my-notes",
-      "installation_id": 456
-    }
-  ],
-  "exp": 1234567890
-}
-```
-
-**App First Launch Flow:**
-```
-App launches with token
-        │
-        ▼
-┌─ Token Exchange ───────────────────────────────────────────┐
-│  POST /api/auth/exchange                                   │
-│  { "setup_token": "eyJhbGc..." }                          │
-│                                                            │
-│  Response:                                                 │
-│  {                                                         │
-│    "access_token": "ghs_xxxx",  // GitHub installation token│
-│    "user": { "id": 123, "plan": "free" },                 │
-│    "vaults": [...]                                         │
-│  }                                                         │
-└────────────────────────────────────────────────────────────┘
-        │
-        ▼
-┌─ Clone Vaults ─────────────────────────────────────────────┐
-│  For each vault:                                           │
-│  1. git.clone({ url, token })                             │
-│  2. Register local path                                    │
-│  3. Start sync watcher                                     │
-└────────────────────────────────────────────────────────────┘
-        │
-        ▼
-   Ready to use!
-```
-
-### 4.3 Existing Logseq User Migration Flow
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  User has existing Logseq installation                       │
-│  └── C:\Users\{user}\Documents\Logseq\                      │
-│      ├── journals/                                           │
-│      ├── pages/                                              │
-│      ├── logseq/                                             │
-│      │   ├── config.edn        ← User settings              │
-│      │   ├── custom.css        ← Custom styling             │
-│      │   └── plugins/          ← Installed plugins          │
-│      └── .git/ (maybe)         ← Existing git setup         │
-└─────────────────────────────────────────────────────────────┘
-                            │
-                    Logsidian Install
-                            │
-                            ▼
-┌─────────────────────────────────────────────────────────────┐
-│  1. Detect existing Logseq graphs                           │
-│  2. Show: "Found 2 vaults - import to Logsidian?"           │
-│  3. User selects which to sync                              │
-│  4. We push existing content to their GitHub repo           │
-│  5. Settings preserved, sync enabled, done!                 │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**Detection Logic:**
-```javascript
-// Common Logseq locations by platform
-const LOGSEQ_PATHS = {
-  win32: [
-    '%USERPROFILE%\\Documents\\Logseq',
-    '%USERPROFILE%\\Logseq',
-    '%APPDATA%\\Logseq\\graphs.edn'  // Logseq's graph registry
-  ],
-  darwin: [
-    '~/Documents/Logseq',
-    '~/Logseq',
-    '~/Library/Application Support/Logseq/graphs.edn'
-  ],
-  android: [
-    '/storage/emulated/0/Documents/Logseq',
-    '/storage/emulated/0/Logseq'
-  ],
-  ios: [
-    // Check via Capacitor filesystem API
-  ]
-};
-
-// Logseq stores known graphs in graphs.edn
-// Format: [{:name "vault1" :path "/path/to/vault1"} ...]
-```
-
-**First Launch UI (With Existing Vaults):**
-```
-┌─────────────────────────────────────────────────────────────┐
-│           Welcome to Logsidian!                              │
-│                                                              │
-│  ┌─ Found existing vaults ─────────────────────────────┐    │
-│  │                                                      │    │
-│  │  ☑ My Notes (2.3 GB)        ~/Documents/Logseq      │    │
-│  │    ⚠️ Exceeds 1GB free limit - upgrade for full sync │    │
-│  │                                                      │    │
-│  │  ☑ Work Vault (340 MB)      ~/Work/notes            │    │
-│  │    ✓ Within free tier                               │    │
-│  │                                                      │    │
-│  │  ☐ Old Archive (50 MB)      ~/Archive/logseq        │    │
-│  │                                                      │    │
-│  └──────────────────────────────────────────────────────┘    │
-│                                                              │
-│  These will sync to your GitHub: @johanclawson              │
-│                                                              │
-│  [ ] Keep existing git remote (advanced)                    │
-│                                                              │
-│         [ Import Selected Vaults ]                          │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-**What Gets Migrated:**
-
-| Item | Location | Action |
-|------|----------|--------|
-| **Pages & Journals** | `pages/`, `journals/` | Push to GitHub repo |
-| **Config** | `logseq/config.edn` | Preserve exactly |
-| **Custom CSS** | `logseq/custom.css` | Preserve exactly |
-| **Plugins** | `logseq/plugins/` | Store list, reinstall on new devices |
-| **Assets** | `assets/` | Push to repo (counts against storage) |
-| **Existing .git** | `.git/` | Option: keep remote or replace |
-
-**Import Flow Backend:**
-```
-User selects vaults to import
-        │
-        ▼
-┌─ For Each Selected Vault ──────────────────────────────────┐
-│  1. API: Create repo (e.g., johanclawson/logsidian-notes)  │
-│  2. Initialize with .gitignore, .logsidian-config          │
-│  3. git init locally (isomorphic-git)                      │
-│  4. Add remote, push all content                           │
-│  5. Register vault in our database                         │
-└────────────────────────────────────────────────────────────┘
-        │
-        ▼
-   Vault ready, sync enabled!
 ```
 
 ### 4.4 Multi-Device Sync Flow
@@ -446,8 +352,8 @@ User selects vaults to import
 │  3. Sync: commit + push (every 30s or on change)            │
 └─────────────────────────────────────────────────────────────┘
                             │
-                     GitHub Repository
-                    (johanclawson/vault)
+                     Git Repository
+               (Any provider - GitHub, GitLab, etc.)
                             │
                             ▼
 ┌─────────────────────────────────────────────────────────────┐
@@ -460,10 +366,34 @@ User selects vaults to import
 
 **Sync Triggers:**
 - App launch / foreground
-- Every 30 seconds while active
-- Manual pull-to-refresh
+- Configurable interval (default: 30 seconds) while active
+- Manual sync button
 - Before editing a file (fetch latest)
 - After saving changes (commit + push)
+
+### 4.5 Adding Git to Existing Local Vault
+
+Users with a local-only vault can enable Git sync later:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│  Settings > Git Sync                                        │
+├─────────────────────────────────────────────────────────────┤
+│                                                              │
+│  Git sync is not configured for this vault.                 │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  🔗 Connect to Existing Repository                      │ │
+│  │     Link this vault to a Git repo you already have     │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  ✨ Create New Repository                               │ │
+│  │     Initialize Git and push to a new remote repo       │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+└─────────────────────────────────────────────────────────────┘
+```
 
 ---
 
@@ -473,75 +403,47 @@ User selects vaults to import
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              LOGSIDIAN ECOSYSTEM                             │
+│                      LOGSIDIAN APP (All Platforms)                           │
 ├─────────────────────────────────────────────────────────────────────────────┤
 │                                                                              │
 │  ┌─────────────────────────────────────────────────────────────────────┐    │
-│  │                         WEB (logsidian.com)                          │    │
-│  │  ┌───────────────┐  ┌───────────────┐  ┌───────────────┐            │    │
-│  │  │   Next.js     │  │   Auth.js     │  │   Stripe      │            │    │
-│  │  │   Frontend    │  │   (GitHub)    │  │   Payments    │            │    │
-│  │  └───────────────┘  └───────────────┘  └───────────────┘            │    │
-│  │           │                  │                  │                    │    │
-│  │           └──────────────────┼──────────────────┘                    │    │
-│  │                              │                                       │    │
-│  │  ┌───────────────────────────┴───────────────────────────────────┐  │    │
-│  │  │                    API Routes (Edge Functions)                 │  │    │
-│  │  │  ├── /api/auth/callback     - GitHub OAuth callback           │  │    │
-│  │  │  ├── /api/auth/exchange     - Token exchange for app          │  │    │
-│  │  │  ├── /api/vaults/create     - Create new vault repo           │  │    │
-│  │  │  ├── /api/vaults/list       - List user's vaults              │  │    │
-│  │  │  ├── /api/sync/token        - Get fresh GitHub token          │  │    │
-│  │  │  ├── /api/conflicts/report  - Report sync conflict            │  │    │
-│  │  │  └── /api/conflicts/resolve - Submit resolution               │  │    │
-│  │  └───────────────────────────────────────────────────────────────┘  │    │
+│  │                         Git Settings UI                              │    │
+│  │  ┌─────────────────────────────────────────────────────────────┐    │    │
+│  │  │  Remote URL: https://github.com/user/notes.git              │    │    │
+│  │  │  Username:   x-access-token                                  │    │    │
+│  │  │  Token:      ********** (stored securely)                   │    │    │
+│  │  └─────────────────────────────────────────────────────────────┘    │    │
 │  └─────────────────────────────────────────────────────────────────────┘    │
 │                                      │                                       │
-│                                      │ HTTPS                                 │
+│                                      ▼                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐    │
+│  │                    Cross-Platform Git Layer                          │    │
+│  │                                                                      │    │
+│  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐        │    │
+│  │  │ isomorphic-git │  │  FS Adapter    │  │ Secure Storage │        │    │
+│  │  │  - clone       │  │  - Electron:   │  │  - Electron:   │        │    │
+│  │  │  - fetch       │  │    Node fs     │  │    safeStorage │        │    │
+│  │  │  - push        │  │  - Mobile:     │  │  - Mobile:     │        │    │
+│  │  │  - commit      │  │    Capacitor   │  │    Keychain/   │        │    │
+│  │  │  - merge       │  │    Filesystem  │  │    Keystore    │        │    │
+│  │  └────────────────┘  └────────────────┘  └────────────────┘        │    │
+│  └─────────────────────────────────────────────────────────────────────┘    │
 │                                      │                                       │
-│  ┌───────────────────────────────────┼───────────────────────────────────┐  │
-│  │                            DATABASE                                    │  │
-│  │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐                   │  │
-│  │  │   Users     │  │   Vaults    │  │  Conflicts  │                   │  │
-│  │  │  - github_id│  │  - repo     │  │  - file     │                   │  │
-│  │  │  - plan     │  │  - user_id  │  │  - versions │                   │  │
-│  │  │  - stripe_id│  │  - size     │  │  - status   │                   │  │
-│  │  └─────────────┘  └─────────────┘  └─────────────┘                   │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
-│                                      │                                       │
-├──────────────────────────────────────┼───────────────────────────────────────┤
-│                                      │                                       │
-│  ┌───────────────────────────────────┼───────────────────────────────────┐  │
-│  │                         GITHUB APP                                     │  │
-│  │                                   │                                    │  │
-│  │  Permissions:                     │                                    │  │
-│  │  ├── contents: write              │                                    │  │
-│  │  ├── metadata: read          Installation Tokens                      │  │
-│  │  └── administration: write        │                                    │  │
-│  │                                   │                                    │  │
-│  └───────────────────────────────────┼───────────────────────────────────┘  │
-│                                      │                                       │
-├──────────────────────────────────────┼───────────────────────────────────────┤
-│                                      │                                       │
-│  ┌───────────────────────────────────┴───────────────────────────────────┐  │
-│  │                      LOGSIDIAN APP (All Platforms)                     │  │
-│  │                                                                        │  │
-│  │  ┌──────────────────────────────────────────────────────────────────┐ │  │
-│  │  │                    Cross-Platform Git Layer                       │ │  │
-│  │  │  ┌────────────────┐  ┌────────────────┐  ┌────────────────┐     │ │  │
-│  │  │  │ isomorphic-git │  │  FS Adapter    │  │  Token Manager │     │ │  │
-│  │  │  │  - clone       │  │  - Electron:   │  │  - Refresh     │     │ │  │
-│  │  │  │  - fetch       │  │    Node fs     │  │  - Cache       │     │ │  │
-│  │  │  │  - push        │  │  - Mobile:     │  │  - Retry       │     │ │  │
-│  │  │  │  - merge       │  │    Capacitor   │  │                │     │ │  │
-│  │  │  └────────────────┘  └────────────────┘  └────────────────┘     │ │  │
-│  │  └──────────────────────────────────────────────────────────────────┘ │  │
-│  │                                                                        │  │
-│  │  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐      │  │
-│  │  │  Windows   │  │   macOS    │  │  Android   │  │    iOS     │      │  │
-│  │  │  Electron  │  │  Electron  │  │  Capacitor │  │  Capacitor │      │  │
-│  │  └────────────┘  └────────────┘  └────────────┘  └────────────┘      │  │
-│  └───────────────────────────────────────────────────────────────────────┘  │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
+│  │  Windows   │  │   macOS    │  │  Android   │  │    iOS     │            │
+│  │  Electron  │  │  Electron  │  │  Capacitor │  │  Capacitor │            │
+│  └────────────┘  └────────────┘  └────────────┘  └────────────┘            │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+                                       │
+                                       │ HTTPS (git clone/fetch/push)
+                                       ▼
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                       User's Git Provider (Any)                              │
+│                                                                              │
+│  ┌────────────┐  ┌────────────┐  ┌────────────┐  ┌────────────┐            │
+│  │   GitHub   │  │   GitLab   │  │   Gitea    │  │ Self-hosted│            │
+│  └────────────┘  └────────────┘  └────────────┘  └────────────┘            │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
@@ -560,8 +462,9 @@ User selects vaults to import
    [frontend.fs.capacitor-fs :as capacitor-fs]
    [frontend.fs.node-fs :as node-fs]
    [frontend.mobile.util :as mobile-util]
-   [frontend.util :as util]
+   [frontend.config :as config]
    [frontend.state :as state]
+   [frontend.handler.notification :as notification]
    [promesa.core :as p]))
 
 (defn get-fs
@@ -571,38 +474,46 @@ User selects vaults to import
     (capacitor-fs/create-fs)
     (node-fs/create-fs)))
 
+(defn get-git-config
+  "Get git configuration for current graph."
+  []
+  (let [repo (state/get-current-repo)]
+    (config/get-git-config repo)))
+
 (defn get-auth
-  "Returns auth callback for GitHub."
+  "Returns auth callback using user-provided credentials."
   []
   (fn []
-    (let [token (state/get-github-token)]
-      #js {:username "x-access-token"
-           :password token})))
+    (let [{:keys [username token]} (get-git-config)]
+      (when (and username token)
+        #js {:username username
+             :password token}))))
 
 (defn clone!
   "Clone a repository."
-  [url dir]
+  [url dir {:keys [username token]}]
   (p/let [fs (get-fs)]
     (git/clone
      #js {:fs fs
           :http http
           :dir dir
           :url url
-          :onAuth (get-auth)
+          :onAuth (fn [] #js {:username username :password token})
           :singleBranch true
           :depth 1})))
 
 (defn pull!
   "Fetch and merge remote changes."
   [dir]
-  (p/let [fs (get-fs)]
+  (p/let [fs (get-fs)
+          {:keys [author-name author-email]} (get-git-config)]
     (git/pull
      #js {:fs fs
           :http http
           :dir dir
           :onAuth (get-auth)
-          :author #js {:name "Logsidian"
-                       :email "sync@logsidian.com"}})))
+          :author #js {:name (or author-name "Logsidian")
+                       :email (or author-email "user@logsidian.app")}})))
 
 (defn push!
   "Push local commits to remote."
@@ -626,13 +537,14 @@ User selects vaults to import
 (defn commit!
   "Create a commit with message."
   [dir message]
-  (p/let [fs (get-fs)]
+  (p/let [fs (get-fs)
+          {:keys [author-name author-email]} (get-git-config)]
     (git/commit
      #js {:fs fs
           :dir dir
           :message message
-          :author #js {:name "Logsidian"
-                       :email "sync@logsidian.com"}})))
+          :author #js {:name (or author-name "Logsidian")
+                       :email (or author-email "user@logsidian.app")}})))
 
 (defn sync!
   "Full sync: pull, add, commit, push."
@@ -643,8 +555,18 @@ User selects vaults to import
     (when has-changes?
       (p/do!
        (add-all! dir)
-       (commit! dir (str "Sync " (js/Date.)))
+       (commit! dir (str "Auto-sync " (.toISOString (js/Date.))))
        (push! dir)))))
+
+(defn test-connection!
+  "Test git connection with provided credentials. Returns promise."
+  [url {:keys [username token]}]
+  (p/let [result (git/getRemoteInfo
+                  #js {:http http
+                       :url url
+                       :onAuth (fn [] #js {:username username :password token})})]
+    {:success true
+     :default-branch (.-HEAD result)}))
 ```
 
 ### 5.3 Filesystem Abstraction for Capacitor
@@ -756,828 +678,184 @@ User selects vaults to import
 
 ---
 
-## 6. Conflict Resolution System
+## 6. Conflict Handling
 
-### 6.1 Conflict Types & Auto-Resolution
+Since users manage their own Git credentials, conflict handling is simpler - we rely on Git's standard merge capabilities with user-friendly UI.
 
-| Conflict Type | Auto-Resolvable? | Strategy |
-|---------------|------------------|----------|
-| **Same block edited differently** | Often | AI merges both edits |
-| **Block deleted vs edited** | Maybe | Keep the edit, flag for review |
-| **New blocks in same location** | Yes | Keep both, reorder by timestamp |
-| **Config file conflict** | Yes | Merge settings, prefer newer |
-| **Binary file (image/pdf)** | No | Ask user which to keep |
-| **Rename + edit** | Usually | Follow rename, apply edit |
+### 6.1 Conflict Detection
 
-### 6.2 Conflict Resolution Flow
+When `git pull` encounters conflicts, isomorphic-git will throw an error. We catch this and present options to the user.
+
+### 6.2 Conflict Resolution UI
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                   User's Device                              │
-│  Sync attempt → Conflict detected → Can't auto-resolve      │
-│                         │                                    │
-│                         ▼                                    │
-│  ┌───────────────────────────────────────────────────────┐  │
-│  │  "Sync paused - we're fixing it!"                     │  │
-│  │  You can keep working, we'll notify you.              │  │
-│  └───────────────────────────────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────┘
-                          │
-                          ▼
-┌─────────────────────────────────────────────────────────────┐
-│                 Logsidian Backend                            │
-│                                                              │
-│  1. Receive conflict report (both versions of files)        │
-│  2. AI attempts auto-resolution                             │
-│  3. If confident (>0.9) → resolve & push                    │
-│  4. If uncertain → email user with simple choices           │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 6.3 AI Auto-Resolution Prompt
-
-```javascript
-const prompt = `
-You are resolving a sync conflict in a note-taking app.
-The user edited this file on two devices before syncing.
-
-ORIGINAL VERSION (common ancestor):
-${base}
-
-VERSION A (${deviceA} - edited ${timeA}):
-${ours}
-
-VERSION B (${deviceB} - edited ${timeB}):
-${theirs}
-
-Rules:
-1. NEVER delete user content - preserve everything
-2. If both added content, include both (newer first)
-3. If both edited same line differently, include both marked:
-   <<<< Phone version
-   [content]
-   ====
-   [content]
-   >>>> Desktop version
-4. For config files (.edn), merge keys, prefer newer values
-5. Output confidence score (0.0-1.0) on first line
-
-Format:
-CONFIDENCE: 0.95
----
-[merged content here]
-`;
-```
-
-### 6.4 Email Flow (When AI Can't Resolve)
-
-**Initial Email Template:**
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Subject: Action needed: Your vault needs attention          │
-│  From: Logsidian Sync <sync@logsidian.com>                  │
+│  Sync Conflict Detected                                      │
 ├─────────────────────────────────────────────────────────────┤
 │                                                              │
-│  Hi Johan,                                                   │
+│  The file "Meeting Notes.md" was changed on both devices.   │
 │                                                              │
-│  Your vault "Work Notes" has a sync conflict we couldn't    │
-│  automatically resolve. Don't worry - nothing is lost!      │
-│                                                              │
-│  📄 File: Meeting Notes.md                                  │
-│                                                              │
-│  What happened:                                              │
-│  You edited this file on your phone AND your computer       │
-│  before they could sync.                                     │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ PHONE VERSION (Tuesday 3pm):                        │    │
-│  │ "- Call with Sarah at 2pm                          │    │
-│  │  - Discuss Q4 budget"                              │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                                                              │
-│  ┌─────────────────────────────────────────────────────┐    │
-│  │ COMPUTER VERSION (Tuesday 4pm):                     │    │
-│  │ "- Call with Sarah at 2pm                          │    │
-│  │  - She approved the proposal!"                     │    │
-│  └─────────────────────────────────────────────────────┘    │
-│                                                              │
-│  What would you like to do?                                  │
-│                                                              │
-│  [ Keep Phone Version ]  [ Keep Computer Version ]          │
-│                                                              │
-│  [ Keep Both ] ← We'll combine them with clear labels       │
-│                                                              │
-│  [ Let me fix it myself ] ← Opens in Logsidian              │
-│                                                              │
-│  ─────────────────────────────────────────────────────────  │
-│  💬 Need help? Just reply to this email and describe        │
-│     what you'd like - our AI assistant will help!           │
-│                                                              │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 6.5 Reply-to-Email AI Resolution
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  User replies:                                               │
-│  "Keep both but the computer one is more recent so put      │
-│   that first"                                                │
-├─────────────────────────────────────────────────────────────┤
-│                          │                                   │
-│                          ▼                                   │
-│  AI parses intent:                                          │
-│  - Action: merge_both                                       │
-│  - Order: theirs (computer) first, ours (phone) second      │
-│                          │                                   │
-│                          ▼                                   │
-│  Generates merged file, pushes to repo                      │
-│                          │                                   │
-│                          ▼                                   │
-│  Sends confirmation email:                                  │
-│  "Done! I merged both versions with your computer edits     │
-│   first. Your vault is syncing now."                        │
-└─────────────────────────────────────────────────────────────┘
-```
-
-### 6.6 In-App Notification (Non-Blocking)
-
-Users can keep working while conflicts are pending:
-
-```
-┌─────────────────────────────────────────────────────────────┐
-│  Logsidian                                        [─][□][×] │
-├─────────────────────────────────────────────────────────────┤
 │  ┌────────────────────────────────────────────────────────┐ │
-│  │ ⚠️ 1 file needs attention • Check email or [Fix Now]  │ │
+│  │  Keep Local Version                                    │ │
+│  │  Keep the version from this device                     │ │
 │  └────────────────────────────────────────────────────────┘ │
 │                                                              │
-│  Your normal vault content here...                          │
-│  - Daily notes                                               │
-│  - etc.                                                      │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  Keep Remote Version                                   │ │
+│  │  Keep the version from the server                      │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  Keep Both (Recommended)                               │ │
+│  │  Create "Meeting Notes (conflict).md" with local copy  │ │
+│  └────────────────────────────────────────────────────────┘ │
+│                                                              │
+│  ┌────────────────────────────────────────────────────────┐ │
+│  │  View Differences                                      │ │
+│  │  See what changed and manually resolve                 │ │
+│  └────────────────────────────────────────────────────────┘ │
 │                                                              │
 └─────────────────────────────────────────────────────────────┘
 ```
 
-### 6.7 Conflict Prevention Strategies
+### 6.3 Conflict Prevention
 
 | Strategy | Implementation |
 |----------|----------------|
 | **Frequent sync** | Sync every 30s when online |
-| **Block-level sync** | Track changes per block, not whole file |
-| **Edit locking** | Soft lock files being edited, short timeout |
+| **Sync on app open** | Always pull when app opens/foregrounds |
 | **Offline indicator** | Warn: "Offline - changes sync later" |
-| **Pre-edit fetch** | Always pull before opening file for edit |
-| **Last-write-wins** | For config files, use newest version |
+| **Pre-edit fetch** | Pull before opening file for edit |
 
 ---
 
-## 7. Data Models
+## 7. Security Considerations
 
-### 7.1 Database Schema
+### 7.1 Credential Storage
 
-```sql
--- Users table
-CREATE TABLE users (
-  id            TEXT PRIMARY KEY,           -- UUID
-  github_id     INTEGER UNIQUE NOT NULL,    -- GitHub user ID
-  github_username TEXT NOT NULL,
-  email         TEXT,
-  plan          TEXT DEFAULT 'free',        -- 'free' | 'paid'
-  stripe_customer_id TEXT,
-  created_at    TIMESTAMP DEFAULT NOW(),
-  updated_at    TIMESTAMP DEFAULT NOW()
-);
+| Platform | Storage Method | Security |
+|----------|----------------|----------|
+| **Electron (Desktop)** | `safeStorage` API | OS-level encryption (DPAPI on Windows, Keychain on macOS) |
+| **Android** | Android Keystore via `@aparajita/capacitor-secure-storage` | Hardware-backed encryption |
+| **iOS** | iOS Keychain via `@aparajita/capacitor-secure-storage` | Secure Enclave |
 
--- Vaults table
-CREATE TABLE vaults (
-  id              TEXT PRIMARY KEY,         -- UUID
-  user_id         TEXT REFERENCES users(id),
-  github_repo     TEXT NOT NULL,            -- 'username/repo-name'
-  installation_id INTEGER NOT NULL,         -- GitHub App installation
-  name            TEXT NOT NULL,            -- Display name
-  size_bytes      BIGINT DEFAULT 0,
-  last_sync_at    TIMESTAMP,
-  created_at      TIMESTAMP DEFAULT NOW(),
-  UNIQUE(user_id, github_repo)
-);
+### 7.2 Token Best Practices
 
--- Conflicts table
-CREATE TABLE conflicts (
-  id                TEXT PRIMARY KEY,       -- UUID
-  vault_id          TEXT REFERENCES vaults(id),
-  user_id           TEXT REFERENCES users(id),
-  file_path         TEXT NOT NULL,
-  base_content      TEXT,                   -- Common ancestor
-  local_content     TEXT NOT NULL,          -- "ours"
-  remote_content    TEXT NOT NULL,          -- "theirs"
-  local_device      TEXT,                   -- Device identifier
-  remote_device     TEXT,
-  status            TEXT DEFAULT 'pending', -- pending|ai_resolved|user_resolved|manual
-  ai_confidence     REAL,                   -- 0.0 - 1.0
-  resolution_content TEXT,
-  resolved_by       TEXT,                   -- 'ai'|'user_email'|'user_app'
-  created_at        TIMESTAMP DEFAULT NOW(),
-  resolved_at       TIMESTAMP
-);
+**Recommend users create tokens with:**
+- Minimum required permissions (repo contents only)
+- Expiration dates (e.g., 90 days)
+- Single-repository scope (if using fine-grained PATs on GitHub)
 
--- Conflict emails table
-CREATE TABLE conflict_emails (
-  id              TEXT PRIMARY KEY,
-  conflict_id     TEXT REFERENCES conflicts(id),
-  email_type      TEXT NOT NULL,            -- 'initial'|'reminder'|'resolved'
-  sent_at         TIMESTAMP DEFAULT NOW(),
-  user_reply      TEXT,
-  ai_interpretation TEXT
-);
+### 7.3 Data Privacy
 
--- Subscriptions table (for Stripe)
-CREATE TABLE subscriptions (
-  id                    TEXT PRIMARY KEY,
-  user_id               TEXT REFERENCES users(id),
-  stripe_subscription_id TEXT UNIQUE,
-  status                TEXT,               -- 'active'|'canceled'|'past_due'
-  current_period_end    TIMESTAMP,
-  created_at            TIMESTAMP DEFAULT NOW()
-);
-```
-
-### 7.2 GitHub App Manifest
-
-```yaml
-name: Logsidian
-description: Sync your Logsidian vaults to GitHub
-url: https://logsidian.com
-callback_url: https://logsidian.com/api/auth/callback
-setup_url: https://logsidian.com/setup
-webhook_url: https://logsidian.com/api/webhooks/github
-
-# Permissions
-default_permissions:
-  contents: write          # Read/write repo files
-  metadata: read           # Repo info (name, size, etc.)
-  administration: write    # Create repos on user's behalf
-
-# Events to receive
-default_events:
-  - push                   # Notified of pushes (for multi-device sync)
-  - repository             # Repo created/deleted
-
-# Installation settings
-public: true
-single_file_name: null     # Not single-file app
-```
-
-### 7.3 Vault Configuration File
-
-**`.logsidian/config.json`** (stored in each vault repo):
-
-```json
-{
-  "version": 1,
-  "vault_id": "abc123",
-  "created_at": "2025-12-09T10:00:00Z",
-  "sync": {
-    "interval_seconds": 30,
-    "auto_commit": true,
-    "commit_message_template": "Logsidian sync: {timestamp}"
-  },
-  "plugins": [
-    { "id": "logseq-todo-plugin", "version": "1.2.3" },
-    { "id": "logseq-markmap", "version": "2.0.0" }
-  ],
-  "ignore": [
-    "logseq/.recycle/",
-    "logseq/bak/",
-    ".logseq/"
-  ]
-}
-```
-
-### 7.4 Default .gitignore
-
-```gitignore
-# Logsidian vault .gitignore
-
-# OS files
-.DS_Store
-Thumbs.db
-
-# Logseq internals (regenerated locally)
-logseq/.recycle/
-logseq/bak/
-.logseq/
-
-# Plugins (reinstalled from config, not synced)
-logseq/plugins/
-
-# Logsidian local state
-.logsidian/local/
-
-# Large binary files (optional - user configurable)
-# Uncomment to exclude:
-# *.pdf
-# *.mp4
-# *.zip
-```
+- **Credentials never leave device** - stored locally in secure storage
+- **No backend** - direct communication between app and Git provider
+- **No analytics** - we don't track sync activity
+- **User owns everything** - repository, credentials, data
 
 ---
 
-## 8. API Specifications
+## 8. Implementation Phases
 
-### 8.1 Authentication Endpoints
+### Phase 1: Core Git Layer
 
-#### POST /api/auth/callback
-GitHub OAuth callback handler.
-
-**Query Parameters:**
-- `code` - OAuth authorization code
-- `state` - CSRF token
-
-**Response:** Redirects to `/setup` or `/dashboard`
-
----
-
-#### POST /api/auth/exchange
-Exchange setup token for access credentials.
-
-**Request:**
-```json
-{
-  "setup_token": "eyJhbGc..."
-}
-```
-
-**Response:**
-```json
-{
-  "access_token": "ghs_xxxx",
-  "expires_at": "2025-12-09T11:00:00Z",
-  "user": {
-    "id": "user_123",
-    "github_username": "johanclawson",
-    "plan": "free"
-  },
-  "vaults": [
-    {
-      "id": "vault_abc",
-      "name": "my-notes",
-      "repo": "johanclawson/logsidian-my-notes",
-      "size_bytes": 52428800
-    }
-  ]
-}
-```
-
----
-
-### 8.2 Vault Endpoints
-
-#### POST /api/vaults/create
-Create a new vault repository.
-
-**Request:**
-```json
-{
-  "name": "work-notes",
-  "description": "My work notes vault",
-  "private": true
-}
-```
-
-**Response:**
-```json
-{
-  "id": "vault_xyz",
-  "name": "work-notes",
-  "repo": "johanclawson/logsidian-work-notes",
-  "clone_url": "https://github.com/johanclawson/logsidian-work-notes.git",
-  "created_at": "2025-12-09T10:00:00Z"
-}
-```
-
----
-
-#### GET /api/vaults
-List user's vaults.
-
-**Response:**
-```json
-{
-  "vaults": [
-    {
-      "id": "vault_abc",
-      "name": "my-notes",
-      "repo": "johanclawson/logsidian-my-notes",
-      "size_bytes": 52428800,
-      "last_sync_at": "2025-12-09T09:30:00Z"
-    }
-  ],
-  "storage": {
-    "used_bytes": 52428800,
-    "limit_bytes": 1073741824,
-    "plan": "free"
-  }
-}
-```
-
----
-
-#### DELETE /api/vaults/:id
-Delete a vault (removes from Logsidian, optionally deletes GitHub repo).
-
-**Query Parameters:**
-- `delete_repo` - boolean, whether to delete GitHub repo
-
-**Response:**
-```json
-{
-  "success": true
-}
-```
-
----
-
-### 8.3 Sync Endpoints
-
-#### POST /api/sync/token
-Get fresh GitHub installation token for syncing.
-
-**Request:**
-```json
-{
-  "vault_id": "vault_abc"
-}
-```
-
-**Response:**
-```json
-{
-  "token": "ghs_xxxx",
-  "expires_at": "2025-12-09T11:00:00Z"
-}
-```
-
----
-
-#### POST /api/sync/pre-check
-Check if push is allowed (storage limits).
-
-**Request:**
-```json
-{
-  "vault_id": "vault_abc",
-  "new_size_bytes": 1200000000
-}
-```
-
-**Response (OK):**
-```json
-{
-  "allowed": true
-}
-```
-
-**Response (Blocked):**
-```json
-{
-  "allowed": false,
-  "reason": "STORAGE_LIMIT_EXCEEDED",
-  "current_bytes": 900000000,
-  "limit_bytes": 1073741824,
-  "upgrade_url": "https://logsidian.com/upgrade"
-}
-```
-
----
-
-### 8.4 Conflict Endpoints
-
-#### POST /api/conflicts/report
-Report a sync conflict.
-
-**Request:**
-```json
-{
-  "vault_id": "vault_abc",
-  "file_path": "pages/Meeting Notes.md",
-  "base_content": "...",
-  "local_content": "...",
-  "remote_content": "...",
-  "local_device": "Windows Desktop",
-  "remote_device": "Android Phone"
-}
-```
-
-**Response:**
-```json
-{
-  "conflict_id": "conflict_123",
-  "status": "processing",
-  "estimated_resolution": "auto"
-}
-```
-
----
-
-#### GET /api/conflicts/:id
-Get conflict status.
-
-**Response:**
-```json
-{
-  "id": "conflict_123",
-  "status": "pending",
-  "file_path": "pages/Meeting Notes.md",
-  "created_at": "2025-12-09T10:00:00Z",
-  "options": {
-    "keep_local_url": "https://logsidian.com/conflicts/123/resolve?choice=local",
-    "keep_remote_url": "https://logsidian.com/conflicts/123/resolve?choice=remote",
-    "keep_both_url": "https://logsidian.com/conflicts/123/resolve?choice=both"
-  }
-}
-```
-
----
-
-#### POST /api/conflicts/:id/resolve
-Resolve a conflict.
-
-**Request:**
-```json
-{
-  "choice": "both",
-  "custom_content": null
-}
-```
-
-**Response:**
-```json
-{
-  "success": true,
-  "resolved_content": "...",
-  "committed": true
-}
-```
-
----
-
-### 8.5 Webhook Endpoints
-
-#### POST /api/webhooks/github
-Handle GitHub App webhooks.
-
-**Events handled:**
-- `installation` - App installed/uninstalled
-- `push` - Repository pushed to
-- `repository` - Repo created/deleted
-
----
-
-#### POST /api/webhooks/email
-Handle inbound email replies (from Postmark/Resend).
-
-**Request:** Postmark inbound webhook format
-
-**Processing:**
-1. Extract conflict ID from email subject/headers
-2. Parse user reply with AI
-3. Apply resolution
-4. Send confirmation email
-
----
-
-## 9. Security Considerations
-
-### 9.1 Token Security
-
-| Token Type | Lifetime | Storage | Refresh |
-|------------|----------|---------|---------|
-| **Setup Token** | 1 hour | URL parameter | One-time use |
-| **GitHub Installation Token** | 1 hour | Memory only | Via backend API |
-| **User Session** | 7 days | HTTP-only cookie | Sliding window |
-| **Stripe Customer ID** | Permanent | Database | N/A |
-
-### 9.2 Data Privacy
-
-- **Vault contents**: Stored only in user's GitHub repo
-- **We never store**: File contents, note text, personal data
-- **We store**: Metadata only (vault names, sizes, sync times)
-- **Conflict resolution**: Content held temporarily, deleted after resolution
-- **Email replies**: Processed by AI, not stored long-term
-
-### 9.3 GitHub App Permissions
-
-**Minimal required permissions:**
-- `contents: write` - Required to read/write vault files
-- `metadata: read` - Required to check repo size
-- `administration: write` - Required to create repos
-
-**NOT requested:**
-- `actions` - No CI/CD access
-- `issues/pull_requests` - No issue tracker access
-- `workflows` - No workflow access
-
-### 9.4 Encryption
-
-- **In transit**: All API calls over HTTPS/TLS 1.3
-- **At rest**: GitHub encrypts repos at rest
-- **Tokens**: AES-256 encrypted in database
-- **Email**: TLS required for email delivery
-
----
-
-## 10. Pricing & Limits
-
-### 10.1 Tier Comparison
-
-| Feature | Free | Paid ($X/month) |
-|---------|------|-----------------|
-| **Vaults** | Unlimited | Unlimited |
-| **Storage per vault** | 1 GB | Unlimited |
-| **Devices** | Unlimited | Unlimited |
-| **Sync frequency** | 30 seconds | 30 seconds |
-| **Conflict resolution** | AI auto + email buttons | + Reply-to-email AI |
-| **Support** | Community | Priority email |
-
-### 10.2 Storage Limit Enforcement
-
-**Enforcement Points:**
-
-1. **Pre-push check** (client-side):
-   ```javascript
-   // Before syncing
-   const size = await calculateVaultSize(dir);
-   const allowed = await api.checkStorageLimit(vaultId, size);
-   if (!allowed) {
-     showUpgradePrompt();
-     return;
-   }
-   ```
-
-2. **Backend validation** (API):
-   ```javascript
-   // POST /api/sync/pre-check
-   if (newSize > user.storageLimit && user.plan === 'free') {
-     return { allowed: false, reason: 'STORAGE_LIMIT_EXCEEDED' };
-   }
-   ```
-
-3. **Periodic audit** (cron job):
-   ```javascript
-   // Daily job
-   for (const vault of await getOversizedVaults()) {
-     await sendStorageWarningEmail(vault.user);
-     await flagVaultReadOnly(vault.id);
-   }
-   ```
-
-### 10.3 What Counts Toward Storage
-
-| Included | Excluded |
-|----------|----------|
-| Markdown files | `.git/` directory |
-| Assets (images, PDFs) | `logseq/plugins/` |
-| Config files | `.logsidian/local/` |
-| Custom CSS | |
-
----
-
-## 11. Implementation Phases
-
-### Phase 1: Foundation (Web + Backend)
-
-**Goal:** User can sign up, create vault, get download link
+**Goal:** Cross-platform git operations working
 
 **Tasks:**
-- [ ] Register GitHub App (dev mode)
-- [ ] Scaffold Next.js web app
-- [ ] Implement Auth.js with GitHub provider
-- [ ] Create vault management API
-- [ ] Build download link generator
-- [ ] Set up database (Turso/Supabase)
+- [ ] Create `src/main/frontend/fs/git.cljs` using isomorphic-git
+- [ ] Create `src/main/frontend/fs/capacitor_fs.cljs` for mobile
+- [ ] Create `src/main/frontend/fs/node_fs.cljs` wrapper for desktop
+- [ ] Implement secure credential storage abstraction
+- [ ] Add `test-connection!` function for credential validation
 
 **Deliverables:**
-- logsidian.com with GitHub login
-- Vault creation flow
-- Download page with platform options
+- Working clone/pull/push/commit on all platforms
 
 ---
 
-### Phase 2: Desktop Integration
+### Phase 2: Settings UI
 
-**Goal:** Desktop app syncs via isomorphic-git
+**Goal:** Users can configure Git sync in settings
 
 **Tasks:**
-- [ ] Create `src/main/frontend/fs/git.cljs`
-- [ ] Implement token refresh flow
-- [ ] Add first-launch setup UI
-- [ ] Implement existing vault detection
-- [ ] Build migration wizard
-- [ ] Test sync loop
+- [ ] Create Git settings component
+- [ ] Add provider presets (GitHub, GitLab, etc.) with username hints
+- [ ] Implement "Test Connection" button
+- [ ] Add "How to create a token" help links per provider
+- [ ] Store credentials in secure storage
 
 **Deliverables:**
-- Windows/macOS builds with sync
-- Seamless migration from Logseq
+- Settings > Git Sync page with full configuration
 
 ---
 
-### Phase 3: Mobile Support
+### Phase 3: Clone Flow
 
-**Goal:** Android app syncs via isomorphic-git
+**Goal:** Users can clone a repo on first launch
 
 **Tasks:**
-- [ ] Create Capacitor filesystem adapter
-- [ ] Remove mobile platform guards
-- [ ] Build mobile-optimized first-launch UI
-- [ ] Test on real Android devices
-- [ ] Handle background sync
-- [ ] Implement offline mode
+- [ ] Create first-launch setup wizard
+- [ ] Implement clone with progress indicator
+- [ ] Handle clone errors gracefully (bad URL, bad credentials, etc.)
+- [ ] Remove mobile platform guards from sync code
 
 **Deliverables:**
-- Android APK with working sync
-- iOS build (if applicable)
+- "Clone from Git" flow working on all platforms
 
 ---
 
-### Phase 4: Conflict Resolution
+### Phase 4: Auto-Sync
 
-**Goal:** Conflicts resolved automatically or via email
+**Goal:** Automatic background synchronization
 
 **Tasks:**
-- [ ] Build conflict detection logic
-- [ ] Implement AI auto-resolution
-- [ ] Create email templates (React Email)
-- [ ] Set up email sending (Resend/Postmark)
-- [ ] Implement inbound email handling
-- [ ] Build reply parsing with AI
+- [ ] Implement configurable sync interval (default 30s)
+- [ ] Add sync-on-app-open trigger
+- [ ] Add sync-on-file-save trigger (optional)
+- [ ] Show sync status indicator in UI
+- [ ] Handle offline gracefully
 
 **Deliverables:**
-- Automatic conflict resolution
-- Email-based resolution flow
-- In-app conflict indicator
+- Seamless background sync with status feedback
 
 ---
 
-### Phase 5: Payments & Polish
+### Phase 5: Conflict Resolution
 
-**Goal:** Paid tier with unlimited storage
+**Goal:** User-friendly conflict handling
 
 **Tasks:**
-- [ ] Integrate Stripe
-- [ ] Implement storage limit enforcement
-- [ ] Build upgrade flow
-- [ ] Add usage dashboard
-- [ ] Performance optimization
-- [ ] Documentation
+- [ ] Detect merge conflicts during pull
+- [ ] Create conflict resolution UI
+- [ ] Implement "keep local/remote/both" options
+- [ ] Add diff viewer for manual resolution
 
 **Deliverables:**
-- Working payments
-- Storage limits enforced
-- Production-ready system
+- Complete conflict handling without data loss
 
 ---
 
-## 12. Tech Stack
+## 9. Tech Stack
 
-### 12.1 Web Application
+### 9.1 Cross-Platform Libraries
 
-| Component | Technology | Rationale |
-|-----------|------------|-----------|
-| **Framework** | Next.js 14 (App Router) | Fast, Auth.js integration, Edge support |
-| **Authentication** | Auth.js v5 | Built-in GitHub provider |
-| **Database** | Turso (SQLite edge) | Low latency, simple, cheap |
-| **ORM** | Drizzle | Type-safe, lightweight |
-| **Hosting** | Vercel | Easy deploys, edge functions |
-| **Email (outbound)** | Resend | Great DX, React Email support |
-| **Email (inbound)** | Postmark Inbound | Reliable webhook delivery |
-| **Payments** | Stripe | Industry standard |
+| Component | Library | Purpose |
+|-----------|---------|---------|
+| **Git operations** | isomorphic-git | Pure JS git implementation |
+| **HTTP for Git** | isomorphic-git/http/web | HTTPS transport layer |
+| **Desktop filesystem** | Node.js `fs` | File operations on Electron |
+| **Mobile filesystem** | @capacitor/filesystem | File operations on iOS/Android |
+| **Secure storage (mobile)** | @aparajita/capacitor-secure-storage | Credential storage |
+| **Secure storage (desktop)** | Electron safeStorage | Credential storage |
 
-### 12.2 Desktop Application
+### 9.2 Existing Infrastructure
 
-| Component | Technology | Rationale |
-|-----------|------------|-----------|
-| **Framework** | Electron | Existing Logseq infrastructure |
-| **Git** | isomorphic-git | Cross-platform, pure JS |
-| **UI** | ClojureScript + Rum | Existing codebase |
-
-### 12.3 Mobile Application
-
-| Component | Technology | Rationale |
-|-----------|------------|-----------|
-| **Framework** | Capacitor | Existing Logseq infrastructure |
-| **Git** | isomorphic-git | Works in mobile WebView |
-| **Filesystem** | @capacitor/filesystem | Native file access |
-| **Secure Storage** | @aparajita/capacitor-secure-storage | Token storage |
-
-### 12.4 AI Integration
-
-| Component | Technology | Rationale |
-|-----------|------------|-----------|
-| **Conflict Resolution** | Claude API (claude-3-haiku) | Fast, cheap, good at merging |
-| **Email Parsing** | Claude API (claude-3-haiku) | Natural language understanding |
-| **SDK** | @anthropic-ai/sdk | Official TypeScript SDK |
+| Component | Technology | Notes |
+|-----------|------------|-------|
+| **Desktop app** | Electron | No changes needed |
+| **Mobile app** | Capacitor | Already configured |
+| **UI framework** | ClojureScript + Rum | Existing codebase |
+| **Build system** | Shadow-cljs | Existing setup |
 
 ---
 
@@ -1588,52 +866,25 @@ logsidian/
 ├── src/
 │   ├── main/frontend/
 │   │   ├── fs/
-│   │   │   ├── git.cljs           # NEW: Cross-platform git
-│   │   │   ├── capacitor_fs.cljs  # NEW: Capacitor adapter
+│   │   │   ├── git.cljs           # NEW: Cross-platform git operations
+│   │   │   ├── capacitor_fs.cljs  # NEW: Capacitor filesystem adapter
+│   │   │   ├── node_fs.cljs       # NEW: Node.js filesystem adapter
 │   │   │   ├── sync.cljs          # MODIFIED: Remove mobile guards
 │   │   │   └── ...
 │   │   ├── handler/
+│   │   │   ├── git_sync.cljs      # NEW: Git sync handlers
 │   │   │   ├── file_sync.cljs     # MODIFIED: Enable mobile
 │   │   │   └── ...
 │   │   ├── components/
-│   │   │   ├── sync_setup.cljs    # NEW: First-launch wizard
-│   │   │   ├── migration.cljs     # NEW: Logseq migration
+│   │   │   ├── git_settings.cljs  # NEW: Git configuration UI
+│   │   │   ├── git_setup.cljs     # NEW: First-launch clone wizard
+│   │   │   ├── conflict_resolver.cljs # NEW: Conflict resolution UI
 │   │   │   └── ...
 │   │   └── ...
 │   └── ...
 ├── docs/
 │   └── feature/
 │       └── mobile-git-sync.md     # This document
-└── ...
-
-logsidian-web/                      # Separate repo
-├── app/
-│   ├── page.tsx                   # Landing page
-│   ├── login/page.tsx             # GitHub OAuth
-│   ├── setup/page.tsx             # Vault creation
-│   ├── download/page.tsx          # Download links
-│   ├── dashboard/page.tsx         # User dashboard
-│   └── api/
-│       ├── auth/
-│       │   ├── callback/route.ts
-│       │   └── exchange/route.ts
-│       ├── vaults/
-│       │   └── route.ts
-│       ├── sync/
-│       │   ├── token/route.ts
-│       │   └── pre-check/route.ts
-│       ├── conflicts/
-│       │   ├── report/route.ts
-│       │   └── [id]/resolve/route.ts
-│       └── webhooks/
-│           ├── github/route.ts
-│           └── email/route.ts
-├── components/
-├── lib/
-│   ├── db.ts
-│   ├── github.ts
-│   ├── ai.ts
-│   └── email.ts
 └── ...
 ```
 
@@ -1643,23 +894,24 @@ logsidian-web/                      # Separate repo
 
 | Term | Definition |
 |------|------------|
-| **Vault** | A Logsidian knowledge base, synced to a GitHub repo |
-| **Installation Token** | Short-lived GitHub token for a specific app installation |
-| **isomorphic-git** | Pure JavaScript Git implementation |
-| **Capacitor** | Cross-platform native runtime for web apps |
-| **Conflict** | When same file edited on multiple devices before sync |
-| **Setup Token** | One-time token embedded in download link |
+| **PAT** | Personal Access Token - user-generated credential for Git authentication |
+| **isomorphic-git** | Pure JavaScript Git implementation that works in any JS environment |
+| **Capacitor** | Cross-platform native runtime for web apps (iOS/Android) |
+| **safeStorage** | Electron API for OS-level encrypted storage |
+| **Keychain/Keystore** | Platform-specific secure credential storage (iOS/Android) |
 
 ---
 
 ## Appendix C: References
 
 - [isomorphic-git Documentation](https://isomorphic-git.org/)
-- [GitHub Apps Documentation](https://docs.github.com/en/apps)
+- [isomorphic-git API Reference](https://isomorphic-git.org/docs/en/alphabetic)
 - [Capacitor Filesystem](https://capacitorjs.com/docs/apis/filesystem)
-- [Auth.js GitHub Provider](https://authjs.dev/reference/core/providers/github)
-- [Logseq Architecture](https://github.com/logseq/logseq)
+- [Capacitor Secure Storage Plugin](https://github.com/nicfoster/capacitor-secure-storage)
+- [Electron safeStorage](https://www.electronjs.org/docs/latest/api/safe-storage)
+- [GitHub Personal Access Tokens](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/creating-a-personal-access-token)
+- [GitLab Personal Access Tokens](https://docs.gitlab.com/ee/user/profile/personal_access_tokens.html)
 
 ---
 
-*Document maintained by the Logsidian team. Last updated: 2025-12-09*
+*Document maintained by the Logsidian team. Last updated: 2025-12-18*

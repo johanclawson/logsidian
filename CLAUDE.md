@@ -71,26 +71,27 @@ yarn release-electron     # Desktop - outputs to static/out/
 
 ### Windows Builds (x64 + ARM64)
 
-Local build for Windows x64:
-```powershell
-yarn install
-yarn gulp:build
-yarn cljs:release-electron
-yarn webpack-app-build
+**Use the build script for reliable builds:**
+```bash
+# From Claude Code bash (isolated PowerShell to avoid path corruption):
+cmd.exe /c "cd /d X:\source\repos\logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1"
 
-cd static
-yarn install
-yarn electron:make
-# Output: static/out/make/
+# Options:
+#   -SkipInstall    Skip yarn install step (faster rebuilds)
+#   -ElectronOnly   Only build electron (skip CSS and webpack)
+#   -Help           Show help message
 ```
 
-Local build for Windows ARM64:
-```powershell
-cd static
-$env:npm_config_arch = "arm64"
-yarn install
-yarn electron:make-win-arm64
-```
+**Output:** `static/out/Logseq-win32-{arch}/Logseq.exe`
+
+**What the build script does:**
+1. Sets Node.js version from `.nvmrc` via PATH (not nvm use)
+2. Installs dependencies with `--ignore-scripts` to avoid path corruption
+3. Builds tldraw and ui packages directly (avoids yarn script bash calls)
+4. Runs gulp, PostCSS, ClojureScript, and webpack builds
+5. Packages Electron app and copies native binaries
+
+**Native binaries:** The script auto-detects architecture and copies pre-built binaries from `native-binaries/win32-{arch}/` if present.
 
 **Note:** ARM64 builds require the rsapi native module to be compiled for ARM64. This is handled automatically by the GitHub Actions workflow.
 
@@ -132,12 +133,13 @@ Production builds include these optimizations:
 
 | Optimization | File | Impact |
 |--------------|------|--------|
+| Early Splash Screen | `resources/electron-entry.js` | Instant visual feedback |
 | Node.js 22 Compile Cache | `resources/electron-entry.js` | 30-50% faster startup |
 | Direct Function Invocation | `shadow-cljs.edn` (`:fn-invoke-direct`) | 10-30% faster |
 | Disabled Logging | `shadow-cljs.edn` (`goog.debug.LOGGING_ENABLED`) | ~5-10% faster |
 | No Source Maps | `shadow-cljs.edn` (`:source-map false`) | Smaller bundles |
 | Webpack Production Mode | `webpack.config.js` | Tree shaking enabled |
-| Splash Screen | `resources/splash.html` | Perceived faster startup |
+| Deferred DB/Git Operations | `src/electron/electron/core.cljs` | Faster window display |
 
 ---
 
@@ -452,66 +454,56 @@ cmd.exe /c "nvm use 22.21.0 && cd /d X:\source\repos\logsidian\static && npm ins
 
 ### Complete Local Build Process (Windows x64)
 
-Full sequence to build a runnable Electron app from scratch:
+**Recommended: Use the build script** (handles all path corruption issues):
 
 ```bash
-# 1. Switch to Node 22 (required - project uses .nvmrc)
-cmd.exe /c "nvm use 22.21.0"
+# Full build from scratch
+cmd.exe /c "cd /d X:\source\repos\logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1"
 
-# 2. Install root dependencies
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm install"
+# Skip dependency install (faster rebuilds)
+cmd.exe /c "cd /d X:\source\repos\logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -SkipInstall"
 
-# 3. Build CSS (PostCSS/Tailwind)
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run css:build"
-
-# 4. Copy resources to static/ (gulp task)
-# Note: gulp:build may fail on CSS step but still copies resources
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run gulp:build"
-
-# 5. Build ClojureScript (compiles to static/js/)
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run cljs:release-electron"
-
-# 6. Build webpack bundles (db-worker, inference-worker)
-pwsh -NoProfile -Command "cd 'X:\source\repos\logsidian'; npm run webpack-app-build"
-
-# 7. Install static/ dependencies and package Electron app
-cmd.exe /c "nvm use 22.21.0 && cd /d X:\source\repos\logsidian\static && npm install && npm run electron:make"
-
-# Output: static/out/Logseq-win32-x64/Logseq.exe
+# Only rebuild ClojureScript
+cmd.exe /c "cd /d X:\source\repos\logsidian && pwsh -NoProfile -ExecutionPolicy Bypass -File scripts\build.ps1 -SkipInstall -ElectronOnly"
 ```
+
+**Output:** `static/out/Logseq-win32-x64/Logseq.exe`
+
+The build script (`scripts/build.ps1`) automatically:
+- Sets correct Node.js version via PATH
+- Builds tldraw and ui packages directly (avoids bash path corruption)
+- Runs gulp, PostCSS, ClojureScript, and webpack builds
+- Copies native binaries from `native-binaries/` if present
+- Packages Electron app with electron-forge
 
 ### Native Module: rsapi
 
 The `@logseq/rsapi-win32-x64-msvc` native module is required but NOT included in npm packages.
 
-**For local builds**, copy from a GitHub release:
-```bash
-# Download release
-gh release download <tag> --repo johanclawson/logsidian --pattern "Logseq-win32-x64-*.zip"
+**Option 1: Pre-built binaries** (recommended)
 
-# Extract and copy rsapi module
-# From: temp-extract/resources/app/node_modules/@logseq/rsapi-win32-x64-msvc/
-# To:   static/out/Logseq-win32-x64/resources/app/node_modules/@logseq/
+Place pre-built binaries in `native-binaries/win32-{arch}/`:
+```
+native-binaries/
+├── win32-x64/
+│   ├── rsapi.win32-x64-msvc.node
+│   ├── keytar.node
+│   └── electron-deeplink.node
+└── win32-arm64/
+    ├── rsapi.win32-arm64-msvc.node
+    ├── keytar.node
+    └── electron-deeplink.node
+```
+
+The build script auto-detects architecture and copies these to the final app.
+
+**Option 2: Download from GitHub release**
+```bash
+gh release download <tag> --repo johanclawson/logsidian --pattern "Logseq-win32-x64-*.zip"
+# Extract and copy rsapi module to native-binaries/win32-x64/
 ```
 
 **GitHub Actions** builds rsapi automatically in the `build-rsapi-arm64` job.
-
-### Post-Package File Copying
-
-After `electron:make`, if files are missing, manually copy:
-
-```bash
-# CSS (if gulp:build failed on CSS step)
-cp static/css/style.css static/out/Logseq-win32-x64/resources/app/css/
-
-# Webpack bundles (if not copied by packager)
-cp static/js/*-bundle.js static/out/Logseq-win32-x64/resources/app/js/
-cp static/js/*.wasm static/out/Logseq-win32-x64/resources/app/js/
-
-# rsapi native module (from GitHub release)
-cp -r <extracted>/resources/app/node_modules/@logseq/rsapi-win32-x64-msvc \
-      static/out/Logseq-win32-x64/resources/app/node_modules/@logseq/
-```
 
 ### Debugging the Built App
 

@@ -301,5 +301,7 @@ exports.watchMobile = gulp.series(
   gulp.parallel(common.keepSyncResourceFile, common.keepSyncWorkersToMobile, css.watchMobileCSS))
 exports.build = gulp.series(common.clean, common.syncResourceFile,
   common.syncAssetFiles, css.buildCSS)
+exports.buildNoCSS = gulp.series(common.clean, common.syncResourceFile,
+  common.syncAssetFiles)
 exports.buildMobile = gulp.series(common.clean, common.syncResourceFile,
   common.syncAssetFiles, css.buildMobileCSS)

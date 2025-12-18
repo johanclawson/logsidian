@@ -169,10 +169,9 @@
 
     (p/do!
      (-> (p/let [t2 (util/time-ms)
-                 ;; Logsidian: Run worker init and repo fetch in parallel
-                 [_ repos] (p/all [(db-browser/start-db-worker!)
-                                   (repo-handler/get-repos)])
+                 _ (db-browser/start-db-worker!)
                  _ (log/info ::db-worker-spent-time (- (util/time-ms) t2))
+                 repos (repo-handler/get-repos)
                  _ (state/set-repos! repos)
                  _ (mobile-util/hide-splash) ;; hide splash as early as ui is stable
                  repo (or (state/get-current-repo) (:url (first repos)))
