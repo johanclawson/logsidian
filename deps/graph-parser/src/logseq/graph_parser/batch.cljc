@@ -246,3 +246,120 @@
       {:ok false
        :errors (vec (concat (:errors uuid-result)
                             (:errors page-result)))})))
+
+;; =============================================================================
+;; Step 8: Transaction Builder
+;; =============================================================================
+
+(defn build-file-tx
+  "Build transaction data from a single parsed file result.
+   This is a batch-friendly version that returns tx-data without delete operations.
+
+   Arguments:
+   - parsed-data: Result from parse-file-data
+   - file-index: Index of this file in the batch (for debugging, not used for tempids)
+
+   Returns transaction vector for this file (excluding delete operations)."
+  [{:keys [pages blocks refs file-entity]} file-index]
+  (let [file-content [{:file/path (:file/path file-entity)}]
+        block-ids (map (fn [block] {:block/uuid (:block/uuid block)}) blocks)
+        block-refs-ids (->> (mapcat :block/refs blocks)
+                            (filter (fn [ref] (and (vector? ref)
+                                                   (= :block/uuid (first ref)))))
+                            (map (fn [ref] {:block/uuid (second ref)}))
+                            (seq))
+        ;; To prevent "unique constraint" on datascript
+        block-ids (set/union (set block-ids) (set block-refs-ids))
+        pages-index (map #(select-keys % [:block/name]) pages)]
+    ;; Order matters for DataScript unique constraints
+    ;; file-index is available for debugging/tracing but not needed for tempid uniqueness
+    ;; since DataScript uses :block/uuid as the unique identifier
+    (vec (concat file-content refs pages-index pages block-ids blocks [file-entity]))))
+
+;; =============================================================================
+;; Step 9: Batch Transaction Composition
+;; =============================================================================
+
+(defn- dedupe-pages-by-name
+  "Deduplicate pages across files by canonical name.
+   Keeps the first occurrence of each page name to preserve input order
+   and ensure primary pages (which come first) are preferred over stubs."
+  [all-pages]
+  (let [;; Track seen names and collect unique pages in order
+        {:keys [pages]}
+        (reduce (fn [{:keys [seen pages]} page]
+                  (let [name (:block/name page)]
+                    (if (contains? seen name)
+                      ;; Already seen - keep existing (first wins)
+                      {:seen seen :pages pages}
+                      ;; First occurrence - add to result
+                      {:seen (conj seen name)
+                       :pages (conj pages page)})))
+                {:seen #{} :pages []}
+                all-pages)]
+    pages))
+
+(defn- collect-all-block-ids
+  "Collect all block UUIDs from parsed files for upserting."
+  [parsed-files]
+  (->> parsed-files
+       (mapcat :blocks)
+       (map (fn [block] {:block/uuid (:block/uuid block)}))
+       set))
+
+(defn- collect-all-block-refs
+  "Collect all block references from blocks for upserting."
+  [parsed-files]
+  (->> parsed-files
+       (mapcat :blocks)
+       (mapcat :block/refs)
+       (filter (fn [ref] (and (vector? ref)
+                              (= :block/uuid (first ref)))))
+       (map (fn [ref] {:block/uuid (second ref)}))
+       set))
+
+(defn build-batch-tx
+  "Build a single transaction from multiple parsed files.
+   Deduplicates pages and ensures proper ordering for DataScript.
+
+   Arguments:
+   - parsed-files: Sequence of results from parse-file-data
+   - delete-blocks: Optional sequence of block retraction operations
+
+   Returns a single transaction vector ready for d/transact!"
+  [parsed-files delete-blocks]
+  (let [;; Collect all entities from all files
+        all-file-entities (mapv :file-entity parsed-files)
+        all-refs (vec (mapcat :refs parsed-files))
+        all-pages (vec (mapcat :pages parsed-files))
+        all-blocks (vec (mapcat :blocks parsed-files))
+
+        ;; File path assertions (for unique constraint)
+        file-paths (mapv (fn [fe] {:file/path (:file/path fe)}) all-file-entities)
+
+        ;; Deduplicate pages by canonical name
+        unique-pages (dedupe-pages-by-name all-pages)
+        pages-index (mapv #(select-keys % [:block/name]) unique-pages)
+
+        ;; Collect all block IDs for upserting
+        block-ids (collect-all-block-ids parsed-files)
+        block-refs-ids (collect-all-block-refs parsed-files)
+        all-block-ids (set/union block-ids block-refs-ids)]
+
+    ;; Order matters for DataScript:
+    ;; 1. File paths (establish file entities)
+    ;; 2. Refs (page references)
+    ;; 3. Pages index (establish page names)
+    ;; 4. Delete operations (remove old blocks)
+    ;; 5. Full page entities
+    ;; 6. Block ID assertions (for upsert)
+    ;; 7. Full block entities
+    ;; 8. File entities with content
+    (vec (concat file-paths
+                 all-refs
+                 pages-index
+                 (or delete-blocks [])
+                 unique-pages
+                 all-block-ids
+                 all-blocks
+                 all-file-entities))))

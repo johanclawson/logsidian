@@ -248,3 +248,104 @@
           "Has UUID conflict error")
       (is (some #(= :page-conflict (:type %)) (:errors result))
           "Has page conflict error"))))
+
+;; =============================================================================
+;; Step 8: Transaction Builder Tests
+;; =============================================================================
+
+(deftest ^:parallel build-file-tx-produces-valid-tx
+  (testing "build-file-tx returns transaction vector"
+    (let [db @(gp-db/start-conn)
+          parsed (parse-file db "test.md" "- Block 1\n- Block 2")
+          tx (batch/build-file-tx parsed 0)]
+      (is (vector? tx) "Returns a vector")
+      (is (pos? (count tx)) "Has tx operations")
+      ;; Should contain file-path assertion
+      (is (some #(= {:file/path "test.md"} %) tx) "Contains file path")
+      ;; Should contain block UUIDs for upserting
+      (is (some #(and (map? %) (:block/uuid %)) tx) "Contains block UUIDs"))))
+
+(deftest ^:parallel build-file-tx-can-be-transacted
+  (testing "build-file-tx output can be transacted to DataScript"
+    (let [conn (gp-db/start-conn)
+          db @conn
+          parsed (parse-file db "test.md" "- Block 1\n- Block 2")
+          tx (batch/build-file-tx parsed 0)]
+      ;; Should be able to transact without error
+      (is (d/transact! conn tx) "Transaction succeeds")
+      ;; Verify data is in DB
+      (is (d/entity @conn [:file/path "test.md"]) "File entity exists"))))
+
+;; =============================================================================
+;; Step 9: Batch Transaction Composition Tests
+;; =============================================================================
+
+(deftest ^:parallel build-batch-tx-combines-files
+  (testing "build-batch-tx combines multiple parsed files"
+    (let [db @(gp-db/start-conn)
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          parsed1 (parse-file db "file1.md" "- Block A" uuid-fn now-fn)
+          parsed2 (parse-file db "file2.md" "- Block B" uuid-fn now-fn)
+          tx (batch/build-batch-tx [parsed1 parsed2] [])]
+      (is (vector? tx) "Returns a vector")
+      ;; Should contain both file paths
+      (is (some #(= {:file/path "file1.md"} %) tx) "Contains file1 path")
+      (is (some #(= {:file/path "file2.md"} %) tx) "Contains file2 path"))))
+
+(deftest ^:parallel build-batch-tx-deduplicates-pages
+  (testing "build-batch-tx deduplicates pages referenced from multiple files"
+    (let [db @(gp-db/start-conn)
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          ;; Both files reference "shared page"
+          parsed1 (parse-file db "file1.md" "- Block with [[Shared Page]]" uuid-fn now-fn)
+          parsed2 (parse-file db "file2.md" "- Another block with [[Shared Page]]" uuid-fn now-fn)
+          tx (batch/build-batch-tx [parsed1 parsed2] [])
+          ;; Count page name assertions for "shared page"
+          page-name-assertions (filter #(= {:block/name "shared page"} %) tx)]
+      ;; Should only have one assertion per unique page name
+      (is (= 1 (count page-name-assertions))
+          "Shared page is deduplicated"))))
+
+(deftest ^:parallel build-batch-tx-can-be-transacted
+  (testing "build-batch-tx output can be transacted to DataScript"
+    (let [conn (gp-db/start-conn)
+          db @conn
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          parsed1 (parse-file db "file1.md" "- Block A" uuid-fn now-fn)
+          parsed2 (parse-file db "file2.md" "- Block B" uuid-fn now-fn)
+          tx (batch/build-batch-tx [parsed1 parsed2] [])]
+      ;; Should be able to transact without error
+      (is (d/transact! conn tx) "Batch transaction succeeds")
+      ;; Verify both files are in DB
+      (is (d/entity @conn [:file/path "file1.md"]) "File1 exists")
+      (is (d/entity @conn [:file/path "file2.md"]) "File2 exists")
+      ;; Verify pages exist
+      (is (d/entity @conn [:block/name "file1"]) "Page file1 exists")
+      (is (d/entity @conn [:block/name "file2"]) "Page file2 exists"))))
+
+(deftest ^:parallel build-batch-tx-equivalent-to-sequential
+  (testing "batch transact yields same entity count as sequential transacts"
+    (let [;; Sequential transacts
+          conn1 (gp-db/start-conn)
+          uuid-fn1 (make-uuid-generator)
+          now-fn1 (make-now-generator)
+          parsed1a (parse-file @conn1 "file1.md" "- Block A" uuid-fn1 now-fn1)
+          parsed1b (parse-file @conn1 "file2.md" "- Block B" uuid-fn1 now-fn1)
+          _ (d/transact! conn1 (batch/build-file-tx parsed1a 0))
+          _ (d/transact! conn1 (batch/build-file-tx parsed1b 1))
+          count-seq (count (d/datoms @conn1 :eavt))
+
+          ;; Batch transact (same content, fresh generators)
+          conn2 (gp-db/start-conn)
+          uuid-fn2 (make-uuid-generator)
+          now-fn2 (make-now-generator)
+          parsed2a (parse-file @conn2 "file1.md" "- Block A" uuid-fn2 now-fn2)
+          parsed2b (parse-file @conn2 "file2.md" "- Block B" uuid-fn2 now-fn2)
+          _ (d/transact! conn2 (batch/build-batch-tx [parsed2a parsed2b] []))
+          count-batch (count (d/datoms @conn2 :eavt))]
+      ;; Entity counts should be the same (or very close due to ordering differences)
+      (is (= count-seq count-batch)
+          (str "Sequential (" count-seq ") should equal batch (" count-batch ")")))))
