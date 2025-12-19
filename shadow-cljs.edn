@@ -132,6 +132,29 @@
                      :devtools {:watch-path "/static"
                                 :preloads [devtools.preload
                                            shadow.remote.runtime.cljs.browser]}}
+
+  ;; Phase 5: Parse worker for parallel file parsing
+  :parse-worker {:target :browser
+                 :modules {:parse-worker
+                           {:init-fn frontend.worker.parse-worker/init
+                            :web-worker true}}
+                 :output-dir "./static/js"
+                 :asset-path "/static/js"
+                 :compiler-options {:infer-externs :auto
+                                    :output-feature-set :es-next-in
+                                    :source-map true
+                                    :externs ["datascript/externs.js"
+                                              "externs.js"]
+                                    :warnings {:fn-deprecated false
+                                               :redef false}}
+                 :closure-defines {goog.debug.LOGGING_ENABLED true}
+                 ;; CODEX: Disable HMR in worker to prevent window references
+                 :devtools {:autoload false}
+                 :release {:compiler-options {:fn-invoke-direct true
+                                              :elide-asserts true
+                                              :source-map false}
+                           :closure-defines {goog.debug.LOGGING_ENABLED false}}}
+
   :mobile {:target        :browser
            :module-loader true
            :js-options    {:ignore-asset-requires true
