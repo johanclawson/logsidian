@@ -2,7 +2,7 @@
   "Tests for parse worker pool - Step 17.
    Note: Full worker integration tests require a browser environment.
    These tests focus on state management and logic that can be tested without workers."
-  (:require [cljs.test :refer [deftest testing is use-fixtures]]
+  (:require [cljs.test :refer [deftest testing is use-fixtures async]]
             [frontend.worker.parse-worker-pool :as pool]
             [promesa.core :as p]))
 
@@ -10,16 +10,16 @@
 ;; Test Fixtures
 ;; =============================================================================
 
-(defn reset-pool-fixture
-  "Reset pool state before each test."
-  [f]
-  (reset! pool/*pool nil)
-  (reset! pool/*loading? false)
-  (f)
+(defn reset-pool-state!
+  "Reset pool state to clean initial state."
+  []
   (reset! pool/*pool nil)
   (reset! pool/*loading? false))
 
-(use-fixtures :each reset-pool-fixture)
+;; Use map format for fixtures to support async tests
+(use-fixtures :each
+  {:before reset-pool-state!
+   :after reset-pool-state!})
 
 ;; =============================================================================
 ;; Pool State Tests
@@ -207,33 +207,171 @@
 
 (deftest parse-files-parallel-requires-pool-test
   (testing "parse-files-parallel! rejects when pool not initialized"
-    (let [result-atom (atom nil)]
+    (async done
       (-> (pool/parse-files-parallel! [] {})
           (p/catch (fn [e]
-                     (reset! result-atom e))))
-      ;; Give promise time to resolve
-      (js/setTimeout
-       (fn []
-         (is (some? @result-atom) "Should have rejected")
-         (is (= "Worker pool not initialized"
-                (ex-message @result-atom))))
-       10))))
+                     (is (some? e) "Should have rejected")
+                     (is (= "Worker pool not initialized" (ex-message e)))
+                     (done)))))))
 
 (deftest parse-files-parallel-rejects-overlap-test
   (testing "parse-files-parallel! rejects when already loading"
-    (reset! pool/*pool {:workers [] :size 0})
+    (reset! pool/*pool {:workers [{:raw nil :wrapped nil}] :size 1})
     (reset! pool/*loading? true)
-    (let [result-atom (atom nil)]
+    (async done
       (-> (pool/parse-files-parallel! [] {})
           (p/catch (fn [e]
-                     (reset! result-atom e))))
-      ;; Give promise time to resolve
-      (js/setTimeout
-       (fn []
-         (is (some? @result-atom) "Should have rejected")
-         (is (= "Parallel load already in progress"
-                (ex-message @result-atom))))
-       10))))
+                     (is (some? e) "Should have rejected")
+                     (is (= "Parallel load already in progress" (ex-message e)))
+                     (done)))))))
+
+(deftest parse-files-parallel-rejects-empty-pool-test
+  (testing "parse-files-parallel! rejects when pool has size 0 (prevents division-by-zero)"
+    ;; This is the Codex-identified bug: pool exists but size is 0
+    ;; would cause (mod chunk-idx size) to divide by zero
+    (reset! pool/*pool {:workers [] :size 0})
+    (async done
+      (-> (pool/parse-files-parallel! [{:file/path "test.md" :file/content "- block"}] {})
+          (p/catch (fn [e]
+                     (is (some? e) "Should have rejected")
+                     (is (= "Worker pool not initialized" (ex-message e)))
+                     (done)))))))
+
+;; =============================================================================
+;; Device Capability Functions Tests (Phase 6: Device-Aware Optimization)
+;; =============================================================================
+
+(deftest calculate-optimal-workers-test
+  (testing "8 cores with no memory constraint gets 8 workers"
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory nil}))))
+
+  (testing "4 cores with high memory gets 4 workers"
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency 4 :device-memory 8}))))
+
+  (testing "Low memory device (2GB) gets max 2 workers"
+    (is (= 2 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 2}))))
+
+  (testing "Medium memory device (4GB) gets max 4 workers"
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 4}))))
+
+  (testing "Handles nil hardware concurrency - uses DEFAULT-WORKERS"
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency nil :device-memory nil}))))
+
+  (testing "Handles 0 hardware concurrency - uses DEFAULT-WORKERS"
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency 0 :device-memory nil}))))
+
+  (testing "Memory constraint limits high core count"
+    ;; 16 cores but only 2GB RAM → limited to 2 workers
+    (is (= 2 (pool/calculate-optimal-workers
+               {:hardware-concurrency 16 :device-memory 2})))
+    ;; 12 cores but only 4GB RAM → limited to 4 workers
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency 12 :device-memory 4}))))
+
+  (testing "Respects MIN-WORKERS and MAX-WORKERS bounds"
+    ;; 1 core with high memory → clamped to MIN-WORKERS (2)
+    (is (= 2 (pool/calculate-optimal-workers
+               {:hardware-concurrency 1 :device-memory 16})))
+    ;; 32 cores with high memory → clamped to MAX-WORKERS (8)
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 32 :device-memory 16})))))
+
+(deftest memory-based-worker-limits-test
+  (testing "Memory limits follow expected tiers"
+    ;; Edge cases around memory thresholds
+    (is (= 2 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 1}))
+        "1GB → 2 workers")
+    (is (= 2 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 2}))
+        "2GB → 2 workers (edge)")
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 3}))
+        "3GB → 4 workers")
+    (is (= 4 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 4}))
+        "4GB → 4 workers (edge)")
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 5}))
+        "5GB → no limit (8 workers)")
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory 8}))
+        "8GB → no limit (8 workers)")))
+
+(deftest calculate-optimal-workers-handles-invalid-memory-test
+  (testing "NaN device-memory is treated as unknown (no limit)"
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory js/NaN}))))
+
+  (testing "Non-numeric device-memory is treated as unknown"
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory "4GB"}))))
+
+  (testing "Negative device-memory is treated as unknown"
+    (is (= 8 (pool/calculate-optimal-workers
+               {:hardware-concurrency 8 :device-memory -1})))))
+
+(deftest get-device-capabilities-test
+  (testing "Returns map with expected keys"
+    ;; In Node.js, navigator doesn't exist, so both should be nil
+    ;; But the structure should be correct
+    (let [caps (pool/get-device-capabilities)]
+      (is (map? caps) "Should return a map")
+      (is (contains? caps :hardware-concurrency) "Should have :hardware-concurrency key")
+      (is (contains? caps :device-memory) "Should have :device-memory key"))))
+
+(deftest init-pool-device-aware-test
+  (testing "init-pool! with no args calculates optimal workers"
+    ;; In Node.js, navigator doesn't exist, so get-device-capabilities returns nils
+    ;; calculate-optimal-workers with nil/nil returns DEFAULT-WORKERS (4)
+    ;; But we can't actually create workers in Node.js
+    ;; Instead, verify the calculation path works
+    (let [caps {:hardware-concurrency nil :device-memory nil}
+          optimal (pool/calculate-optimal-workers caps)]
+      (is (= pool/DEFAULT-WORKERS optimal)
+          "With unknown device, should use DEFAULT-WORKERS")))
+
+  (testing "init-pool! respects memory constraints in calculation"
+    ;; Low memory device: 8 cores but only 2GB RAM
+    (let [caps {:hardware-concurrency 8 :device-memory 2}
+          optimal (pool/calculate-optimal-workers caps)]
+      (is (= 2 optimal)
+          "2GB device should be limited to 2 workers"))
+
+    ;; Medium memory device: 8 cores with 4GB RAM
+    (let [caps {:hardware-concurrency 8 :device-memory 4}
+          optimal (pool/calculate-optimal-workers caps)]
+      (is (= 4 optimal)
+          "4GB device should be limited to 4 workers"))
+
+    ;; High memory device: 8 cores with 16GB RAM
+    (let [caps {:hardware-concurrency 8 :device-memory 16}
+          optimal (pool/calculate-optimal-workers caps)]
+      (is (= 8 optimal)
+          "16GB device should use all 8 workers"))))
+
+(deftest init-pool-explicit-count-respects-memory-test
+  (testing "Explicit count is still bounded by memory heuristics"
+    ;; When 8 workers requested but device only has 2GB RAM
+    ;; The memory limit should reduce to 2 workers
+    ;; This tests the calculation logic that init-pool! should use
+    (let [caps {:hardware-concurrency 8 :device-memory 2}
+          ;; If we request 8 workers, memory should still limit us
+          memory-limited (pool/calculate-optimal-workers caps)]
+      (is (= 2 memory-limited)
+          "8 cores on 2GB device should become 2 workers"))
+
+    ;; Requesting more than cores available should still respect memory
+    (let [caps {:hardware-concurrency 16 :device-memory 4}
+          memory-limited (pool/calculate-optimal-workers caps)]
+      (is (= 4 memory-limited)
+          "16 cores on 4GB device should become 4 workers"))))
 
 ;; =============================================================================
 ;; Worker Count Capping Tests (Logic Only)

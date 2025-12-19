@@ -30,6 +30,69 @@
 (def ^:const MIN-FILES-PER-WORKER 10)
 
 ;; =============================================================================
+;; Device Capability Detection (Phase 6: Device-Aware Optimization)
+;; =============================================================================
+
+(defn- valid-memory-value?
+  "Check if device-memory is a valid positive number (not NaN)."
+  [device-memory-gb]
+  (and (number? device-memory-gb)
+       (not (js/isNaN device-memory-gb))
+       (pos? device-memory-gb)))
+
+(defn- memory-based-max-workers
+  "Calculate max workers based on device memory.
+   Memory tiers: ≤2GB → 2, ≤4GB → 4, >4GB or invalid → no limit (MAX-WORKERS).
+   Returns nil if no memory constraint applies (>4GB, nil, NaN, non-numeric, negative)."
+  [device-memory-gb]
+  (when (valid-memory-value? device-memory-gb)
+    (cond
+      (<= device-memory-gb 2) 2
+      (<= device-memory-gb 4) 4
+      :else nil)))  ; No constraint for >4GB
+
+(defn calculate-optimal-workers
+  "Pure function to calculate optimal worker count based on device capabilities.
+
+   Arguments:
+   - capabilities: Map with :hardware-concurrency and :device-memory
+
+   Returns: Number of workers to use, clamped to [MIN-WORKERS, MAX-WORKERS]
+
+   Logic:
+   - Start with hardware concurrency (or DEFAULT-WORKERS if unavailable)
+   - Apply memory-based limit if device memory is constrained
+   - Clamp to [MIN-WORKERS, MAX-WORKERS] bounds"
+  [{:keys [hardware-concurrency device-memory]}]
+  (let [;; Base: use hardware cores, or default if unavailable/zero
+        cores (if (and (some? hardware-concurrency)
+                       (pos? hardware-concurrency))
+                hardware-concurrency
+                DEFAULT-WORKERS)
+        ;; Apply memory limit if applicable
+        memory-limit (memory-based-max-workers device-memory)
+        limited (if memory-limit
+                  (min cores memory-limit)
+                  cores)]
+    ;; Clamp to [MIN-WORKERS, MAX-WORKERS]
+    (-> limited
+        (max MIN-WORKERS)
+        (min MAX-WORKERS))))
+
+(defn get-device-capabilities
+  "Read device capabilities from browser APIs.
+   Returns map with :hardware-concurrency and :device-memory.
+
+   Note: These APIs may be unavailable:
+   - navigator.hardwareConcurrency: might be 0 or undefined on some browsers
+   - navigator.deviceMemory: not available on Safari/iOS"
+  []
+  {:hardware-concurrency (when (exists? js/navigator)
+                           (.-hardwareConcurrency js/navigator))
+   :device-memory (when (exists? js/navigator)
+                    (.-deviceMemory js/navigator))})
+
+;; =============================================================================
 ;; State
 ;; =============================================================================
 
@@ -76,17 +139,24 @@
 (defn init-pool!
   "Initialize pool with N workers.
 
-   Default: Uses ALL available cores (navigator.hardwareConcurrency).
-   Graph loading is a short burst - use full CPU power for fast startup.
+   Default: Uses device-aware optimal worker count based on hardware and memory.
+   Graph loading is a short burst - use full CPU power for fast startup,
+   but respect memory constraints on low-memory devices.
 
-   CODEX: Caps at MAX-WORKERS (12), minimum MIN-WORKERS (2)."
-  ([] (init-pool! (or js/navigator.hardwareConcurrency DEFAULT-WORKERS)))
+   CODEX: Caps at MAX-WORKERS (8), minimum MIN-WORKERS (2).
+   Phase 6: Uses calculate-optimal-workers for device-aware sizing."
+  ([]
+   ;; Device-aware initialization: use calculate-optimal-workers
+   (let [caps (get-device-capabilities)
+         optimal (calculate-optimal-workers caps)]
+     (init-pool! optimal)))
   ([n]
    (when-not @*pool
-     (let [;; Use all cores - it's just a short burst at startup
-           worker-count (-> n
-                            (max MIN-WORKERS)
-                            (min MAX-WORKERS))
+     (let [;; Apply memory heuristics even for explicit counts
+           ;; This prevents callers from requesting 8 workers on a 2GB device
+           caps (get-device-capabilities)
+           worker-count (calculate-optimal-workers
+                          (assoc caps :hardware-concurrency n))
            workers (->> (repeatedly worker-count create-worker)
                         (filter some?)  ; Filter failed worker creations
                         vec)]
@@ -94,7 +164,11 @@
          (do
            (reset! *pool {:workers workers :size (count workers)})
            (println (str "Parse worker pool initialized with " (count workers) " workers"
-                        " (device has " (or js/navigator.hardwareConcurrency "unknown") " cores)"))
+                        " (device: " (or (:hardware-concurrency caps) "?") " cores, "
+                        (if-let [mem (:device-memory caps)]
+                          (str mem "GB RAM")
+                          "unknown RAM")
+                        ")"))
            true)
          (do
            (js/console.error "Failed to initialize any parse workers")
@@ -166,7 +240,8 @@
    Returns: Promise resolving to vector of parse results"
   [files opts]
   (cond
-    (not @*pool)
+    ;; CODEX: Use pool-initialized? to also catch size=0 case (prevents division-by-zero)
+    (not (pool-initialized?))
     (p/rejected (ex-info "Worker pool not initialized" {}))
 
     ;; CODEX: Prevent overlapping loads
