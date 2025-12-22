@@ -330,7 +330,6 @@
   [parsed-files delete-blocks]
   (let [;; Collect all entities from all files
         all-file-entities (mapv :file-entity parsed-files)
-        all-refs (vec (mapcat :refs parsed-files))
         all-pages (vec (mapcat :pages parsed-files))
         all-blocks (vec (mapcat :blocks parsed-files))
 
@@ -348,15 +347,13 @@
 
     ;; Order matters for DataScript:
     ;; 1. File paths (establish file entities)
-    ;; 2. Refs (page references)
-    ;; 3. Pages index (establish page names)
-    ;; 4. Delete operations (remove old blocks)
-    ;; 5. Full page entities
-    ;; 6. Block ID assertions (for upsert)
-    ;; 7. Full block entities
-    ;; 8. File entities with content
+    ;; 2. Pages index (establish page names)
+    ;; 3. Delete operations (remove old blocks)
+    ;; 4. Full page entities
+    ;; 5. Block ID assertions (for upsert)
+    ;; 6. Full block entities
+    ;; 7. File entities with content
     (vec (concat file-paths
-                 all-refs
                  pages-index
                  (or delete-blocks [])
                  unique-pages

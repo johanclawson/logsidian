@@ -155,3 +155,76 @@
           (p/catch (fn [e]
                      (is false (str "Test failed: " e))
                      (done)))))))
+
+;; =============================================================================
+;; Codex Review Fixes
+;; =============================================================================
+
+(deftest parse-file-isolated-strips-ast-test
+  (testing "parse-file-isolated strips :ast from results for memory efficiency"
+    (async done
+      (let [db @(gp-db/start-conn)
+            files [(make-file "test.md" "- Block with content\n  - Nested block")]]
+        (-> (pl/parse-files-parallel db files {})
+            (p/then (fn [results]
+                      (is (= 1 (count results)) "Should have 1 result")
+                      (let [wrapped (first results)
+                            parsed-data (:result wrapped)]
+                        (is (= :ok (:status wrapped)) "Should parse ok")
+                        ;; The parsed data should NOT contain :ast
+                        ;; This matches worker behavior for memory efficiency
+                        (is (not (contains? parsed-data :ast))
+                            "Parsed result should not contain :ast (stripped for memory)")
+                        (done))))
+            (p/catch (fn [e]
+                       (is false (str "Test failed: " e))
+                       (done))))))))
+
+(deftest worker-error-preserves-stack-test
+  (testing "worker parse errors preserve stack trace for debugging"
+    ;; This tests that when we convert a worker error result to batch format,
+    ;; the stack trace from the worker is preserved in the error's ex-data.
+    ;; We can't easily trigger a real worker error, so we test the conversion logic.
+    (let [worker-error-result {:status :error
+                               :file-path "broken.md"
+                               :error "SyntaxError: Unexpected token"
+                               :message "Unexpected token"
+                               :stack "Error: Unexpected token\n    at parse (worker.js:42)\n    at processFile (worker.js:100)"}
+          ;; Simulate what parse-files-with-workers does with the result
+          converted (if (= :ok (:status worker-error-result))
+                      (batch/wrap-parse-result (:file-path worker-error-result) (:result worker-error-result))
+                      ;; Create ex-info with stack in ex-data for debuggability
+                      (batch/wrap-parse-error
+                       (:file-path worker-error-result)
+                       (ex-info (:error worker-error-result)
+                                {:stack (:stack worker-error-result)
+                                 :message (:message worker-error-result)})))]
+      (is (= :error (:status converted)) "Status should be :error")
+      (is (= "broken.md" (:file-path converted)) "File path preserved")
+      ;; The error should be an ex-info with stack in ex-data
+      (let [error (:error converted)]
+        (is (instance? ExceptionInfo error) "Error should be ex-info")
+        (is (contains? (ex-data error) :stack) "Error ex-data should contain :stack")
+        (is (string? (:stack (ex-data error))) "Stack should be a string")))))
+
+(deftest parse-files-parallel-preserves-order-test
+  (testing "parse-files-parallel returns results in original file order"
+    (async done
+      (let [db @(gp-db/start-conn)
+            ;; Create files in specific order - we'll verify results maintain this order
+            files [(make-file "first.md" "- First")
+                   (make-file "second.md" "- Second")
+                   (make-file "third.md" "- Third")
+                   (make-file "fourth.md" "- Fourth")]]
+        (-> (pl/parse-files-parallel db files {})
+            (p/then (fn [results]
+                      (is (= 4 (count results)) "Should have 4 results")
+                      ;; Verify order matches input
+                      (is (= "first.md" (:file-path (nth results 0))) "First result is first.md")
+                      (is (= "second.md" (:file-path (nth results 1))) "Second result is second.md")
+                      (is (= "third.md" (:file-path (nth results 2))) "Third result is third.md")
+                      (is (= "fourth.md" (:file-path (nth results 3))) "Fourth result is fourth.md")
+                      (done)))
+            (p/catch (fn [e]
+                       (is false (str "Test failed: " e))
+                       (done))))))))

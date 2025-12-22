@@ -30,7 +30,6 @@
 (deftest enqueue-transact-preserves-order-test
   (async done
     (let [conn (gp-db/start-conn)
-          order (atom [])
           ;; Queue three transactions that record their execution order
           p1 (tq/enqueue-transact! conn [{:block/uuid (d/squuid)
                                            :block/name "page-1"

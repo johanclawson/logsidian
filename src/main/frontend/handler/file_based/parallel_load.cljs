@@ -24,16 +24,19 @@
 
 (defn- parse-file-isolated
   "Parse a single file with error isolation.
-   Returns wrapped result with :ok or :error status."
+   Returns wrapped result with :ok or :error status.
+   Strips :ast from result for memory efficiency (matches worker behavior)."
   [db file opts]
   (try
-    (let [result (graph-parser/parse-file-data
-                  (:file/path file)
-                  (:file/content file)
-                  {:db db
-                   :extract-options opts
-                   :ctime (:ctime (:stat file))
-                   :mtime (:mtime (:stat file))})]
+    (let [result (-> (graph-parser/parse-file-data
+                      (:file/path file)
+                      (:file/content file)
+                      {:db db
+                       :extract-options opts
+                       :ctime (:ctime (:stat file))
+                       :mtime (:mtime (:stat file))})
+                     ;; Strip AST to reduce memory usage (parity with worker path)
+                     (dissoc :ast))]
       (batch/wrap-parse-result (:file/path file) result))
     (catch :default e
       (batch/wrap-parse-error (:file/path file) e))))
@@ -57,27 +60,23 @@
    - files: Sequence of file maps with :file/path and :file/content
    - opts: Extract options
 
-   Note: 'Parallel' here means concurrent I/O, not parallel CPU.
-   JavaScript is single-threaded, but this allows I/O to overlap.
-   Results are returned in the same order as input files to ensure
-   deterministic conflict resolution (first file wins in deduplication)."
+   Note: This is a sequential operation on the main thread. The 'parallel'
+   in the name refers to its role in the overall parallel loading strategy
+   (workers provide true parallelism when available). Results are returned
+   in the same order as input files to ensure deterministic conflict
+   resolution (first file wins in deduplication)."
   [db files opts]
-  (let [total (count files)
-        ;; Use vector of fixed size to preserve order
-        results (atom (vec (repeat total nil)))
-        counter (atom 0)]
-    (p/create
-     (fn [resolve _reject]
-       (if (zero? total)
-         (resolve [])
-         (doseq [[idx file] (map-indexed vector files)]
-           (let [result (parse-file-isolated db file opts)
-                 n (swap! counter inc)]
-             ;; Store at original index to preserve order
-             (swap! results assoc idx result)
-             (report-progress! (:file/path file) n total)
-             (when (= n total)
-               (resolve @results)))))))))
+  (p/resolved
+   (let [total (count files)]
+     (if (zero? total)
+       []
+       (doall
+        (map-indexed
+         (fn [idx file]
+           (let [result (parse-file-isolated db file opts)]
+             (report-progress! (:file/path file) (inc idx) total)
+             result))
+         files))))))
 
 (defn execute-load-plan!
   "Execute a validated load plan by committing batches to the database.
@@ -162,7 +161,12 @@
                   (mapv (fn [r]
                           (if (= :ok (:status r))
                             (batch/wrap-parse-result (:file-path r) (:result r))
-                            (batch/wrap-parse-error (:file-path r) (:error r))))
+                            ;; Preserve stack trace in ex-data for debuggability
+                            (batch/wrap-parse-error
+                             (:file-path r)
+                             (ex-info (or (:error r) "Unknown worker error")
+                                      {:stack (:stack r)
+                                       :message (:message r)}))))
                         results)))
         (p/catch (fn [e]
                    ;; Check if this is an "already loading" guard rejection

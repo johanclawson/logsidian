@@ -433,3 +433,71 @@
       (is (= 4 (count batches)) "Should have 4 batches")
       (is (= [0 1 2] (vec (first batches))) "First batch has 3 items")
       (is (= [9] (vec (last batches))) "Last batch has remainder"))))
+
+;; =============================================================================
+;; Codex Review: Edge Case Tests
+;; =============================================================================
+
+(deftest ^:parallel parsed-files-refs-always-empty-test
+  (testing "refs field from parsed files is always empty (extract doesn't return refs)"
+    ;; This test documents that the :refs field in parsed files is always empty.
+    ;; The extract/extract function returns {:pages :blocks :ast} without :refs,
+    ;; so parse-file-data defaults :refs to [].
+    ;; This means all-refs in build-batch-tx is always empty and can be removed.
+    (let [db @(gp-db/start-conn)
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          ;; Parse a file with various types of content
+          parsed (parse-file db "test.md"
+                             "- Block with [[Page Link]]\n- Another block"
+                             uuid-fn now-fn)]
+      ;; The :refs field should be empty (it defaults to [] in parse-file-data)
+      (is (= [] (:refs parsed)) ":refs should be empty vector")
+      ;; Pages and blocks should NOT be empty (to verify parsing worked)
+      (is (seq (:pages parsed)) ":pages should not be empty")
+      (is (seq (:blocks parsed)) ":blocks should not be empty"))))
+
+(deftest ^:parallel dedupe-pages-stub-before-primary-test
+  (testing "when stub page appears before primary page in file order"
+    ;; This test documents the current behavior of page deduplication.
+    ;; Scenario:
+    ;; - File 1 (page-b.md): Links to [[target page]], creating a stub/ref page
+    ;; - File 2 (target page.md): IS the actual "target page" with content
+    ;;
+    ;; The concern: If page-b.md is processed first, will the stub page
+    ;; override the real "target page" from its own file?
+    ;;
+    ;; Current behavior: "First file wins" - dedupe-pages-by-name keeps
+    ;; the first occurrence. Within each file, primary pages come before
+    ;; ref pages in the :pages list.
+    (let [db @(gp-db/start-conn)
+          uuid-fn (make-uuid-generator)
+          now-fn (make-now-generator)
+          ;; File 1: References "target page" (creates stub)
+          ;; This file's primary page is "page-b", but it also creates
+          ;; a ref/stub page for "target page"
+          parsed-b (parse-file db "pages/page-b.md"
+                               "- Block in Page B\n- Links to [[target page]]"
+                               uuid-fn now-fn)
+          ;; File 2: IS "target page" (primary) - filename matches the page name
+          ;; The primary page here is "target page" with actual content
+          parsed-target (parse-file db "pages/target page.md"
+                                    "- Block in target page\n- This is the real content"
+                                    uuid-fn now-fn)
+          ;; Process in order: page-b first (creates stub), then target page (real)
+          tx (batch/build-batch-tx [parsed-b parsed-target] [])
+          ;; Transact and verify
+          conn (gp-db/start-conn)
+          _ (d/transact! conn tx)
+          target-entity (d/entity @conn [:block/name "target page"])]
+      ;; The page should exist
+      (is (some? target-entity) "target page should exist")
+      ;; The page should have blocks from its own file
+      ;; This verifies the primary page data was preserved
+      (let [blocks-query (d/q '[:find ?b
+                                :where
+                                [?b :block/page ?p]
+                                [?p :block/name "target page"]]
+                              @conn)]
+        (is (seq blocks-query)
+            "target page should have blocks (not just be a stub)")))))
