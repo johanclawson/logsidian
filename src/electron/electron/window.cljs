@@ -28,7 +28,7 @@
          native-titlebar? (cfgs/get-item :window/native-titlebar?)
          url (if graph (str url "#/?graph=" graph) url)
          win-opts  (cond->
-                    {:backgroundColor      "#fff" ; SEE https://www.electronjs.org/docs/latest/faq#the-font-looks-blurry-what-is-this-and-what-can-i-do
+                    {:backgroundColor      "#002b36" ; Solarized dark - matches splash screen
                      :width                (.-width win-state)
                      :height               (.-height win-state)
                      :frame                (or mac? native-titlebar?)

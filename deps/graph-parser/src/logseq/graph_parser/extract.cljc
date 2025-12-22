@@ -338,19 +338,25 @@
      :blocks blocks}))
 
 (defn- with-block-uuid
-  [pages]
-  (->> (common-util/distinct-by :block/name pages)
-       (map (fn [page]
-              (if (:block/uuid page)
-                page
-                (assoc page :block/uuid (d/squuid)))))))
+  "Add UUIDs to pages that don't have one.
+   uuid-fn is an optional function to generate UUIDs (defaults to d/squuid)."
+  ([pages] (with-block-uuid pages d/squuid))
+  ([pages uuid-fn]
+   (->> (common-util/distinct-by :block/name pages)
+        (map (fn [page]
+               (if (:block/uuid page)
+                 page
+                 (assoc page :block/uuid (uuid-fn))))))))
 
 (defn with-ref-pages
-  [pages blocks]
-  (let [ref-pages (->> (mapcat :block/refs blocks)
-                       (filter :block/name))]
-    (->> (concat pages ref-pages)
-         (group-by :block/name)
-         vals
-         (map (partial apply merge))
-         (with-block-uuid))))
+  "Merge reference pages with main pages and ensure all have UUIDs.
+   uuid-fn is an optional function to generate UUIDs (defaults to d/squuid)."
+  ([pages blocks] (with-ref-pages pages blocks d/squuid))
+  ([pages blocks uuid-fn]
+   (let [ref-pages (->> (mapcat :block/refs blocks)
+                        (filter :block/name))
+         merged-pages (->> (concat pages ref-pages)
+                           (group-by :block/name)
+                           vals
+                           (map (partial apply merge)))]
+     (with-block-uuid merged-pages uuid-fn))))

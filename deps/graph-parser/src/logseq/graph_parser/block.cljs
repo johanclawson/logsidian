@@ -373,9 +373,10 @@
    `with-timestamp?`: assign timestampes to the map structure.
     Useful when creating new pages from references or namespaces,
     as there's no chance to introduce timestamps via editing in page
-   `skip-existing-page-check?`: if true, allows pages to have the same name"
+   `skip-existing-page-check?`: if true, allows pages to have the same name
+   `uuid-fn`: optional function to generate UUIDs (defaults to d/squuid)"
   [original-page-name db with-timestamp? date-formatter
-   & {:keys [page-uuid class?] :as options}]
+   & {:keys [page-uuid class? uuid-fn] :or {uuid-fn d/squuid} :as options}]
   (when-not (and db (common-util/uuid-string? original-page-name)
                  (not (ldb/page? (d/entity db [:block/uuid (uuid original-page-name)]))))
     (let [db-based? (ldb/db-based-graph? db)
@@ -391,7 +392,7 @@
                                                  original-page-name
 
                                                  (map? original-page-name)
-                                                 (assoc original-page-name :block/uuid (or page-uuid (d/squuid)))
+                                                 (assoc original-page-name :block/uuid (or page-uuid (uuid-fn)))
 
                                                  :else
                                                  nil)]
@@ -541,14 +542,17 @@
       (gp-property/->new-properties content))))
 
 (defn get-custom-id-or-new-id
-  [properties]
-  (or (when-let [custom-id (or (get-in properties [:properties :custom-id])
-                               (get-in properties [:properties :custom_id])
-                               (get-in properties [:properties :id]))]
-        ;; guard against non-string custom-ids
-        (when-let [custom-id (and (string? custom-id) (string/trim custom-id))]
-          (some-> custom-id parse-uuid)))
-      (d/squuid)))
+  "Get block UUID from properties or generate a new one.
+   uuid-fn is an optional function to generate UUIDs (defaults to d/squuid)."
+  ([properties] (get-custom-id-or-new-id properties d/squuid))
+  ([properties uuid-fn]
+   (or (when-let [custom-id (or (get-in properties [:properties :custom-id])
+                                (get-in properties [:properties :custom_id])
+                                (get-in properties [:properties :id]))]
+         ;; guard against non-string custom-ids
+         (when-let [custom-id (and (string? custom-id) (string/trim custom-id))]
+           (some-> custom-id parse-uuid)))
+       (uuid-fn))))
 
 (defn get-page-refs-from-properties
   [properties db date-formatter user-config]
@@ -584,7 +588,8 @@
     (mapv macro->block @*result)))
 
 (defn with-pre-block-if-exists
-  [blocks body pre-block-properties encoded-content {:keys [db date-formatter user-config]}]
+  [blocks body pre-block-properties encoded-content {:keys [db date-formatter user-config uuid-fn]
+                                                     :or {uuid-fn d/squuid}}]
   (let [first-block (first blocks)
         first-block-start-pos (get-in first-block [:block/meta :start_pos])
 
@@ -595,7 +600,7 @@
                   (merge
                    (let [content (utf8/substring encoded-content 0 first-block-start-pos)
                          {:keys [properties properties-order properties-text-values invalid-properties]} pre-block-properties
-                         id (get-custom-id-or-new-id {:properties properties})
+                         id (get-custom-id-or-new-id {:properties properties} uuid-fn)
                          property-refs (->> (get-page-refs-from-properties
                                              properties db date-formatter
                                              user-config)
@@ -630,8 +635,9 @@
     properties))
 
 (defn- construct-block
-  [block properties timestamps body encoded-content format pos-meta {:keys [block-pattern db date-formatter remove-properties? db-graph-mode? export-to-db-graph?]}]
-  (let [id (get-custom-id-or-new-id properties)
+  [block properties timestamps body encoded-content format pos-meta {:keys [block-pattern db date-formatter remove-properties? db-graph-mode? export-to-db-graph? uuid-fn]
+                                                                     :or {uuid-fn d/squuid}}]
+  (let [id (get-custom-id-or-new-id properties uuid-fn)
         ref-pages-in-properties (->> (:page-refs properties)
                                      (remove string/blank?))
         block (second block)

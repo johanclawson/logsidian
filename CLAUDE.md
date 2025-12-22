@@ -495,7 +495,14 @@ native-binaries/
     └── electron-deeplink.node
 ```
 
-The build script auto-detects architecture and copies these to the final app.
+The build script auto-detects architecture and copies these to the final app in two places:
+1. `static/node_modules/@logseq/rsapi/` (before packaging)
+2. `static/out/Logseq-win32-{arch}/resources/app/node_modules/@logseq/rsapi/` (after packaging)
+
+**Manual builds**: When using `electron-forge package` directly (not the build script), you must manually copy rsapi to the final app:
+```bash
+cp native-binaries/win32-arm64/rsapi.win32-arm64-msvc.node static/out/Logseq-win32-arm64/resources/app/node_modules/@logseq/rsapi/
+```
 
 **Option 2: Download from GitHub release**
 ```bash
