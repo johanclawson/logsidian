@@ -18,7 +18,7 @@ Logsidian is a high-performance fork of Logseq focused on file-based graphs with
 | **Name** | Logsidian |
 | **Tagline** | "Obsidian's speed with Logseq's blocks, files stay yours" |
 | **Base** | Logseq 0.10.15 (stable, file-based only) |
-| **License** | AGPL-3.0 (app), MIT (sidecar) |
+| **License** | AGPL-3.0 |
 | **Status** | Early Development |
 
 ### Why 0.10.15?
@@ -27,7 +27,7 @@ We chose Logseq 0.10.15 as the base because:
 - **Stable**: Last major stable release before the database version
 - **File-based only**: No SQLite/DB-based graph code to maintain
 - **Clean codebase**: Simpler architecture without dual file/DB code paths
-- **Our focus**: The JVM sidecar is specifically for file-based graphs
+- **Performance focus**: Optimizing for file-based graphs specifically
 
 ---
 
@@ -166,7 +166,7 @@ bb lint:large-vars          # Check for overly complex functions
 
 ## Performance Testing
 
-Performance benchmarks measure baseline metrics before sidecar implementation.
+Performance benchmarks measure baseline metrics for the current implementation. These baselines are useful for evaluating future optimization efforts.
 
 ### Running Benchmarks
 
@@ -186,8 +186,10 @@ yarn cljs:run-test -n frontend.sidecar.baseline-benchmark-test/query-simple-benc
 
 ### Benchmark Results Location
 
-- **Results document**: `docs/tests/performance_before_sidecar.md`
+- **Results document**: `docs/tests/performance_before_sidecar.md` (baseline metrics)
 - **Test implementation**: `src/test/frontend/sidecar/baseline_benchmark_test.cljs`
+
+> Note: The "sidecar" naming in paths is historical from when these tests were created to measure performance before a planned sidecar implementation. The tests remain useful as general baselines.
 
 ### Current Baseline (2025-12-09)
 
@@ -322,9 +324,15 @@ Use `(shadow.user/worker-repl)` or check http://localhost:9630/runtimes for runt
 
 ---
 
-## JVM Sidecar Performance Project
+## Shelved: JVM Sidecar Experiment
 
-The core differentiator of Logsidian is a JVM sidecar approach to dramatically improve performance for large file-based graphs.
+> **Status**: Shelved (January 2026)
+> **Reason**: Complexity exceeded practical benefits; IPC overhead and state synchronization challenges made the approach impractical.
+
+This section documents a previous experiment to use a JVM sidecar for performance improvements. The approach was abandoned due to complexity.
+
+<details>
+<summary>Original JVM Sidecar Design (for historical reference)</summary>
 
 ### The Problem
 
@@ -333,7 +341,7 @@ Large Logseq graphs (10k+ blocks) suffer from:
 - High memory usage (GBs for large graphs)
 - UI lag during operations
 
-### The Solution: JVM Sidecar with Lazy Loading
+### The Proposed Solution: JVM Sidecar with Lazy Loading
 
 **Architecture:**
 ```
@@ -370,33 +378,38 @@ Large Logseq graphs (10k+ blocks) suffer from:
 3. **Named Pipes (Windows)**: Fast IPC with sub-millisecond latency
 4. **Soft References**: JVM garbage collector automatically evicts unused data
 
-### Why JVM?
+### Why It Was Abandoned
 
-- **DataScript IStorage is JVM-only**: The lazy loading protocol only exists in JVM DataScript
-- **Soft References**: JVM GC can automatically manage memory pressure
-- **Clojure compatibility**: Same language as ClojureScript, easy code sharing
-- **Proven technology**: DataScript on JVM is battle-tested
+- IPC overhead negated lazy loading benefits
+- State synchronization between JVM and ClojureScript became complex
+- Startup time for JVM process added latency
+- Maintenance burden of two runtimes was significant
 
-### Project Structure
+</details>
 
-```
-X:\source\repos\
-├── logsidian/                    # Main app (AGPL-3.0)
-│   └── (this repo)
-│
-├── logsidian-sidecar/            # JVM sidecar (MIT)
-│   └── (separate repo - original code)
-│
-└── logseqWinArm64/               # ARM64 fork reference
-    └── docs/hybrid-architecture-revised.md
-```
+---
 
-### Implementation Phases
+## Future Considerations: Tauri Migration
 
-1. **Phase 0: Validation** - Test JVM startup time, IPC latency
-2. **Phase 1: Read Path** - Lazy loading for queries
-3. **Phase 2: Write Path** - Transaction handling
-4. **Phase 3: Integration** - Full file-based graph support
+> **Status**: Researched, deferred
+> **Documentation**: `docs/architecture/tauri-migration-research.md`
+> **Primary Blocker**: Plugin system incompatibility
+
+Tauri (Rust-based Electron alternative) has been researched as a potential future direction:
+
+| Benefit | Impact |
+|---------|--------|
+| Bundle size | 150MB → ~15MB (90% reduction) |
+| Memory usage | 300MB → 50MB (80% reduction) |
+| Startup time | 1-2s → <0.5s |
+| rsapi integration | Direct Rust, no native module pain |
+
+**Why deferred:**
+- Current Logseq plugins would not work (different isolation model)
+- WebKit rendering differences on macOS/Linux
+- Significant migration effort (6-8 weeks minimum)
+
+See `docs/architecture/tauri-migration-research.md` for full analysis.
 
 ---
 
@@ -556,7 +569,7 @@ winget install --id Microsoft.OpenJDK.17
 ## Links
 
 - **Main Repo**: https://github.com/johanclawson/logsidian (private)
-- **Sidecar Repo**: https://github.com/johanclawson/logsidian-sidecar (private)
+- **Sidecar Repo**: https://github.com/johanclawson/logsidian-sidecar (archived, shelved)
 - **Domain**: https://logsidian.com (reserved)
 - **GitHub Org**: https://github.com/logsidian (reserved)
 
