@@ -94,3 +94,9 @@
   (or api-server-token
       ;; graph(s) check overrides env since it is more explicit
       (and js/process.env.LOGSEQ_API_SERVER_TOKEN (not graph) (not graphs))))
+
+(defn file-graph?
+  "Returns true if the given path is a file-based graph (has logseq/config.edn but no db.sqlite)"
+  [path]
+  (and (fs/existsSync (node-path/join path "logseq" "config.edn"))
+       (not (fs/existsSync (node-path/join path "db.sqlite")))))

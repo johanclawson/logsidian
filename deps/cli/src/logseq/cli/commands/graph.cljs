@@ -39,16 +39,27 @@
 
 (defn list-graphs
   []
-  (let [[db-graphs* file-graphs*] ((juxt filter remove) #(string/starts-with? % common-config/db-version-prefix)
-                                                        (cli-common-graph/get-db-based-graphs))
+  (let [[db-graphs* file-graphs-from-db*] ((juxt filter remove) #(string/starts-with? % common-config/db-version-prefix)
+                                                                 (cli-common-graph/get-db-based-graphs))
         db-graphs (->> db-graphs*
                        (map #(string/replace-first % common-config/db-version-prefix ""))
                        sort)
-        file-graphs (->> file-graphs*
-                         (map #(string/replace-first % common-config/file-version-prefix ""))
-                         (map node-path/basename)
+        ;; Get file graphs from transit cache (primary source)
+        file-graphs-from-cache (or (cli-common-graph/get-file-graphs) [])
+        ;; Also include any from the DB graphs dir (legacy)
+        file-graphs-from-db (->> file-graphs-from-db*
+                                  (map #(string/replace-first % common-config/file-version-prefix ""))
+                                  (filter #(and (fs/existsSync %)
+                                                (cli-util/file-graph? %))))
+        ;; Combine and deduplicate file graphs
+        file-graphs (->> (concat file-graphs-from-cache file-graphs-from-db)
+                         distinct
                          sort)]
     (println "DB Graphs:")
-    (println (string/join "\n" db-graphs))
+    (if (seq db-graphs)
+      (println (string/join "\n" db-graphs))
+      (println "  (none)"))
     (println "\nFile Graphs:")
-    (println (string/join "\n" file-graphs))))
+    (if (seq file-graphs)
+      (println (string/join "\n" file-graphs))
+      (println "  (none)"))))

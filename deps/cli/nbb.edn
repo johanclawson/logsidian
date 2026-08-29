@@ -2,5 +2,7 @@
  :deps
  {logseq/outliner
   {:local/root "../outliner"}
+  logseq/graph-parser
+  {:local/root "../graph-parser"}
   io.github.nextjournal/nbb-test-runner
   {:git/sha "b379325cfa5a3306180649da5de3bf5166414e71"}}}

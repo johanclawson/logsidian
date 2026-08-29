@@ -11,6 +11,7 @@
             [logseq.db.common.sqlite-cli :as sqlite-cli]
             [logseq.db.frontend.property :as db-property]
             [logseq.db.frontend.rules :as rules]
+            [logseq.graph-parser.cli :as gp-cli]
             [promesa.core :as p]))
 
 (defn- api-query
@@ -70,35 +71,49 @@
     ;; Remove nesting for most queries which just have one :find binding
     (if (= 1 (count (first res))) (mapv first res) res)))
 
+(defn- open-graph
+  "Opens a graph and returns the connection. Supports both file-based and DB graphs."
+  [graph]
+  (let [path (cli-util/get-graph-path graph)]
+    (if (cli-util/file-graph? path)
+      ;; File graph - parse markdown files into DataScript
+      (:conn (gp-cli/parse-graph path {:verbose false}))
+      ;; DB graph - open SQLite database
+      (apply sqlite-cli/open-db! (cli-util/->open-db-args graph)))))
+
 (defn- local-query
   [{{:keys [args graphs properties-readable title-query]} :opts}]
   (when-not graphs
     (cli-util/error "Command missing required option 'graphs'"))
   (doseq [graph graphs]
-    (if (fs/existsSync (cli-util/get-graph-path graph))
-      (let [conn (apply sqlite-cli/open-db! (cli-util/->open-db-args graph))
-            _ (cli-util/ensure-db-graph-for-command @conn)
-            query* (when (string? (first args)) (common-util/safe-read-string {:log-error? false} (first args)))
-            results (cond
-                      ;; Run datalog query if detected
-                      (and (vector? query*) (= :find (first query*)))
-                      (local-datalog-query @conn query*)
-                      ;; Runs predefined title query. Predefined queries could better off in a separate command
-                      ;; since they could be more powerful and have different args than query command
-                      title-query
-                      (let [query '[:find (pull ?b [*])
-                                    :in $ % ?search-term
-                                    :where (block-content ?b ?search-term)]
-                            res (d/q query @conn (rules/extract-rules rules/db-query-dsl-rules)
-                                     (string/join " " args))]
-                        ;; Remove nesting for most queries which just have one :find binding
-                        (if (= 1 (count (first res))) (mapv first res) res))
-                      :else
-                      (local-entities-query @conn properties-readable args))]
-        (when (> (count graphs) 1)
-          (println "Results for graph" (pr-str graph)))
-        (pprint/pprint results))
-      (cli-util/error "Graph" (pr-str graph) "does not exist"))))
+    (let [path (cli-util/get-graph-path graph)]
+      (if (fs/existsSync path)
+        (let [is-file-graph (cli-util/file-graph? path)
+              conn (open-graph graph)
+              ;; Only enforce DB graph check for DB graphs
+              _ (when-not is-file-graph
+                  (cli-util/ensure-db-graph-for-command @conn))
+              query* (when (string? (first args)) (common-util/safe-read-string {:log-error? false} (first args)))
+              results (cond
+                        ;; Run datalog query if detected
+                        (and (vector? query*) (= :find (first query*)))
+                        (local-datalog-query @conn query*)
+                        ;; Runs predefined title query. Predefined queries could better off in a separate command
+                        ;; since they could be more powerful and have different args than query command
+                        title-query
+                        (let [query '[:find (pull ?b [*])
+                                      :in $ % ?search-term
+                                      :where (block-content ?b ?search-term)]
+                              res (d/q query @conn (rules/extract-rules rules/db-query-dsl-rules)
+                                       (string/join " " args))]
+                          ;; Remove nesting for most queries which just have one :find binding
+                          (if (= 1 (count (first res))) (mapv first res) res))
+                        :else
+                        (local-entities-query @conn properties-readable args))]
+          (when (> (count graphs) 1)
+            (println "Results for graph" (pr-str graph)))
+          (pprint/pprint results))
+        (cli-util/error "Graph" (pr-str graph) "does not exist")))))
 
 (defn query
   [{{:keys [args api-server-token] :as opts} :opts :as m}]
