@@ -73,3 +73,8 @@ clj-e2e/resources
 clj-e2e/e2e-dump
 .dir-locals.el
 .projectile
+
+# Local machine-specific config (not shared)
+.claude/settings.local.json
+.mcp.json
+deps/cli/package-lock.json
