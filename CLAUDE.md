@@ -17,17 +17,23 @@ Logsidian is a high-performance fork of Logseq focused on file-based graphs with
 |------|-------|
 | **Name** | Logsidian |
 | **Tagline** | "Obsidian's speed with Logseq's blocks, files stay yours" |
-| **Base** | Logseq 0.10.15 (stable, file-based only) |
+| **Base** | Upstream Logseq DB-era snapshot (0.11.0, 2025-12-01); file-based graphs only |
 | **License** | AGPL-3.0 |
 | **Status** | Early Development |
 
-### Why 0.10.15?
+### About the base
 
-We chose Logseq 0.10.15 as the base because:
-- **Stable**: Last major stable release before the database version
-- **File-based only**: No SQLite/DB-based graph code to maintain
-- **Clean codebase**: Simpler architecture without dual file/DB code paths
+The initial commit is labelled "Logseq 0.10.15 base", but its code is an
+upstream DB-era snapshot (0.11.0, 2025-12-01). Logsidian uses its file-graph
+path only:
+- **File graphs stored through SQLite**: the db worker keeps every graph as
+  DataScript over SQLite (OPFS) via IStorage, restored lazily; markdown files
+  remain the source of truth
+- **No DB-graph features shipped**: DB graphs, RTC and the DB-only mobile app
+  are upstream code Logsidian does not ship
 - **Performance focus**: Optimizing for file-based graphs specifically
+
+Architecture decisions: `docs/decisions/` (ADR-003 is the current direction).
 
 ---
 
