@@ -25,16 +25,26 @@
 
 ;; all IPC paths must be normalized! (via common-util/path-normalize)
 
+(defn- missing-id-blocks
+  "The blocks of the current repo's db referred to by ref-ids whose id:: property
+   is missing from their file."
+  [ref-ids]
+  (->> ref-ids
+       (distinct)
+       (keep model/get-block-by-uuid)
+       (filter (fn [block]
+                 (not= (str (:id (:block/properties block)))
+                       (str (:block/uuid block)))))))
+
 (defn- set-missing-block-ids!
-  "For every referred block in the content, fix their block ids in files if missing."
+  "For every referred block in the content, fix their block ids in files if missing.
+   The fix saves the block from its db content, which the worker then writes to
+   the block's file whatever is on disk (fs.node/write-file-impl! only adds a
+   backup). So it must not run while that file's disk content may not be in the
+   db yet: the reopen reconcile defers it (<run-deferred-id-repairs!)."
   [content]
   (when (string? content)
-    (let [missing-blocks (->> (block-ref/get-all-block-ref-ids content)
-                              (distinct)
-                              (keep model/get-block-by-uuid)
-                              (filter (fn [block]
-                                        (not= (str (:id (:block/properties block)))
-                                              (str (:block/uuid block))))))]
+    (let [missing-blocks (missing-id-blocks (block-ref/get-all-block-ref-ids content))]
       (when (seq missing-blocks)
         (file-property-handler/batch-set-block-property-aux!
          (mapv
@@ -44,8 +54,12 @@
 (defn- handle-add-and-change!
   "Resolves to true once the new content was handed to alter-file. Returns nil
    when the path is hidden or the content is unchanged. The reopen reconcile
-   counts the true results as changed files."
-  [repo path content db-content ctime mtime backup?]
+   counts the true results as changed files.
+   on-id-repair, when given, receives the content instead of
+   set-missing-block-ids! running on it: the reopen reconcile collects the
+   repairs and runs them after its last file. Live watcher events pass nil and
+   repair at once, as before."
+  [repo path content db-content ctime mtime backup? on-id-repair]
   (let [config (state/get-config repo)
         path-hidden-patterns (:hidden config)]
     (when-not (or (and (seq path-hidden-patterns)
@@ -63,7 +77,9 @@
                                                             :fs/event :fs/local-file-change
                                                             :ctime ctime
                                                             :mtime mtime})
-              _ (set-missing-block-ids! content)]
+              _ (if on-id-repair
+                  (on-id-repair content)
+                  (set-missing-block-ids! content))]
         true))))
 
 (defn- <handle-changed
@@ -73,8 +89,8 @@
    handle-add-and-change!). load-graph-files! awaits it, so its concurrency cap
    also bounds the pulls and reparses; handle-changed! leaves them detached.
    on-pull-ms, when given, is called with the round trip of the worker pull, so
-   the reconcile can log it."
-  [type {:keys [dir path content stat global-dir] :as payload} & {:keys [on-pull-ms]}]
+   the reconcile can log it. on-id-repair is passed to handle-add-and-change!."
+  [type {:keys [dir path content stat global-dir] :as payload} & {:keys [on-pull-ms on-id-repair]}]
   (let [repo (state/get-current-repo)]
     (when dir
       (let [;; Global directory events don't know their originating repo so we rely
@@ -105,12 +121,12 @@
                 (and (= "add" type)
                      (not= (string/trim content) (string/trim db-content)))
                 (let [backup? (not (string/blank? db-content))]
-                  (handle-add-and-change! repo path content db-content ctime mtime backup?))
+                  (handle-add-and-change! repo path content db-content ctime mtime backup? on-id-repair))
 
                 (and (= "change" type)
                      (= dir repo-dir)
                      (not (common-config/local-relative-asset? path)))
-                (handle-add-and-change! repo path content db-content ctime mtime (not global-dir)) ;; no backup for global dir
+                (handle-add-and-change! repo path content db-content ctime mtime (not global-dir) on-id-repair) ;; no backup for global dir
 
                 (and (= "unlink" type)
                      exists-in-db?)
@@ -156,8 +172,9 @@
    started all of them at once and so queued one pull per graph file in the
    worker. ADR-003 step 1 caps it to test whether that queue causes the reopen
    stalls (H2). No bound on the stall is predicted: the LSPERF line measures it.
-   A slot is held until the file's worker calls settle (pull, reset-file, the
-   set-missing-block-ids! transact). Worker calls have no timeout
+   A slot is held until the file's worker calls settle (pull, reset-file). The
+   missing-id repairs run after the last file (<run-deferred-id-repairs!).
+   Worker calls have no timeout
    (state/<invoke-db-worker*), so a call that never settles keeps its slot; if
    all of them hang, the reconcile, its LSPERF line and the \"Loading changes
    from disk...\" notice never finish. The former p/all left those calls
@@ -173,6 +190,110 @@
   ;; Id of the latest load-graph-files! run. An older run takes no new items.
   (atom 0))
 
+(defonce ^:private *deferred-id-repairs
+  ;; graph -> #{ref-id string}: block refs in files the reopen reconcile changed,
+  ;; whose missing-id repair waits for the end of a run
+  ;; (<run-deferred-id-repairs!). Repairs a run may not do yet stay here for the
+  ;; next run of that graph. In memory only, like the former immediate repair.
+  (atom {}))
+
+(defn plan-id-repairs
+  "Which missing-id repairs deferred by a finished, still current reconcile run
+   may be saved now (:run), and which wait for the next run of the graph
+   (:defer). A repair is {:ref-id .. :path ..}, :path being the file of the
+   block's page, or nil when the db does not know it.
+   - A repair whose file failed in this run (stat, read, pull or page delete)
+     waits: the db may lack that file's disk content, which the save would
+     overwrite.
+   - A repair without a known file runs only when the run was clean (no failed
+     and no skipped item), since it cannot be tied to one file.
+   The caller still checks each :run file against the db before saving
+   (<paths-matching-db), which also catches a failed reparse: alter-file
+   swallows those."
+  [repairs {:keys [failed-paths clean?]}]
+  (let [ready? (fn [{:keys [path]}]
+                 (if path
+                   (not (contains? failed-paths path))
+                   (boolean clean?)))]
+    {:run (filterv ready? repairs)
+     :defer (filterv (complement ready?) repairs)}))
+
+(defn- <paths-matching-db
+  "The set of paths whose disk content equals the worker db's content, trimmed
+   as fs.node compares them. A block of such a file can be saved without
+   dropping text that is only on disk. A path whose read or pull fails is left
+   out."
+  [graph repo-dir paths]
+  (p/let [results (async-util/<map-bounded
+                   reconcile-concurrency
+                   (fn [path]
+                     (-> (p/let [disk-content (fs/read-file repo-dir path)
+                                 db-content (db-async/<get-file graph path)]
+                           (when (and (string? disk-content)
+                                      (string? db-content)
+                                      (= (string/trim disk-content) (string/trim db-content)))
+                             path))
+                         (p/catch (fn [e]
+                                    (js/console.error "Reconcile: checking" path "before an id repair failed:" e)
+                                    nil))))
+                   paths)]
+    (set (filter string? results))))
+
+(defn- <run-deferred-id-repairs!
+  "Runs the missing-id repairs deferred by a reconcile run of graph, once every
+   file of the run has settled. Resolves to the number of blocks repaired.
+
+   Why deferred: a repair saves the referred block from its db content and the
+   worker writes that to the block's file whatever is on disk (fs.node only
+   adds a .bak). Under the reconcile's concurrency cap that file may not be read
+   yet, e.g. a journal (sorted first) refers to a block of a page that was
+   edited offline: the repair replaced the page's offline edits on disk and the
+   reconcile then read the replacement. Regression scenario for an integration
+   test: page P's block B has a uuid in the db but no id:: in P's file; with the
+   app closed, edit P and add ((B's uuid)) to journal J; reopen; P on disk must
+   keep the edit and gain B's id::.
+
+   Nothing runs when the run was stopped, since the current repo may be another
+   graph. Otherwise plan-id-repairs picks the repairs, and each file they write
+   must still match the db (<paths-matching-db). The rest wait for the next run
+   of graph."
+  [graph repo-dir current-run? {:keys [failed-paths clean?]}]
+  (if-not (and (seq (get @*deferred-id-repairs graph)) (current-run?))
+    (p/resolved 0)
+    ;; p/do: a throw in the bindings is caught below too, so it cannot skip the
+    ;; reconcile's completion notice
+    (-> (p/do
+         (let [[old _] (swap-vals! *deferred-id-repairs dissoc graph)
+               defer! (fn [repairs]
+                        (when (seq repairs)
+                          (swap! *deferred-id-repairs update graph (fnil into #{}) (map :ref-id repairs))))
+               {:keys [run defer]} (plan-id-repairs
+                                    (map (fn [block]
+                                           {:ref-id (str (:block/uuid block))
+                                            :path (some-> block :block/page :block/file :file/path)})
+                                         (missing-id-blocks (get old graph)))
+                                    {:failed-paths failed-paths :clean? clean?})]
+           (defer! defer)
+           (p/let [matching (<paths-matching-db graph repo-dir (distinct (keep :path run)))
+                   safe? #(or (nil? (:path %)) (contains? matching (:path %)))
+                   ready (filterv safe? run)]
+             (defer! (remove safe? run))
+             (cond
+               (empty? ready)
+               0
+
+               (not (current-run?))
+               (do (defer! ready) 0)
+
+               :else
+               (p/do!
+                (file-property-handler/batch-set-block-property-aux!
+                 (mapv (fn [{:keys [ref-id]}] [(uuid ref-id) :id ref-id]) ready))
+                (count ready))))))
+        (p/catch (fn [e]
+                   (js/console.error "Reconcile: repairing missing block ids failed:" e)
+                   0)))))
+
 (defn- log-reconcile-perf!
   "ADR-003 instrumentation: one LSPERF line per reopen reconcile.
    - max-queue-ms is the longest wait from the start of the file phase (after
@@ -186,10 +307,11 @@
    - max-file-ms is the slowest file, from its stat to its reparse settling.
    - changed counts files handed to alter-file, and deleted the vanished files.
      errors and delete-errors count only failures that reach the reconcile: the
-     stat and read IPC calls, the pull, set-missing-block-ids! and synchronous
-     throws of the page delete. alter-file and page-handler/<delete! catch their
-     own errors (console, :capture-error) and resolve, so a failed reparse still
-     counts as changed and a failed page delete is not counted.
+     stat and read IPC calls, the pull and synchronous throws of the page
+     delete. alter-file and page-handler/<delete! catch their own errors
+     (console, :capture-error) and resolve, so a failed reparse still counts as
+     changed and a failed page delete is not counted. The deferred missing-id
+     repairs run after this line is logged and are not counted in it.
    - skipped and delete-skipped count items not started because the run was
      stopped (see load-graph-files!). run tells overlapping runs apart."
   [{:keys [run files deleted t0 files-t0 changed errors delete-errors skipped delete-skipped
@@ -227,7 +349,15 @@
    current repo's db rather than graph's (file-model/get-file-page,
    set-missing-block-ids!, page-handler/<delete!), so after a graph switch they
    would change the other graph. Nothing is lost by stopping: every :graph/ready
-   runs a full reconcile again. Items already in flight finish."
+   runs a full reconcile again. Items already in flight finish.
+
+   The missing-id repairs of changed files (set-missing-block-ids!) are
+   collected during the run and run after its last file, see
+   <run-deferred-id-repairs!. A stopped run leaves them for the next run.
+
+   At the end a stopped run reports nothing, as the next run will. A run with
+   failed files or page deletes shows a warning, with or without the large
+   change set notice. Otherwise the success notice follows that notice."
   [graph]
   (when graph
     (let [repo-dir (config/get-repo-dir graph)
@@ -244,7 +374,15 @@
                        (vswap! *perf #(-> %
                                           (update :pulls inc)
                                           (update :pull-ms-sum + ms)
-                                          (update :pull-ms-max max ms))))]
+                                          (update :pull-ms-max max ms))))
+          ;; files whose stat, read, pull or page delete failed in this run
+          *failed-paths (volatile! #{})
+          ;; collects the block refs of changed files for <run-deferred-id-repairs!
+          on-id-repair (fn [content]
+                         (when (string? content)
+                           (when-let [ref-ids (seq (block-ref/get-all-block-ref-ids content))]
+                             (swap! *deferred-id-repairs update graph
+                                    (fnil into #{}) (map str ref-ids)))))]
       ;; read all files in the repo dir, notify if readdir error
       (p/let [;; all paths, md/org included, or deleted-files would miss them
               db-files (db-async/<get-file-paths graph)
@@ -295,6 +433,7 @@
                        (page-handler/<delete! page-name #())))
                     (p/catch (fn [e]
                                (vswap! *perf update :delete-errors inc)
+                               (vswap! *failed-paths conj path)
                                (js/console.error "Reconcile: deleting the page of" path "failed:" e))))))
             deleted-files))
          (-> (p/delay 500) ;; workaround for notification ui not showing
@@ -320,11 +459,13 @@
                                                                           :path file-rpath
                                                                           :content content
                                                                           :stat stat}
-                                                                         :on-pull-ms on-pull-ms)]
+                                                                         :on-pull-ms on-pull-ms
+                                                                         :on-id-repair on-id-repair)]
                                          (when (true? changed?)
                                            (vswap! *perf update :changed inc)))
                                        (p/catch (fn [e]
                                                   (vswap! *perf update :errors inc)
+                                                  (vswap! *failed-paths conj file-rpath)
                                                   (js/console.error "Reconcile: loading" file-rpath "failed:" e)))
                                        (p/then (fn [_]
                                                  (vswap! *perf update :max-file-ms max
@@ -335,16 +476,40 @@
                                                 :files (count files)
                                                 :deleted (count deleted-files)
                                                 :t0 t0
-                                                :files-t0 files-t0))))))
+                                                :files-t0 files-t0))
+                    ;; every file of the run has settled: the deferred id repairs
+                    ;; can no longer overwrite disk content the db lacks
+                    (let [{:keys [errors delete-errors skipped delete-skipped]} @*perf]
+                      (p/let [repaired (<run-deferred-id-repairs!
+                                        graph repo-dir current-run?
+                                        {:failed-paths @*failed-paths
+                                         :clean? (zero? (+ errors delete-errors skipped delete-skipped))})]
+                        (when (pos? repaired)
+                          (js/console.log "Reconcile: added the missing id:: of" repaired "referred blocks"))))))))
              (p/then (fn []
-                       (when notification-uid
-                         (prn ::init-notify)
-                         (notification/clear! notification-uid)
-                         ;; a stopped run did not load every file
-                         (let [{:keys [skipped delete-skipped]} @*perf]
-                           (when (zero? (+ skipped delete-skipped))
-                             (state/pub-event! [:notification/show {:content (str "The graph " graph " is loaded.")
-                                                                    :status :success
-                                                                    :clear? true}]))))))
+                       (let [{:keys [errors delete-errors skipped delete-skipped]} @*perf
+                             failed (+ errors delete-errors)]
+                         (when notification-uid
+                           (prn ::init-notify)
+                           (notification/clear! notification-uid))
+                         (cond
+                           ;; a stopped run did not load every file; the next run reports
+                           (pos? (+ skipped delete-skipped))
+                           nil
+
+                           ;; the per-file catch keeps a failed file from stopping the
+                           ;; others, so failures must be reported here
+                           (pos? failed)
+                           (state/pub-event! [:notification/show
+                                              {:content (str "The graph " graph " is not fully loaded: "
+                                                             failed " file(s) could not be loaded from disk. "
+                                                             "See the developer console for details.")
+                                               :status :warning
+                                               :clear? false}])
+
+                           notification-uid
+                           (state/pub-event! [:notification/show {:content (str "The graph " graph " is loaded.")
+                                                                  :status :success
+                                                                  :clear? true}])))))
              (p/catch (fn [error]
                         (js/console.dir error)))))))))
