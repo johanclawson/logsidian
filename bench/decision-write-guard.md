@@ -51,3 +51,56 @@ Adopted as the plan of record.
    - CRLF file and BOM file edited in-app: written, no refusal.
    - Adversarial write after compare: documents the TOCTOU, expected to fail, marked as such.
 6. **Ship guard + reconcile** after 5 passes and after one week of step-1 soak with zero unexplained bak files. Then the H2 cap experiment on the 10k bench, then Codex commits 2–3 only if the soak or harness shows the renderer base going stale.
+
+
+---
+
+# Follow-up decision: guard findings 1, 3, 5 (Fable arbiter, 2026-09-12)
+
+# Decision: guard follow-ups 1, 3, 5 (2026-09-12)
+
+Arbiter memo after Codex's review of perf/write-guard (0d99e12). Findings 2, 4, 6, 7, 8 and the inverted `file-writes-finished?` predicate are being fixed. This memo decides 1, 3 and 5. Paths: `F/ = src/main/frontend/`, `E/ = src/electron/electron/`.
+
+## Verified facts the decision rests on
+
+- `db/set-file-content!` (F/db.cljs:66) goes through `outliner-op/transact!` to the worker; the renderer's `:file/content` advances only when the worker syncs back. Two `:write-files` messages handled back to back both read base A.
+- `write-files!` (F/worker/file.cljs:183) dedupes by `[repo page-id outliner-op]`. Type, then Enter, inside one 1 s flush = `:save-block` + `:insert-blocks` = two messages with identical content C. The second reaches Electron with expected A while disk is C: **self-refusal on ordinary typing**, a "not saved" warning and a conflict copy every time. With a renderer stall > 1 s spanning two flushes the second message carries newer ops and the refusal's reparse resets the page to the first write, dropping those ops from the DB (into bak). The harness never triggers this: `typeInto` only produces `:save-block`.
+- Worker→renderer messages (`post-message`, Comlink replies) share `js/self.postMessage`, so a proposal serialized before a reset always arrives before that reset's reply.
+- Editor autosave commits 450 ms after the last keystroke; flush cadence 1 s; refusal recovery window (copy IPC + event + stat + read + worker reset) ~100–300 ms.
+- Upstream's Electron catch side backs up the *proposed* content on a write error; the guarded branch dropped that.
+
+## Finding 1: speculative base — implement now, gates the guard
+
+Regression: yes, and frequent (every type+Enter second), not the exotic ordering Codex led with. The stale-overwrite-of-E ordering is real but needs a proposal serialized pre-reset and handled post-reset, which the shared channel prevents unless `alter-files` itself re-advances `:file/content` (it does today).
+
+Smallest change, three parts, no per-path queue, no envelope module:
+
+1. **Coalesce per page in the worker.** In `write-files!` replace `distinct-by #(take 3 %)` with: group by `[repo page-id]`, keep the *last* tuple (its op decides `blocks-just-deleted?`, which is correct for every op sequence), `dissoc-request!` the others. Extract a pure `coalesce-page-writes [pages] -> {:keep [...] :drop-ids #{...}}` for the test.
+2. **Stamp the base at serialization.** In `save-tree-aux!`: `base = (:file/content (d/entity db file-db-id))`; post `{:request-id .. :page-id .. :repo .. :files [[path content]] :base base}`; then `(ldb/transact! conn [{:file/path path :file/content content}] {:skip-refresh? true})` so the next serialization (same flush, later flush, or after a stall) sees this proposal as its base. A reset from disk overwrites it with E, so a proposal serialized before the reset carries a pre-E base and refuses; one serialized after carries E and writes.
+3. **Use the stamp in the renderer.** `handle :write-files` passes `:base`; `alter-files` takes `{:base base}` and, when the key is present, uses `base` as `:old-content` (nil → `{:absent true}` as now) and calls with `update-db? false` — the worker already advanced `:file/content`, and re-advancing it here is what would let a refused stale proposal cause a second reparse. `alter-file` (config, CSS, direct edits) keeps `original-content`; two config writes inside one worker round trip can still self-refuse — human-paced, accepted.
+
+Tests (node build): coalesce keeps the last tuple and drops the other ids; `save-tree-aux!` posts `:base` equal to the pre-call `:file/content` and leaves `:file/content` = proposal (with-redefs `post-message`, datascript conn); `alter-files` with `:base` sends it as `:old-content` and does not transact; without `:base` unchanged. Add an `LSGUARD {path,result,copy}` console line in `write-file-impl!` for every guarded outcome; the harness captures it like LSPERF.
+
+## Finding 3: edits committed during recovery — implement, does not gate
+
+Regression: no. Upstream's watcher resets the page from disk on any external change to the page being typed and loses in-flight ops the same way; the guard only moves that reset earlier (the refusal) and loses ≤ 450 ms of committed keystrokes instead of the whole external edit. Likelihood: needs a refusal on the page being typed *and* an autosave inside the ~200 ms window — a fragment lost perhaps weekly under Jarvis-appends-while-typing, with a warning that names a copy lacking the last words.
+
+Smallest change: make the copy honest. `:thread-api/reset-file` gets opt `:snapshot-before? true`: before parsing, serialize the page bound to the file with the same code `save-tree-aux!` uses (`otree/blocks->vec-tree` + `common-file/tree->file-content`, context from `worker-state/get-context`) and return `{:tx .. :snapshot s}`. `<reparse-from-disk!` passes the opt; if `s` differs from the refused proposal, `backupConflictFile` it too and name both copies in the notice. Atomic with the reset inside the worker, so no window remains. Test: page with block X, reset with content lacking X → snapshot contains X, DB does not. Editor textarea text follows upstream (accepted earlier).
+
+## Finding 5: failed copy / io-error terminal — part now, part accepted
+
+Regression: one part, yes: a guarded `io-error` no longer preserves the proposal anywhere (upstream's catch-side backup did). No retry and no quit barrier are upstream behaviour (`file-writes-finished?` only gates graph switch). Likelihood: low on Linux (no Windows-side locks reach it); ENOSPC or an unwritable `logseq/bak` are the cases.
+
+Implement now (gates, trivial): on `"io-error"` in `write-file-impl!`, `backupConflictFile` the proposal, name it in the error notice, no reparse (disk untouched after the finding-6 temp+rename fix; DB keeps the proposal; the next edit of the page rewrites the whole file, which is the natural retry). Implement with it (~15 lines, not gating): `page-file-saved` carries `:outcome` (`:written` `:refused` `:failed`); the worker keeps `:failed` and copy-failed requests in `*failed-writes`, and `file-writes-finished?` (after the predicate fix) reports them so graph switch warns. Accepted residual: quit with a failed write whose conflict copy also failed loses it, as upstream; revisit if any `LSGUARD io-error` line appears in a soak log.
+
+## Shipping gates for the guard
+
+Finding 1 (all three parts), 5's io-error copy, plus the contained fixes underway. Findings 3 and 5's failed-write tracking ship in the same series if ready; they do not hold the guard. The perf batch is unaffected.
+
+## lssafety.js additions
+
+- Capture `LSGUARD` records; every scenario asserts zero `mismatch`/`exists`/`io-error` records unless it stages a conflict.
+- 7 `two-ops-one-flush` (fail): type into block one, Enter, type into the new block, Escape, all fast; both tokens on disk once, no LSGUARD refusal, no new bak file, no "not saved" notification.
+- 8 `typing-through-external-rewrite` (finding 1 stale ordering + finding 3): type continuously with Enter presses for 3 s while the page is rewritten externally mid-way. Fail: external tokens on disk at the end (never overwritten by a stale proposal). Warn, becoming fail once the snapshot lands: every typed token is in the final file or in some conflict copy.
+- Promote `external_survived` in scenario 3's same-page cases from `policy` to `fail`; `typed_survived` stays `policy`.
+- Optional 9 `bak-unwritable`: `chmod 000 logseq/bak`, stage a same-page refusal; expect an error notification and the typed text still in the UI (no reparse).
