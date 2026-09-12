@@ -256,7 +256,12 @@
         conn2 (d/restore-conn s)
         _ (is (= (eav-set @conn1) (eav-set @conn2)))
         hits0 (:hits (node-cache/-stats cache))
-        _ (d/transact! conn2 (for [i (range 1 2001 7)] [:db/add i :name (str "v2-" i)]))
+        ;; Rewrite only two entities at opposite ends: most leaves stay as
+        ;; conn2's walk cached them, so conn3 must hit the cache for those,
+        ;; while the rewritten leaves (same addresses) must come back new.
+        ;; (Changing every 7th entity touched every leaf, so a miss-only
+        ;; restore was correct and the hit assertion could not hold.)
+        _ (d/transact! conn2 [[:db/add 8 :name "v2-8"] [:db/add 1990 :name "v2-1990"]])
         _ (d/store @conn2)
         conn3 (d/restore-conn s)]
     (is (= (eav-set @conn2) (eav-set @conn3)))
