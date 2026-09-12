@@ -98,7 +98,7 @@
         errors (binding [db-malli-schema/*db-for-validate-fns* db]
                  (-> (map (fn [e]
                             (dissoc e :db/id))
-                          ent-maps) (get-schema-explainer true) :errors))]
+                          ent-maps) ((get-schema-explainer true)) :errors))]
     (cond-> {:datom-count (count datoms)
              :entities ent-maps*}
       (some? errors)
