@@ -450,6 +450,7 @@ function profStop(why) {
         // LSBENCH_TYPE_BURSTS: more saves give store/search distributions
         // (two saves cannot tell a checkpoint landing in one from a change)
         const nBursts = Number(process.env.LSBENCH_TYPE_BURSTS) || 2;
+        let orig; // the block's text as found, put back after the bursts
         for (let burst = 0; burst < nBursts; burst++) {
           await target().scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
           await target().click({ timeout: 5000 }).catch(() => {});
@@ -460,6 +461,7 @@ function profStop(why) {
             result.typing.bursts.push({ editing: false });
             continue;
           }
+          if (orig === undefined) orig = await page.evaluate(() => document.activeElement.value).catch(() => null);
           await page.keyboard.press('End');
           const start = wall();
           for (let i = 0; i < n; i++) {
@@ -477,6 +479,38 @@ function profStop(why) {
             ui_max_ms: Math.max(0, ...win.filter((r) => r.event === 'ui').map(lag)),
             ui_longtasks: win.filter((r) => r.event === 'ui').length,
             slow_syncs: win.filter((r) => r.event === 'search' && r.step === 'slow-sync').map((r) => `${r.ms}ms/${r.rows}rows/${r.deletes}del`) });
+        }
+        // Put the block back as found (LSBENCH_TYPE_RESTORE=0 keeps the typing).
+        // Every run types into the same block of a reused graph copy; without
+        // this the block grew by 350 characters per run and each later build
+        // was measured on a longer textarea (2026-09-12: the apparent typing
+        // regression between RC2, RC3 and (b) was this).
+        result.typing.origLen = orig == null ? null : orig.length;
+        if (orig != null && process.env.LSBENCH_TYPE_RESTORE !== '0') {
+          await target().scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+          await target().click({ timeout: 5000 }).catch(() => {});
+          await sleep(800);
+          if (!(await editing())) { await target().click({ timeout: 5000 }).catch(() => {}); await sleep(800); }
+          const cur = (await editing()) ? await page.evaluate(() => document.activeElement.value).catch(() => null) : null;
+          if (cur == null) result.typing.restored = 'not-editing';
+          else if (cur === orig) result.typing.restored = true;
+          else {
+            // the bursts made one contiguous insertion: find it between the
+            // common prefix and suffix, select it and delete it with one key
+            let p = 0; while (p < orig.length && p < cur.length && orig[p] === cur[p]) p++;
+            let s = 0; while (s < orig.length - p && s < cur.length - p && orig[orig.length - 1 - s] === cur[cur.length - 1 - s]) s++;
+            const ins = cur.slice(p, cur.length - s);
+            if (orig.length !== p + s || !/^[x ]+$/.test(ins)) result.typing.restored = 'not-a-pure-insertion';
+            else {
+              await page.evaluate(([a, b]) => document.activeElement.setSelectionRange(a, b), [p, cur.length - s]);
+              await page.keyboard.press('Backspace');
+              await sleep(1500);
+              const now = await page.evaluate(() => document.activeElement.value).catch(() => null);
+              result.typing.restored = now === orig;
+            }
+          }
+          await page.keyboard.press('Escape');
+          await sleep(3500);
         }
         await page.screenshot({ path: path.join(outDir, 'typing.png') });
       } catch (e) {
