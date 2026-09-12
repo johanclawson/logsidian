@@ -468,6 +468,87 @@ eagerly. Making it a literal at macro time should remove about 1.9 s
 schemas are the next candidates (about 0.9 s). The fixes are in progress on
 branch `perf/boot-lazy`.
 
+### Step 4: search write path and maintenance tick (build deaf065, 2026-09-12)
+
+Runs in `~/.cache/lsbench/step4/`, compared against `fts/` with
+`bench/compare-runs.js`. The build has search step 4 (one statement per
+commit, checkpoints and FTS5 merges moved into a worker tick, main db
+`synchronous=NORMAL` for file graphs) plus boot fixes 1-3.
+
+**Full index walk at 10k (69 938 rows), triggered by a manual rebuild:**
+
+| | FTS build | step 4 |
+|---|---|---|
+| walk | 254 s | **153 s** |
+| slices | 5 836 | 3 686 |
+| p99 slice | 269 ms | **94 ms** |
+| slices > 100 ms | 266 | **34** |
+| worker busy | 265 s | 191 s |
+| longest slice | 757 ms | **5 416 ms** |
+
+**The two multi-second commits are a regression.** Two slices took 5 416 ms
+and 3 340 ms, almost all of it commit time. The maint lines right after them
+show 3 746 and 3 228 WAL frames; every other line in the walk shows 560–740.
+
+The merge step size never left 1 during the walk. The halving rule (halve
+after any step over 10 ms) never lets it grow in wasm, where one step takes
+16–150 ms even at N=1. Merging therefore fell behind, and FTS5 crisis-merged
+inside slice commits: level 0 reached 15 segments, with 263 drops.
+
+The likely sequence: a crisis merge that cascades writes thousands of pages
+in one commit, the WAL passes the 2 000-frame fallback within that commit,
+and SQLite checkpoints inline, in the same commit. The fix is under review
+(Fable; Codex hit its usage limit until ~15:28). Candidates: automerge back
+on; a time budget per tick instead of the halving rule; or automerge on only
+while a walk runs.
+
+**Typing and reopen.** Worker time per `save-block`, as total/store/search ms:
+
+| run | FTS build | step 4 |
+|---|---|---|
+| g-10k, trusted index | 185/8/48, 60/10/24 | 155/13/29, 145/48/20 |
+| g-real | (baseline run migrated the index) | 120/4/30, 301/242/7 |
+
+**Inconclusive.** With two saves per run, a main-db checkpoint landing in a
+save cannot be told apart from a real change. The main db still checkpoints
+inline, which likely explains the store outliers of 48 and 242 ms. The
+harness now takes `LSBENCH_TYPE_BURSTS`, and the next comparison uses 10
+saves.
+
+The 10k search took 1 885 ms to hit, against 1 745 ms before. The worst
+worker stall is unchanged at 8.8 s (get-initial-data).
+
+**Boot (boot fixes 1-3, same `--debug` build type, `boot/s4`).** Longest
+boot task per launch:
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| before (`boot/debug`) | 6 164 | 4 808 | 5 879 | 5 617 ms |
+| boot fixes 1-3 (`boot/s4`) | 3 058 | 2 910 | 2 831 | **2 933 ms** |
+
+That is about 2.7 s off every start (−48 %). Under profiling the boot task
+went from 7 676 ms to 4 036 ms (`bootprof/master` → `bootprof/s4`).
+
+The new profile has no instaparse, malli-closing or tongue work left. What
+remains in the 4.0 s profiled task:
+
+| inside the boot task | ms |
+|---|---|
+| main.js top level | 2 640 |
+| – shadow js requires (npm modules) | 1 100 |
+| tabler-icons-react bundle | 450 |
+| excalidraw | 190 |
+| GC | 145 |
+
+The next candidates are:
+
+- **The icon bundle.** It could load on idle, falling back to the existing
+  webfont; medium risk.
+- **Top-level npm requires** that are not needed at boot.
+- **The two boot follow-ups** that are verified but not yet in this build:
+  linear shortcut registration and a Map LRU for the block AST cache (about
+  0.5 s profiled together).
+
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
 `slow-slice` split of the 258 slices over 100 ms: median 167 ms = **index 7 ms
