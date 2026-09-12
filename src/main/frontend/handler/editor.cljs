@@ -262,8 +262,13 @@
     (db-editor-handler/wrap-parse-block block)
     (file-editor-handler/wrap-parse-block block)))
 
+(defonce ^:private *last-sent-edit
+  ;; [block-uuid text] of the last typed text sent to the worker, see gone-block-edit
+  (atom nil))
+
 (defn- save-block-inner!
   [block value opts]
+  (reset! *last-sent-edit [(:block/uuid block) value])
   (let [block {:db/id (:db/id block)
                :block/uuid (:block/uuid block)
                :block/title value}
@@ -278,6 +283,61 @@
      ;; gone by the time the save runs (a from-disk re-parse replaced it), the
      ;; text is kept instead of dropped (logseq.outliner.core/save-missing-block)
      (outliner-save-block! block' {:user-edit? true}))))
+
+(defn ^:api gone-block-edit
+  "The save map that keeps `value`, the editor's text for `edit-block`, when the
+   UI db no longer has the block; else nil. File graphs only.
+   A from-disk re-parse retracts a page's blocks and gives those without an
+   id:: property new uuids. When its tx reaches the UI before the typed text
+   was saved, the editor's block is gone, and save-current-block! used to drop
+   the text without a word.
+   nil unless the text differs from what the editor last sent for the block
+   (`last-sent`, [uuid text]) or, when nothing was sent for it, from the
+   block's text when editing started: unchanged text has nothing to keep, and
+   a block that the user deleted after its text was saved is not brought back."
+  [repo edit-block value last-sent]
+  (let [block-uuid (:block/uuid edit-block)]
+    (when (and block-uuid
+               (not (config/db-based-graph? repo))
+               (string? value)
+               (not (string/blank? value))
+               (nil? (db/entity repo [:block/uuid block-uuid])))
+      (let [format (get edit-block :block/format :markdown)
+            baseline (if (= block-uuid (first last-sent))
+                       (second last-sent)
+                       (some->> (:block/title edit-block)
+                                (property-file/remove-built-in-properties-when-file-based repo format)
+                                (drawer/remove-logbook)))
+            page-id (:db/id (:block/page edit-block))]
+        (when (not= (string/trim (or baseline "")) (string/trim value))
+          (cond-> {:block/uuid block-uuid
+                   :block/title (string/trim value)
+                   :block/format format}
+            page-id (assoc :block/page {:db/id page-id})))))))
+
+(defn- save-gone-block-edit!
+  "Sends `m` (see gone-block-edit) to the worker as a user edit: the worker
+   keeps the text as a new block with the same uuid at the end of the page, or
+   shows a notice that names it (logseq.outliner.core/save-missing-block)."
+  [m]
+  (let [block-uuid (:block/uuid m)
+        block' (cond-> (assoc (wrap-parse-block m) :block/uuid block-uuid)
+                 (:block/page m) (assoc :block/page (:block/page m)))]
+    (js/console.warn "save: the edited block is gone from the db (its file was re-read from disk?), sending its text to be kept"
+                     (str block-uuid))
+    (reset! *last-sent-edit [block-uuid (:block/title m)])
+    (ui-outliner-tx/transact!
+     {:outliner-op :save-block}
+     (outliner-save-block! block' {:user-edit? true}))))
+
+(defn- save-gone-edit-block!
+  "Saves `value` (else the editor's content) of the block being edited when that
+   block is gone from the db, per gone-block-edit. A no-op otherwise."
+  [repo value]
+  (let [edit-block (state/get-edit-block)
+        value (or value (state/get-edit-content))]
+    (when-let [m (gone-block-edit repo edit-block value @*last-sent-edit)]
+      (save-gone-block-edit! m))))
 
 ;; id: block dom id, "ls-block-counter-uuid"
 (defn- another-block-with-same-id-exists?
@@ -1458,7 +1518,11 @@
   ([repo block-or-uuid content {:keys [properties] :as opts}]
    (let [block (if (or (uuid? block-or-uuid)
                        (string? block-or-uuid))
-                 (db-model/query-block-by-uuid block-or-uuid) block-or-uuid)]
+                 (or (db-model/query-block-by-uuid block-or-uuid)
+                     ;; gone from the db: the arity below keeps the text when
+                     ;; it is the edited block's
+                     {:block/uuid (if (string? block-or-uuid) (parse-uuid block-or-uuid) block-or-uuid)})
+                 block-or-uuid)]
      (save-block!
       {:block block :repo repo :opts (dissoc opts :properties)}
       (if (seq properties)
@@ -1466,8 +1530,11 @@
         content))))
   ([{:keys [block repo opts] :as _state} value]
    (let [repo (or repo (state/get-current-repo))]
-     (when (db/entity repo [:block/uuid (:block/uuid block)])
-       (save-block-aux! block value opts)))))
+     (if (db/entity repo [:block/uuid (:block/uuid block)])
+       (save-block-aux! block value opts)
+       (when (and (:block/uuid block)
+                  (= (:block/uuid block) (:block/uuid (state/get-edit-block))))
+         (save-gone-edit-block! repo value))))))
 
 (defn save-blocks!
   [blocks]
@@ -1504,20 +1571,24 @@
                value (if (= (:block/uuid current-block) (:block/uuid block))
                        (:block/title current-block)
                        (and elem (gobj/get elem "value")))]
-           (when value
-             (cond
-               force?
-               (save-block-aux! db-block value opts)
+           (if (and (:block/uuid block) (nil? db-block))
+             ;; the edited block is gone from the db (a from-disk re-parse
+             ;; replaced it): keep the typed text instead of dropping it
+             (save-gone-edit-block! (state/get-current-repo) value)
+             (when value
+               (cond
+                 force?
+                 (save-block-aux! db-block value opts)
 
-               (and skip-properties?
-                    (db-model/top-block? block)
-                    (when elem (thingatpt/properties-at-point elem)))
-               nil
+                 (and skip-properties?
+                      (db-model/top-block? block)
+                      (when elem (thingatpt/properties-at-point elem)))
+                 nil
 
-               (and block value db-content-without-heading
-                    (not= (string/trim db-content-without-heading)
-                          (string/trim value)))
-               (save-block-aux! db-block value opts))))
+                 (and block value db-content-without-heading
+                      (not= (string/trim db-content-without-heading)
+                            (string/trim value)))
+                 (save-block-aux! db-block value opts)))))
          (catch :default error
            (js/console.error error)
            (log/error :save-block-failed error)))))))
@@ -2201,10 +2272,13 @@
                                                                                   :keep-uuid? keep-uuid?}))))]
     (if ops-only?
       (transact-blocks!)
-      (p/let [_ (when has-unsaved-edits
+      (p/let [_ (if has-unsaved-edits
                   (ui-outliner-tx/transact!
                    {:outliner-op :save-block}
-                   (outliner-save-block! editing-block)))
+                   (outliner-save-block! editing-block {:user-edit? true}))
+                  (when-not editing-block
+                    ;; the edited block is gone from the db: keep its typed text
+                    (save-gone-edit-block! (state/get-current-repo) nil)))
               result (transact-blocks!)]
         (state/set-block-op-type! nil)
         (when result

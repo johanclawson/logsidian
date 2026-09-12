@@ -265,3 +265,86 @@
 
       (editor/save-block! repo block-uuid "# bar")
       (is (= "# bar" (:block/title (model/query-block-by-uuid block-uuid)))))))
+
+;;; The edited block is gone from the UI db (a from-disk re-parse replaced it)
+;;; before its typed text was saved. save-current-block! used to find no entity
+;;; and drop the text without calling the worker.
+
+(defn- pull-block-by-title
+  [title]
+  (ffirst (d/q '[:find (pull ?b [*]) :in $ ?title :where [?b :block/title ?title]]
+               @(db/get-db test-helper/test-db false) title)))
+
+(defn- reparse-block!
+  "What a from-disk re-parse does to a block without an id:: property:
+   retracts it and creates it anew with a new uuid."
+  [block]
+  (let [conn (db/get-db test-helper/test-db false)]
+    (d/transact! conn [[:db.fn/retractEntity (:db/id block)]])
+    (d/transact! conn [(-> block (dissoc :db/id) (assoc :block/uuid (random-uuid)))])))
+
+(deftest gone-block-edit-test
+  (load-test-files [{:file/path "pages/gone-edit.md"
+                     :file/content "- block one\n- block two"}])
+  (let [repo test-helper/test-db
+        block (pull-block-by-title "block one")
+        block-uuid (:block/uuid block)
+        page-id (:db/id (:block/page block))
+        edit-block (select-keys block [:block/uuid :block/title :block/format :block/page])]
+    (testing "the block exists: the normal save path, not this one"
+      (is (nil? (editor/gone-block-edit repo edit-block "block one typed" nil))))
+    (reparse-block! block)
+    (testing "typed text of a gone block is saved with its uuid and page"
+      (is (= {:block/uuid block-uuid
+              :block/title "block one typed"
+              :block/format :markdown
+              :block/page {:db/id page-id}}
+             (editor/gone-block-edit repo edit-block " block one typed " nil))))
+    (testing "text that was not changed has nothing to keep"
+      (is (nil? (editor/gone-block-edit repo edit-block "block one" nil)))
+      (is (nil? (editor/gone-block-edit repo edit-block "  " nil)))
+      (is (nil? (editor/gone-block-edit repo nil "block one typed" nil)) "not editing"))
+    (testing "text that was already sent for the block is not sent again"
+      (is (nil? (editor/gone-block-edit repo edit-block "block one typed" [block-uuid "block one typed"])))
+      (is (some? (editor/gone-block-edit repo edit-block "block one typed more" [block-uuid "block one typed"])))
+      (is (some? (editor/gone-block-edit repo edit-block "block one typed" [(random-uuid) "block one typed"]))
+          "what was sent for another block does not count"))))
+
+(deftest save-current-block-of-gone-block-test
+  (load-test-files [{:file/path "pages/gone-save.md"
+                     :file/content "- block one\n- block two"}])
+  (let [repo test-helper/test-db
+        block (pull-block-by-title "block one")
+        block-uuid (:block/uuid block)
+        page-id (:db/id (:block/page block))]
+    (try
+      ;; what set-editing! stores: the entity, which keeps its db value
+      (state/set-state! :editor/block (db/entity [:block/uuid block-uuid]))
+
+      (testing "an existing block saves as before"
+        (editor/save-current-block! {:current-block {:block/uuid block-uuid
+                                                     :block/title "block one edited"}})
+        (is (= "block one edited" (:block/title (db/entity [:block/uuid block-uuid])))))
+
+      (reparse-block! (pull-block-by-title "block one edited"))
+
+      (testing "gone, and the editor's text is what was saved: nothing to keep"
+        (state/set-state! :editor/content "block one edited" :path-in-sub-atom block-uuid)
+        (editor/save-current-block!)
+        (is (nil? (db/entity [:block/uuid block-uuid]))))
+
+      (testing "gone before the typed text was saved (textarea unmounted): the text is kept"
+        (state/set-state! :editor/content "block one edited, typed" :path-in-sub-atom block-uuid)
+        (editor/save-current-block!)
+        (let [kept (db/entity [:block/uuid block-uuid])]
+          (is (= "block one edited, typed" (:block/title kept)))
+          (is (= page-id (:db/id (:block/page kept))))
+          (is (some? (pull-block-by-title "block one edited")) "the re-parsed block stays")
+          (is (some? (pull-block-by-title "block two")))))
+
+      (testing "save-block! by the uuid of the gone edited block keeps the text too"
+        (reparse-block! (pull-block-by-title "block one edited, typed"))
+        (editor/save-block! repo block-uuid "typed in code mode")
+        (is (= "typed in code mode" (:block/title (db/entity [:block/uuid block-uuid])))))
+      (finally
+        (state/clear-edit!)))))
