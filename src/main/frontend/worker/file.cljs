@@ -39,6 +39,13 @@
       (when (seq old-page-request-ids)
         (swap! *writes (fn [x] (apply dissoc x old-page-request-ids)))))))
 
+(defn remove-writes-of-deleted-pages
+  "writes (request id -> page db id) without the requests whose page is no
+   longer in db. A deleted page is never saved, so nothing would acknowledge
+   its requests. Requests of pages that exist stay: their writes are pending."
+  [writes db]
+  (into {} (filter (fn [[_ page-id]] (d/entity db page-id))) writes))
+
 (defonce file-writes-chan
   (let [coercer (m/coercer [:catn
                             [:repo :string]

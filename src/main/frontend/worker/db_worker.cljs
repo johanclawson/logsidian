@@ -934,19 +934,16 @@
 
 (def-thread-api :thread-api/file-writes-finished?
   [repo]
-  (let [conn (worker-state/get-datascript-conn repo)
-        writes @file/*writes]
-    ;; Clean pages that have been deleted
+  (let [conn (worker-state/get-datascript-conn repo)]
+    ;; Clean pages that have been deleted, then answer from what remains
     (when conn
-      (swap! file/*writes (fn [writes]
-                            (->> writes
-                                 (remove (fn [[_ pid]] (d/entity @conn pid)))
-                                 (into {})))))
-    (if (empty? writes)
-      true
-      (do
-        (prn "Unfinished file writes:" @file/*writes)
-        false))))
+      (swap! file/*writes file/remove-writes-of-deleted-pages @conn))
+    (let [writes @file/*writes]
+      (if (empty? writes)
+        true
+        (do
+          (prn "Unfinished file writes:" writes)
+          false)))))
 
 (def-thread-api :thread-api/page-file-saved
   [request-id _page-id]
