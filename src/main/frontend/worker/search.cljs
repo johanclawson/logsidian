@@ -452,6 +452,47 @@ DROP TRIGGER IF EXISTS blocks_au;
   (.exec db #js {:sql "INSERT INTO search_meta (k, v) VALUES ('wal_restart', $v) ON CONFLICT (k) DO UPDATE SET v = excluded.v"
                  :bind #js {:$v (str (js/Date.now))}}))
 
+(defn- varint
+  "SQLite varint at i of bytes (7 bits a byte, big-endian, the 9th byte all
+  8): [value next-i]. Multiplies instead of shifting, so values above 2^31
+  stay right."
+  [^js bytes i]
+  (loop [n 0 v 0]
+    (let [b (aget bytes (+ i n))]
+      (cond
+        (= n 8) [(+ (* v 256) b) (+ i 9)]
+        (< b 128) [(+ (* v 128) b) (+ i n 1)]
+        :else (recur (inc n) (+ (* v 128) (bit-and b 127)))))))
+
+(defn structure-level0-segments
+  "Segments on level 0 of an FTS5 structure record (fts5StructureDecode, as
+  bench/sqlprobe-step4.py decodes it): a 4-byte cookie, an optional 4-byte V2
+  marker, varints nLevel, nSegment and nWriteCounter, then per level nMerge
+  and its segment count. 0 for a record without levels."
+  [^js bytes]
+  (let [v2? (and (>= (.-length bytes) 8)
+                 (= 0xff (aget bytes 4)) (= 0 (aget bytes 5))
+                 (= 0 (aget bytes 6)) (= 1 (aget bytes 7)))
+        [n-level i] (varint bytes (if v2? 8 4))
+        [_n-segment i] (varint bytes i)
+        [_write-counter i] (varint bytes i)]
+    (if (pos? n-level)
+      (let [[_n-merge i] (varint bytes i)]
+        (first (varint bytes i)))
+      0)))
+
+(defn level0-segments
+  "Level-0 segments of blocks_fts now, or nil when the structure record can't
+  be read. Commits add them (one per commit); only merges remove them. With
+  automerge=0 a level-0 count that went down between two ticks without a
+  merge step in between means a crisismerge ran inside a commit (or the
+  index was truncated). Never throws: it only feeds the maint line."
+  [^js db]
+  (try
+    (let [b (ffirst (query-rows db "SELECT block FROM blocks_fts_data WHERE id = 10"))]
+      (if (some? b) (structure-level0-segments b) 0))
+    (catch :default _e nil)))
+
 ;; repo -> #{block uuid string}: search db rows whose block DataScript does not
 ;; have (search-blocks found them). The maintenance tick deletes them.
 (defonce ^:private *orphan-ids (atom {}))

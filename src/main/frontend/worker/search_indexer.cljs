@@ -65,8 +65,15 @@
 (def maint-ckpt-gap-ms 200)
 ;; Writes quiet this long: the last checkpoint of a burst (or of one save).
 (def maint-quiet-ms 1000)
+;; However busy the worker stays, no write waits longer than about this for
+;; its checkpoint. Writes less often than one per tick (a save every 0.5-1 s
+;; while typing) never make a streak and never leave a quiet second; without
+;; this bound only the auto-checkpoint cap would take them, inside a commit.
+;; Above maint-quiet-ms, so one save while the user keeps the worker busy
+;; still waits for quiet first.
+(def maint-max-pending-ms 2000)
 ;; Pages of output per FTS5 merge step ('merge', N). FTS5 stops only at term
-;; boundaries, so a step can overshoot on long doclists.
+;; boundaries, so a step can overshoot on long doclists (see maint-action).
 (def maint-merge-pages 64)
 ;; Idle (no writes, no thread-api call): merge steps per tick until FTS5
 ;; reports no work or this budget is spent, then the next tick after
@@ -151,6 +158,14 @@
 
     ;; DataScript stored a tx the index never reflected: rows can be missing or
     ;; stale anywhere, so truncate (which also drops stale rows) and walk.
+    ;; An index ahead of the stored db is trusted. With the main db on
+    ;; synchronous=NORMAL a power loss can drop its last commits while the
+    ;; search db keeps them: rows of blocks the db lost become orphans
+    ;; (search/queue-orphans!), and a block that still exists keeps the title
+    ;; of a lost edit until it is edited again. Accepted (it takes a power loss
+    ;; or OS crash; clean reopens show the index 0 or 1 tx ahead, so no
+    ;; threshold tells the two apart). The trust path sets the watermark back
+    ;; to max-tx (on-open!), so later gaps still show.
     (and (some? stored-max-tx)
          (or (nil? indexed-tx) (> stored-max-tx indexed-tx)))
     {:action :walk :truncate? true :cursor 0 :reason "gap"}
@@ -632,30 +647,74 @@
   :quiet-ms      since the last tick that saw writes
   :since-ckpt-ms since the last checkpoint
   :pending?      writes not checkpointed yet (the tick's own included)
+  :pending-ms    since the first tick that saw them pending (0 if none)
   :merge?        FTS5 merge work may be left
   :busy?         a thread-api call arrived in the last busy-window-ms
   Returns {:ckpt? :merge}, :merge nil, :step (one step) or :run (steps until
   none is left or the idle budget is spent).
   - Checkpoint about every tick while writes keep happening (a streak of at
     least maint-ckpt-gap-ms), else once after maint-quiet-ms of quiet unless
-    the user is waiting on the worker; never two within maint-ckpt-gap-ms.
-    One save thus gets a single checkpoint a second later, not one at the
-    next tick.
+    the user is waiting on the worker, and in any case once writes have been
+    pending maint-max-pending-ms; never two within maint-ckpt-gap-ms. One
+    save thus gets a single checkpoint a second later, not one at the next
+    tick, and writes too sparse for a streak still get one every
+    maint-max-pending-ms or so.
   - Merge one step per tick while writes happen or the user waits, so a
-    first open (which never goes idle) merges too; run steps when idle."
-  [{:keys [wrote? streak-ms quiet-ms since-ckpt-ms pending? merge? busy?]}]
+    first open (which never goes idle) merges too; run steps when idle.
+  - A busy tick has no time bound. FTS5 ends a step only at a term boundary,
+    so a step can write well past maint-merge-pages on a long doclist, and
+    the same tick can also checkpoint. Accepted: smaller or skipped busy
+    steps leave the work to crisismerge, which merges a whole level inside a
+    commit. The maint line (busy-tick-max-ms, merge-max-step-ms and -changes,
+    l0-drops) shows what it costs, and the defs above are the knobs."
+  [{:keys [wrote? streak-ms quiet-ms since-ckpt-ms pending? pending-ms merge? busy?]}]
   {:ckpt? (boolean (and pending?
                         (>= since-ckpt-ms maint-ckpt-gap-ms)
-                        (if wrote?
-                          (>= streak-ms maint-ckpt-gap-ms)
-                          (and (>= quiet-ms maint-quiet-ms) (not busy?)))))
+                        (or (if wrote?
+                              (>= streak-ms maint-ckpt-gap-ms)
+                              (and (>= quiet-ms maint-quiet-ms) (not busy?)))
+                            (>= (or pending-ms 0) maint-max-pending-ms))))
    :merge (when merge? (if (or wrote? busy?) :step :run))})
+
+(defn maint-observe
+  "A tick's bookkeeping before it decides (pure; maint-tick! and the tests
+  run it). st: repo's maintenance state (*maint), t: now, tc: total_changes
+  now, orphans: rows the tick deleted before deciding. Returns [st' m], m
+  being maint-action's argument without :busy?."
+  [st t tc orphans]
+  (let [wrote? (not= tc (:tc st))
+        pending? (or (not= tc (:ckpt-tc st)) (pos? orphans))
+        st (cond-> (assoc st :pending-t (when pending? (or (:pending-t st) t)))
+             wrote? (assoc :write-t t :streak-t (or (:streak-t st) t))
+             (not wrote?) (assoc :streak-t nil)
+             (or wrote? (pos? orphans)) (assoc :merge? true))]
+    [st {:wrote? wrote?
+         :streak-ms (if wrote? (- t (:streak-t st)) 0)
+         :quiet-ms (- t (:write-t st))
+         :since-ckpt-ms (- t (:ckpt-t st))
+         :pending? pending?
+         :pending-ms (if pending? (- t (:pending-t st)) 0)
+         :merge? (:merge? st)}]))
+
+(defn maint-settle
+  "A tick's bookkeeping after its work (pure). tc: total_changes after the
+  tick's own writes, which never count as writes (the tick can't feed
+  itself) but stay pending until a checkpoint takes them. t: when the
+  checkpoint started if ckpt?, else the tick's time."
+  [st t ckpt? merge-left? tc]
+  (let [st (assoc st :merge? merge-left? :tc tc)]
+    (if ckpt?
+      (assoc st :ckpt-t t :ckpt-tc tc :pending-t nil)
+      (cond-> st
+        (and (not= tc (:ckpt-tc st)) (nil? (:pending-t st))) (assoc :pending-t t)))))
 
 ;; repo -> {:sdb db :timer id
 ;;          :tc n        ; total_changes at the end of the last tick
 ;;          :ckpt-tc n   ; total_changes right after the last checkpoint
 ;;          :ckpt-t t :write-t t :streak-t t|nil
-;;          :merge? b}
+;;          :pending-t t|nil ; first tick that saw writes not checkpointed
+;;          :merge? b
+;;          :l0 n|nil}   ; level-0 segments at the end of the last tick
 (defonce ^:private *maint (atom {}))
 
 ;; Counts merged into the next LSSEARCH maint line.
@@ -716,26 +775,34 @@
                                     (update :merge-steps (fnil inc 0))
                                     (update :merge-changes (fnil + 0) delta)
                                     (update :merge-ms (fnil + 0) ms)
-                                    (update :merge-max-step-ms (fnil max 0) ms))))
+                                    (update :merge-max-step-ms (fnil max 0) ms)
+                                    ;; about the pages the step wrote: its
+                                    ;; overshoot past maint-merge-pages
+                                    (update :merge-max-step-changes (fnil max 0) delta))))
            (if (and left? (= mode :run) (< (- (now) t0) maint-idle-merge-budget-ms))
              (recur)
              left?)))))))
 
 (defn- checkpoint!
-  "PASSIVE checkpoint, then the WAL restart write when it completed."
+  "PASSIVE checkpoint, then the WAL restart write when it completed. Timed
+  apart: ckpt-ms is the copy and its flush, restart-ms the restart write
+  (the new WAL header's flush and the journal_size_limit truncate)."
   [sdb]
   (let [t0 (now)
         [_busy log ckpt] (search/checkpoint! sdb)
+        t1 (now)
         complete? (and (number? log) (pos? log) (= log ckpt))
         _ (when complete? (search/restart-wal! sdb))
-        ms (- (now) t0)]
-    (note-maint! (fn [m] (-> m
-                             (update :ckpts (fnil inc 0))
-                             (update :ckpt-ms (fnil + 0) ms)
-                             (update :ckpt-max-ms (fnil max 0) ms)
-                             (update :wal-log-max (fnil max 0) (or log 0))
-                             (update :wal-ckpt (fnil + 0) (or ckpt 0))
-                             (update :restarts (fnil + 0) (if complete? 1 0)))))))
+        ms (- t1 t0)
+        restart-ms (- (now) t1)]
+    (note-maint! (fn [m] (cond-> (-> m
+                                     (update :ckpts (fnil inc 0))
+                                     (update :ckpt-ms (fnil + 0) ms)
+                                     (update :ckpt-max-ms (fnil max 0) ms)
+                                     (update :wal-log-max (fnil max 0) (or log 0))
+                                     (update :wal-ckpt (fnil + 0) (or ckpt 0))
+                                     (update :restarts (fnil + 0) (if complete? 1 0)))
+                           complete? (update :restart-ms (fnil + 0) restart-ms))))))
 
 (defn- maint-tick!
   "One tick; reschedules itself while sdb is still repo's search db. A
@@ -752,41 +819,46 @@
             next-ms
             (try
               (let [tc (search/total-changes sdb)
-                    wrote? (not= tc (:tc st))
                     busy (busy? t0)
                     orphans (delete-orphans! repo sdb)
-                    st (cond-> st
-                         wrote? (assoc :write-t t0 :streak-t (or (:streak-t st) t0))
-                         (not wrote?) (assoc :streak-t nil)
-                         (or wrote? (pos? orphans)) (assoc :merge? true))
-                    {:keys [ckpt?] merge-mode :merge}
-                    (maint-action {:wrote? wrote?
-                                   :streak-ms (if wrote? (- t0 (:streak-t st)) 0)
-                                   :quiet-ms (- t0 (:write-t st))
-                                   :since-ckpt-ms (- t0 (:ckpt-t st))
-                                   :pending? (or (not= tc (:ckpt-tc st)) (pos? orphans))
-                                   :merge? (:merge? st)
-                                   :busy? busy})
+                    [st' seen] (maint-observe st t0 tc orphans)
+                    {:keys [ckpt?] merge-mode :merge} (maint-action (assoc seen :busy? busy))
+                    ;; Level 0 before this tick's merge. Only writes add
+                    ;; segments, so it is read only after some.
+                    l0 (if (:wrote? seen) (search/level0-segments sdb) (:l0 st))
                     ;; merge first, so this tick's checkpoint also takes the
                     ;; merge's frames
-                    merge-left? (if merge-mode (merge! sdb merge-mode) (:merge? st))
-                    st (cond-> (assoc st :merge? merge-left?)
-                         ckpt? (assoc :ckpt-t (now)))
+                    merge-left? (if merge-mode (merge! sdb merge-mode) (:merge? st'))
+                    t-ckpt (now)
                     _ (when ckpt? (checkpoint! sdb))
-                    tc' (search/total-changes sdb)
+                    st' (maint-settle st' (if ckpt? t-ckpt t0) ckpt? merge-left?
+                                      (search/total-changes sdb))
+                    l0' (if merge-mode (search/level0-segments sdb) l0)
                     ms (- (now) t0)]
                 (when (pos? orphans)
                   (note-maint! (fn [m] (update m :orphans (fnil + 0) orphans))))
+                ;; Level 0 went down since the last tick with no merge step in
+                ;; between: a crisismerge ran inside a commit (or the index was
+                ;; truncated), the stall this tick is there to prevent.
+                (when (and (some? l0) (some? (:l0 st)) (< l0 (:l0 st)))
+                  (note-maint! (fn [m] (update m :l0-drops (fnil inc 0)))))
                 (when (or ckpt? merge-mode (pos? orphans))
-                  (note-maint! (fn [m] (-> m
-                                           (update :ticks (fnil inc 0))
-                                           (update :max-tick-ms (fnil max 0) ms)))))
+                  (note-maint! (fn [m] (cond-> (-> m
+                                                   (update :ticks (fnil inc 0))
+                                                   ;; busy: writes seen or a thread-api
+                                                   ;; call waiting (merge :step)
+                                                   (update (if (or (:wrote? seen) busy)
+                                                             :busy-tick-max-ms
+                                                             :idle-tick-max-ms)
+                                                           (fnil max 0) ms))
+                                         (some? l0) (update :l0-max (fnil max 0) l0)))))
                 (swap! *maint update repo
                        (fn [cur]
                          (when cur
-                           (merge cur (select-keys st [:write-t :streak-t :merge? :ckpt-t])
-                                  {:tc tc'}
-                                  (when ckpt? {:ckpt-tc tc'})))))
+                           (merge cur
+                                  (select-keys st' [:tc :ckpt-tc :ckpt-t :write-t :streak-t
+                                                    :pending-t :merge?])
+                                  {:l0 l0'}))))
                 (log-maint! (now))
                 (if (and merge-left? (= merge-mode :run))
                   maint-idle-yield-ms

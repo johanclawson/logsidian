@@ -163,12 +163,30 @@
       (is (string/includes? s "order by b.rowid is null, b.rowid, j.key")
           "existing rows by rowid first, then new rows in input order"))
     (testing "where true, then order by, then on conflict (the INSERT ... SELECT upsert parse rule)"
-      (is (< (at " where true ") (at " order by ") (at " on conflict (id) "))))
+      ;; index-of gives nil for a missing clause, and nil < n holds in JS
+      (let [clauses [(at " where true ") (at " order by ") (at " on conflict (id) ")]]
+        (is (every? some? clauses) "each clause is there")
+        (when (every? some? clauses)
+          (is (apply < clauses)))))
     (is (string/includes? s (str "on conflict (id) do update set title = excluded.title, page = excluded.page"
                                  " where blocks.title is not excluded.title"
                                  " or blocks.page is not excluded.page"))
         "an unchanged row is not updated, so no trigger fires")
     (is (not (string/includes? s "or replace")) "no delete + reinsert")))
+
+(deftest structure-level0-segments-test
+  (testing "a record sqlite 3.46.1 wrote (bench/sqlprobe-step4.py: 5 commits, one merge, 3 commits)"
+    (is (= 3 (search/structure-level0-segments
+              (js/Uint8Array. #js [0 0 0 3 2 4 0 0 3 1 1 1 2 1 1 3 1 1 0 1 6 1 3])))
+        "levels [3 1]: level 0 has 3 segments"))
+  (is (= 3 (search/structure-level0-segments
+            (js/Uint8Array. #js [0 0 0 7 2 4 0x82 0x2C 0 3 1 1 2 2 3 3 3 4 4 0 1 4 5 9])))
+      "a two-byte write counter (300) is skipped whole")
+  (is (= 2 (search/structure-level0-segments
+            (js/Uint8Array. #js [0 0 0 7 0xff 0 0 1 1 2 0 0 2 1 1 1 0 0 0 0 0 2 2 2 0 0 0 0 0])))
+      "a V2 record: the marker is skipped")
+  (is (= 0 (search/structure-level0-segments (js/Uint8Array. #js [0 0 0 1 0 0 0])))
+      "no levels yet"))
 
 (deftest delete-sql-test
   (is (= "delete from blocks where id in (select value from json_each($ids))"

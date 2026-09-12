@@ -366,10 +366,13 @@
       ;; tx (search-indexer/sync-tx!): skip the WAL fsync on each commit. WAL +
       ;; NORMAL survives a process kill; a power loss can drop the last search
       ;; commits, which the watermark check on open sees as a gap and heals.
-      ;; With the main db on NORMAL the search db can also be the one ahead:
-      ;; rows for blocks the main db lost. A re-parse does not replace them (a
+      ;; With the main db on NORMAL the search db can also be the one ahead,
+      ;; which the open trusts (search-indexer/open-action). Rows for blocks
+      ;; the main db lost are orphans: a re-parse does not replace them (a
       ;; file-graph block without id:: gets a new uuid), so search-blocks
-      ;; hides them and queues them for deletion (search/queue-orphans!).
+      ;; hides them and queues them for deletion (search/queue-orphans!). A
+      ;; block that still exists keeps the title of a lost edit in the index
+      ;; until it is edited again.
       (.exec search-db "PRAGMA synchronous=NORMAL")
       ;; Checkpoints leave the commit: search-indexer's maintenance tick runs
       ;; them (PASSIVE) between tasks. The auto-checkpoint stays on as a hard

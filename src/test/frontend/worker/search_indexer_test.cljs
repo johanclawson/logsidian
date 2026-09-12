@@ -277,15 +277,70 @@
     (testing "quiet: one checkpoint after a second without writes"
       (is (false? (:ckpt? (search-indexer/maint-action (assoc idle :pending? true :quiet-ms 750)))))
       (is (true? (:ckpt? (search-indexer/maint-action (assoc idle :pending? true :quiet-ms 1000)))))
-      (is (false? (:ckpt? (search-indexer/maint-action (assoc idle :pending? true :busy? true))))
+      (is (false? (:ckpt? (search-indexer/maint-action
+                           (assoc idle :pending? true :quiet-ms 1500 :pending-ms 1500 :busy? true))))
           "not while the user waits on the worker")
       (is (false? (:ckpt? (search-indexer/maint-action (assoc idle :quiet-ms 1000))))
           "nothing written since the last one"))
+    (testing "writes pending maint-max-pending-ms: a checkpoint however they come"
+      (is (true? (:ckpt? (search-indexer/maint-action
+                          (assoc idle :pending? true :quiet-ms 2000 :pending-ms 2000 :busy? true))))
+          "the user keeps the worker busy")
+      (is (true? (:ckpt? (search-indexer/maint-action (assoc writing :pending-ms 2000))))
+          "a write on this tick, but no streak")
+      (is (false? (:ckpt? (search-indexer/maint-action (assoc writing :pending-ms 2000 :since-ckpt-ms 100))))
+          "still never two within the gap"))
     (testing "merges: one step while busy or writing, a run when idle"
       (is (= :run (:merge (search-indexer/maint-action (assoc idle :merge? true)))))
       (is (= :step (:merge (search-indexer/maint-action (assoc idle :merge? true :busy? true)))))
       (is (= :step (:merge (search-indexer/maint-action (assoc writing :merge? true)))))
       (is (nil? (:merge (search-indexer/maint-action writing))) "no merge work left"))))
+
+(defn- simulate-maint
+  "Ticks every maint-tick-ms up to end-ms through maint-observe, maint-action
+  and maint-settle, as maint-tick! runs them, with a write at each of write-ts
+  (sorted ms). No merges, no orphans. Returns :ckpts, :max-wait (the longest
+  a write waited for its checkpoint) and the final :st."
+  [write-ts end-ms busy?]
+  (let [write-ts (vec write-ts)]
+    (loop [t search-indexer/maint-tick-ms
+           st {:tc 0 :ckpt-tc 0 :ckpt-t 0 :write-t 0 :streak-t nil :merge? false}
+           ckpts 0
+           max-wait 0]
+      (if (> t end-ms)
+        {:ckpts ckpts :max-wait max-wait :st st}
+        (let [tc (count (take-while #(<= % t) write-ts))
+              [st' seen] (search-indexer/maint-observe st t tc 0)
+              ckpt? (:ckpt? (search-indexer/maint-action (assoc seen :busy? busy?)))
+              ;; the oldest write this checkpoint takes
+              wait (if (and ckpt? (> tc (:ckpt-tc st))) (- t (nth write-ts (:ckpt-tc st))) 0)]
+          (recur (+ t search-indexer/maint-tick-ms)
+                 (search-indexer/maint-settle st' t ckpt? false tc)
+                 (cond-> ckpts ckpt? inc)
+                 (max max-wait wait)))))))
+
+(deftest maint-checkpoints-any-write-pattern-test
+  (let [tick search-indexer/maint-tick-ms
+        bound (+ search-indexer/maint-max-pending-ms (* 2 tick))
+        every (fn [p] (range 100 30000 p))]
+    (testing "writes on alternate ticks: never a streak, never a quiet second"
+      (doseq [p [550 600 700 800 900]]
+        (let [{:keys [ckpts max-wait st]} (simulate-maint (every p) 35000 false)]
+          (is (>= ckpts (dec (quot 30000 bound))) (str "a save every " p " ms"))
+          (is (<= max-wait bound) (str "a save every " p " ms"))
+          (is (= (count (every p)) (:ckpt-tc st)) "every write checkpointed in the end"))))
+    (testing "a thread-api call on every tick: the bound still holds"
+      (let [{:keys [max-wait st]} (simulate-maint (every 600) 35000 true)]
+        (is (<= max-wait bound))
+        (is (= (count (every 600)) (:ckpt-tc st)))))
+    (testing "a streak: about a checkpoint per tick"
+      (let [{:keys [ckpts max-wait]} (simulate-maint (every 100) 30000 false)]
+        (is (> ckpts (* 0.8 (/ 30000 tick))))
+        (is (<= max-wait (* 2 tick)))))
+    (testing "one save: a single checkpoint about a second later"
+      (let [{:keys [ckpts max-wait]} (simulate-maint [100] 5000 false)]
+        (is (= 1 ckpts))
+        (is (<= search-indexer/maint-quiet-ms max-wait (+ search-indexer/maint-quiet-ms tick)))))))
 
 (deftest maint-inert-without-sqlite-test
   (let [{:keys [db]} (fake-sdb)]
