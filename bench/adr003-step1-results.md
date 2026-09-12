@@ -583,10 +583,21 @@ build has the write guard yet.
   block's editor was being set up after Enter. The harness now checks the
   file against the editor's actual text, and reports lost keystrokes as a
   separate warning.
-- **The errors both builds logged** ("Unexpected webworker error",
-  "Promise error") come about 1 s after the harness closes the priming
-  launch. They are shutdown noise from worker calls still pending, and are
-  now counted separately.
+- **The errors both builds logged are real, not shutdown noise.** They are
+  "Unexpected webworker error", "Promise error" and ExceptionInfo records.
+  I first matched their times to a launch's close using two different
+  clocks, which was wrong. On one clock they fall well before any close.
+
+  They are a failed save: `thread-api/apply-outliner-ops` / `save-block`
+  throws "No protocol method INode.-save defined for type object". It
+  happens in two places:
+  - in idrepair-race, during the reopen reconcile (the missing-id repair's
+    own save);
+  - in live-external-edit, as a typed save right after a same-page re-read.
+
+  Master shows it too (idrepair-race), so it is an upstream bug, and it is
+  now under investigation. A save that fails can lose typing. The harness
+  now records `t0_ms` per launch and counts real post-close errors apart.
 
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
