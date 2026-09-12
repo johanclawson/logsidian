@@ -105,23 +105,25 @@
     (p/let [copy-path (-> (ipc/ipc "backupConflictFile" dir rpath content)
                           (p/catch (fn [error]
                                      (log/error :write-file/conflict-copy-failed {:path rpath :error error})
-                                     nil)))
-            copy-path (when (string? copy-path) copy-path)
+                                     nil)))]
+      ;; A plain let, not p/let: promesa coerces an Error value (the ex-info
+      ;; below) into a rejection, which skipped the notice and the result.
+      (let [copy-path (when (string? copy-path) copy-path)
             message (str "Write to the file " file-fpath " failed: " (gobj/get result "error")
                          (if copy-path
                            (str ". Your version was saved to " copy-path ".")
                            (str ", and saving your version to logseq/bak/conflicts/ failed too."
                                 " Copy your changes elsewhere before closing the app.")))
             error (ex-info message {:path file-fpath :result "io-error" :copy copy-path})]
-      (log-guard! rpath "io-error" copy-path)
-      (gobj/set result "copy" copy-path)
-      (state/pub-event! [:notification/show {:content message
-                                             :status :error
-                                             :clear? false}])
-      (if error-handler
-        (error-handler error)
-        (log/error :write-file-failed error))
-      result)))
+        (log-guard! rpath "io-error" copy-path)
+        (gobj/set result "copy" copy-path)
+        (state/pub-event! [:notification/show {:content message
+                                               :status :error
+                                               :clear? false}])
+        (if error-handler
+          (error-handler error)
+          (log/error :write-file-failed error))
+        result))))
 
 (defn- write-file-impl!
   "Writes content to rpath under dir through the writeFile IPC handler.
