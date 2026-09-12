@@ -231,6 +231,33 @@
     (fn [stat'] (not (nil? stat')))
     (fn [_e] false))))
 
+(defn enoent-error?
+  "Whether error, a failed stat from any fs backend, says that the path does
+   not exist. Node's message starts with the code (\"ENOENT: no such file or
+   directory, stat '...'\") and across the Electron IPC only the message is
+   sure to arrive, so both the code and the message are checked. Every other
+   failure (EACCES, EPERM, EIO, EBUSY, ...) is not absence."
+  [error]
+  (boolean
+   (when (some? error)
+     (or (= "ENOENT" (.-code ^js error))
+         (= "ENOENT" (:code (ex-data error)))
+         (re-find #"(^|: )ENOENT: " (str (or (ex-message error) error)))))))
+
+(defn <path-state
+  "Resolves to :present when path under dir exists, and to :missing when its
+   stat fails with ENOENT (enoent-error?) or returns nothing. Rejects with the
+   stat's error on any other failure. Unlike file-exists?, which takes every
+   failed stat for absence, a permission or I/O error never reads as a
+   deleted file."
+  [dir path]
+  (-> (stat dir path)
+      (p/then (fn [stat'] (if (nil? stat') :missing :present)))
+      (p/catch (fn [error]
+                 (if (enoent-error? error)
+                   :missing
+                   (p/rejected error))))))
+
 (defn asset-href-exists?
   "href is from `make-asset-url`, so it's most likely a full-path"
   [href]

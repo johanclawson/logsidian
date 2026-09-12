@@ -1,6 +1,67 @@
 (ns frontend.fs.watcher-handler-test
   (:require [cljs.test :refer [deftest is testing]]
-            [frontend.fs.watcher-handler :as watcher-handler]))
+            [frontend.config :as config]
+            [frontend.fs :as fs]
+            [frontend.fs.watcher-handler :as watcher-handler]
+            [frontend.handler.notification :as notification]
+            [frontend.handler.page :as page-handler]
+            [frontend.test.helper :as test-helper :include-macros true :refer [deftest-async]]
+            [promesa.core :as p]))
+
+(defn- probe-of
+  "A probe for <await-presence resolving to states in turn, and its call count."
+  [states]
+  (let [*calls (atom 0)
+        *states (atom states)]
+    [*calls (fn []
+              (swap! *calls inc)
+              (let [state (first @*states)]
+                (swap! *states rest)
+                (p/resolved state)))]))
+
+(deftest-async await-presence-test
+  (p/let [back (let [[calls probe] (probe-of [:missing :missing :present :missing])]
+                 (p/let [state (watcher-handler/<await-presence probe [0 0 0 0])]
+                   [state @calls]))
+          gone (let [[calls probe] (probe-of (repeat :missing))]
+                 (p/let [state (watcher-handler/<await-presence probe [0 0 0])]
+                   [state @calls]))
+          failed (-> (watcher-handler/<await-presence #(p/rejected (js/Error. "EACCES: permission denied")) [0 0])
+                     (p/then (constantly :resolved))
+                     (p/catch (constantly :rejected)))]
+    (is (= [:present 3] back) "a file back after two misses is present, probed no further")
+    (is (= [:missing 4] gone) "one probe, then one per wait")
+    (is (= :rejected failed) "a failure other than absence rejects")))
+
+(deftest-async reparse-from-disk-never-deletes-test
+  (let [originals [fs/<path-state page-handler/<delete! fs/unlink! notification/show! config/get-repo-dir]
+        restore! (fn [& _]
+                   (let [[path-state delete unlink show get-repo-dir] originals]
+                     (set! fs/<path-state path-state)
+                     (set! page-handler/<delete! delete)
+                     (set! fs/unlink! unlink)
+                     (set! notification/show! show)
+                     (set! config/get-repo-dir get-repo-dir)))
+        *probes (atom 0)
+        *deletions (atom [])
+        *notices (atom [])]
+    (set! config/get-repo-dir (constantly "/tmp/graph"))
+    (set! page-handler/<delete! (fn [& args] (swap! *deletions conj [:delete-page args]) (p/resolved nil)))
+    (set! fs/unlink! (fn [& args] (swap! *deletions conj [:unlink args]) (p/resolved nil)))
+    (set! notification/show! (fn [& args] (swap! *notices conj args) nil))
+    (-> (p/do!
+         (set! fs/<path-state (fn [_ _] (swap! *probes inc) (p/resolved :missing)))
+         (watcher-handler/<reparse-from-disk! "logseq_local_/tmp/graph" "pages/a.md" :waits-ms [0 0 0])
+         (is (= 4 @*probes) "looked for the file again after each wait")
+         (is (= [] @*deletions) "a file still missing deletes neither the page nor the path")
+         (is (= 1 (count @*notices)) "and says the db was kept")
+
+         (reset! *notices [])
+         (set! fs/<path-state (fn [_ _] (p/rejected (js/Error. "EACCES: permission denied, stat '/tmp/graph/pages/a.md'"))))
+         (watcher-handler/<reparse-from-disk! "logseq_local_/tmp/graph" "pages/a.md" :waits-ms [0])
+         (is (= [] @*deletions) "a stat error is not absence and deletes nothing")
+         (is (= 1 (count @*notices))))
+        (p/finally restore!))))
 
 (deftest plan-id-repairs-test
   (let [journal {:ref-id "a" :path "journals/2026_09_12.md"}

@@ -168,25 +168,59 @@
   ;; return nil, otherwise the entire db will be transferred by ipc
   nil)
 
+(def reparse-missing-waits-ms
+  "The waits, in ms, before each new look at a file that <reparse-from-disk!
+   found missing, about 2 s in all: a sync client, or an editor that saves by
+   delete and rename, can make a file vanish for a moment."
+  [250 250 500 500 500])
+
+(defn <await-presence
+  "Calls probe-f, which resolves to :present or :missing (fs/<path-state),
+   until it resolves to :present or waits-ms runs out, waiting the next
+   element of waits-ms before each further call. Resolves to the last state;
+   rejects when probe-f rejects (a failure other than absence)."
+  [probe-f waits-ms]
+  (p/let [state (probe-f)]
+    (if (or (= :present state) (empty? waits-ms))
+      state
+      (p/let [_ (p/delay (first waits-ms))]
+        (<await-presence probe-f (rest waits-ms))))))
+
 (defn <reparse-from-disk!
   "Makes the db of repo follow the disk for rpath after a guarded writeFile
    refused to replace it (fs.node): reparses the file's disk content like a
-   watcher change event, or handles its absence like an unlink. Unlike a
-   watcher change it backs up nothing, since fs.node already saved the refused
-   content as a conflict copy. Resolves once done; failures are logged."
-  [repo rpath]
-  (let [repo-dir (config/get-repo-dir repo)]
-    (-> (p/let [exists? (fs/file-exists? repo-dir rpath)]
-          (if exists?
+   watcher change event. Unlike a watcher change it backs up nothing, since
+   fs.node already saved the refused content as a conflict copy.
+   It never deletes anything, neither in the db nor on disk. A missing file
+   is looked for again for about 2 s (waits-ms, default
+   reparse-missing-waits-ms). If it stays missing, or its stat fails for
+   another reason than absence (fs/<path-state), the db keeps the page as it
+   is and a warning says so. The unlink path is never taken from here: its
+   page deletion ends in after-page-deleted!, which unlinks the path when it
+   exists again, e.g. restored by a sync client meanwhile. A file that is
+   really gone reaches that path through the watcher's own unlink event.
+   Resolves once done; failures are logged."
+  [repo rpath & {:keys [waits-ms] :or {waits-ms reparse-missing-waits-ms}}]
+  (let [repo-dir (config/get-repo-dir repo)
+        keep-db! (fn [reason]
+                   (log/warn :reparse-from-disk/db-kept {:path rpath :reason reason})
+                   (notification/show!
+                    (str "The app could not reload " rpath " from disk: " reason
+                         ". It keeps showing the page as it was and deleted nothing.")
+                    :warning
+                    false))]
+    (-> (p/let [presence (<await-presence #(fs/<path-state repo-dir rpath) waits-ms)]
+          (if (= :present presence)
             (p/let [stat (-> (fs/stat repo-dir rpath) (p/catch (constantly nil)))
                     content (fs/read-file repo-dir rpath)
                     db-content (db-async/<get-file repo rpath)]
               (when (string? content)
                 (handle-add-and-change! repo rpath content db-content
                                         (:ctime stat) (:mtime stat) false nil)))
-            (<handle-changed "unlink" {:dir repo-dir :path rpath})))
+            (keep-db! "the file is not on disk (deleted or moved?)")))
         (p/catch (fn [e]
-                   (js/console.error "Reparsing" rpath "from disk after a refused write failed:" e))))))
+                   (js/console.error "Reparsing" rpath "from disk after a refused write failed:" e)
+                   (keep-db! (str e)))))))
 
 (def ^:private reconcile-experiment-cap
   "File-phase cap of the ADR-003 H2 experiment: at most this many graph files
