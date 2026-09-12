@@ -113,20 +113,46 @@
      (and (search-handler/rebuild-indices!) true)
      (repo-handler/refresh-repos!))))
 
+(defonce ^:private *failed-writes-warned
+  ;; the failed page saves a graph switch last warned about
+  (atom nil))
+
 (defmethod handle :graph/switch [[_ graph opts]]
   (export/cancel-db-backup!)
   (persist-db/export-current-graph!)
   (state/set-state! :db/async-queries {})
   (st/refresh!)
 
-  (p/let [writes-finished? (state/<invoke-db-worker :thread-api/file-writes-finished? (state/get-current-repo))]
-    (if (not writes-finished?) ; TODO: test (:sync-graph/init? @state/state)
+  (p/let [repo (state/get-current-repo)
+          writes-finished? (state/<invoke-db-worker :thread-api/file-writes-finished? repo)
+          failed (when writes-finished?
+                   (state/<invoke-db-worker :thread-api/failed-file-writes repo))]
+    (cond
+      (not writes-finished?) ; TODO: test (:sync-graph/init? @state/state)
       (do
         (log/info :graph/switch {:file-writes-finished? writes-finished?})
         (notification/show!
          "Please wait seconds until all changes are saved for the current graph."
          :warning))
-      (graph-switch-on-persisted graph opts))))
+
+      ;; page saves that failed (frontend.handler.worker): warn once per
+      ;; set of pages, switch on the next attempt
+      (and (seq failed) (not= failed @*failed-writes-warned))
+      (do
+        (reset! *failed-writes-warned failed)
+        (log/warn :graph/switch {:failed-file-writes failed})
+        (notification/show!
+         (str "Changes to these pages could not be saved to disk: "
+              (apply str (interpose ", " (map :title failed)))
+              ". Their text is only in the app, and in logseq/bak/conflicts/ where a copy could be saved."
+              " Switch graphs again to leave them anyway.")
+         :error
+         false))
+
+      :else
+      (do
+        (reset! *failed-writes-warned nil)
+        (graph-switch-on-persisted graph opts)))))
 
 (defmethod handle :graph/open-new-window [[_ev target-repo]]
   (ui-handler/open-new-window-or-tab! target-repo))

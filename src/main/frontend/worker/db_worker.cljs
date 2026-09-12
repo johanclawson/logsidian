@@ -946,9 +946,17 @@
           false)))))
 
 (def-thread-api :thread-api/page-file-saved
-  [request-id _page-id]
+  [request-id page-id outcome repo]
+  ;; outcome: :written, :refused or :failed (frontend.handler.worker)
   (file/dissoc-request! request-id)
+  (when repo
+    (file/record-write-outcome! repo page-id outcome))
   nil)
+
+(def-thread-api :thread-api/failed-file-writes
+  [repo]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (file/failed-writes repo @conn)))
 
 (def-thread-api :thread-api/sync-app-state
   [new-state]

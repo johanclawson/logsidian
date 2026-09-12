@@ -44,6 +44,39 @@
   [writes db]
   (into {} (filter (fn [[_ page-id]] (d/entity db page-id))) writes))
 
+(defonce *failed-writes
+  ;; [repo page-id] -> :failed, see record-write-outcome!
+  (atom {}))
+
+(defn record-write-outcome!
+  "Tracks page saves that failed, for graph switching
+   (:thread-api/failed-file-writes). outcome is what the renderer reports in
+   :thread-api/page-file-saved:
+   - :failed: an io-error, or a refusal whose conflict copy failed, so the
+     page's content may be only in the db: the page is marked;
+   - :written: the page's content is on disk: the mark goes;
+   - :refused (content in a conflict copy, the page follows the disk) or
+     nil: the mark of an earlier failure stays, its content is not on disk."
+  [repo page-id outcome]
+  (case outcome
+    :failed (swap! *failed-writes assoc [repo page-id] :failed)
+    :written (swap! *failed-writes dissoc [repo page-id])
+    nil))
+
+(defn failed-writes
+  "The pages of repo marked by record-write-outcome!, as
+   [{:page-id .. :title ..}] sorted by page id, leaving out pages no longer
+   in db."
+  [repo db]
+  (->> (keys @*failed-writes)
+       (keep (fn [[r page-id]]
+               (when (= r repo)
+                 (when-let [page (d/entity db page-id)]
+                   {:page-id page-id
+                    :title (or (:block/title page) (:block/name page))}))))
+       (sort-by :page-id)
+       vec))
+
 (defonce file-writes-chan
   (let [coercer (m/coercer [:catn
                             [:repo :string]

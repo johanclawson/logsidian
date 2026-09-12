@@ -97,3 +97,31 @@
           [[_ data]] (save-page! conn 1)]
       (is (contains? data :base))
       (is (nil? (:base data))))))
+
+(deftest failed-writes-test
+  (reset! worker-file/*failed-writes {})
+  (let [conn (d/create-conn file-schema/schema)
+        {:keys [tempids]} (d/transact! conn [{:db/id "a" :block/uuid (random-uuid) :block/name "a" :block/title "A"}
+                                             {:db/id "b" :block/uuid (random-uuid) :block/name "b" :block/title "B"}])
+        a (get tempids "a")
+        b (get tempids "b")]
+    (try
+      (worker-file/record-write-outcome! "repo" a :failed)
+      (worker-file/record-write-outcome! "repo" b :failed)
+      (worker-file/record-write-outcome! "other" a :failed)
+      (testing "failed saves are reported per repo"
+        (is (= [{:page-id a :title "A"} {:page-id b :title "B"}]
+               (worker-file/failed-writes "repo" @conn))))
+      (testing "a refused save leaves the mark, a written one clears it"
+        (worker-file/record-write-outcome! "repo" a :refused)
+        (is (= 2 (count (worker-file/failed-writes "repo" @conn))))
+        (worker-file/record-write-outcome! "repo" a :written)
+        (is (= [{:page-id b :title "B"}] (worker-file/failed-writes "repo" @conn))))
+      (testing "an outcome from an older renderer (nil) changes nothing"
+        (worker-file/record-write-outcome! "repo" b nil)
+        (is (= 1 (count (worker-file/failed-writes "repo" @conn)))))
+      (testing "a deleted page is left out"
+        (d/transact! conn [[:db/retractEntity b]])
+        (is (= [] (worker-file/failed-writes "repo" @conn))))
+      (finally
+        (reset! worker-file/*failed-writes {})))))

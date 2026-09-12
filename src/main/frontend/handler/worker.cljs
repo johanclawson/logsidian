@@ -19,15 +19,16 @@
         ;; write's expected content; nil means a new file
         opts (if (contains? data :base) {:base (:base data)} {})]
     (->
-     (p/let [_ (file-handler/alter-files repo files opts)]
-       (state/<invoke-db-worker :thread-api/page-file-saved request-id page-id))
+     (p/let [results (file-handler/alter-files repo files opts)]
+       (state/<invoke-db-worker :thread-api/page-file-saved request-id page-id
+                                (file-handler/alter-files-outcome results) repo))
      (p/catch (fn [error]
                 (notification/show!
                  [:div
                   [:p "Write file failed, please copy the changes to other editors in case of losing data."]
                   "Error: " (str (.-stack error))]
                  :error)
-                (state/<invoke-db-worker :thread-api/page-file-saved request-id page-id))))))
+                (state/<invoke-db-worker :thread-api/page-file-saved request-id page-id :failed repo))))))
 
 (defmethod handle :notification [_ _worker data]
   (apply notification/show! data))

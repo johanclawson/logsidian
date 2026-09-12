@@ -99,3 +99,16 @@
          (is (= [["pages/a.md" "- C" "db content"]] @*writes) "without :base, as before: the db's content")
          (is (= ["- C"] @*db-contents) "and the db is updated"))
         (p/finally restore!))))
+
+(deftest alter-files-outcome-test
+  (is (= :written (file-handler/alter-files-outcome [#js {:result "written"}])))
+  (is (= :written (file-handler/alter-files-outcome [nil]))
+      "a result without an outcome (skip-compare?, browser backends)")
+  (is (= :refused (file-handler/alter-files-outcome
+                   [#js {:result "mismatch" :copy "/g/logseq/bak/conflicts/pages/a/x.md"}])))
+  (is (= :failed (file-handler/alter-files-outcome [#js {:result "exists" :copy nil}]))
+      "a refusal whose conflict copy failed")
+  (is (= :failed (file-handler/alter-files-outcome [#js {:result "io-error" :copy "/g/c.md"}]))
+      "an io-error, copy or not: the disk lacks the content")
+  (is (= :failed (file-handler/alter-files-outcome [#js {:result "written"} #js {:result "io-error"}])))
+  (is (= :written (file-handler/alter-files-outcome []))))

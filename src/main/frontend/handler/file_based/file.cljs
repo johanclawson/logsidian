@@ -275,16 +275,44 @@
                                                               :payload {:type :write-file/failed}}])
                                           (log/error :write-file/failed {:path path
                                                                          :content content
-                                                                         :error error})))))))
+                                                                         :error error})
+                                          #js {:result "io-error" :error (str error)}))))))
         finish-handler (fn []
                          (when finish-handler
                            (finish-handler)))]
+    ;; resolves to the write results, one per file (alter-files-outcome)
     (-> (p/all (map write-file-f files))
-        (p/then (fn []
-                  (finish-handler)))
+        (p/then (fn [results]
+                  (finish-handler)
+                  (vec results)))
         (p/catch (fn [error]
                    (println "Alter files failed:")
-                   (js/console.error error))))))
+                   (js/console.error error)
+                   [#js {:result "io-error" :error (str error)}])))))
+
+(defn alter-files-outcome
+  "The outcome of a page save for the worker (:thread-api/page-file-saved,
+   frontend.worker.file/record-write-outcome!), from the write results
+   alter-files resolves to:
+   - :failed when a write failed (\"io-error\") or was refused without a
+     conflict copy: the content may be only in the db;
+   - else :refused when a write was refused (\"mismatch\"/\"exists\") and its
+     proposal saved as a conflict copy (\"copy\");
+   - else :written. A result without an outcome (skip-compare?, browser
+     backends) counts as written."
+  [results]
+  (let [outcomes (map (fn [result]
+                        (let [outcome (when (some? result) (gobj/get result "result"))
+                              copy (when (some? result) (gobj/get result "copy"))]
+                          (cond
+                            (or (nil? outcome) (= "written" outcome)) :written
+                            (and (contains? #{"mismatch" "exists"} outcome) (string? copy)) :refused
+                            :else :failed)))
+                      results)]
+    (cond
+      (some #{:failed} outcomes) :failed
+      (some #{:refused} outcomes) :refused
+      :else :written)))
 
 (defn alter-files
   "Writes files, [path content] pairs, as guarded writes.
