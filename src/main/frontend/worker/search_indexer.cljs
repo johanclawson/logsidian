@@ -14,8 +14,12 @@
     Nothing goes through the UI thread.
   - The Fuse page index is built in slices too (`ensure-fuse!`).
 
+  - A search db whose tables and triggers are from another version
+    (search/schema-version) is truncated and walked again (reason \"schema\").
+
   Observability for the benchmark harness: `LSSEARCH {json}` console lines
-  with :step build-start / progress / upsert-done / failed / cancelled."
+  with :step open / build-start / progress / slow-slice / upsert-done /
+  sync-failed / failed / cancelled."
   (:require [datascript.core :as d]
             [frontend.worker.search :as search]
             [frontend.worker.state :as worker-state]
@@ -81,14 +85,30 @@
   "What to do with the block index when a graph opens.
   meta: persisted state (search/get-meta).
   facts: :stored-max-tx, the max-tx of the DataScript db as restored from
-  storage (before this session's txs); :blocks-empty? and :has-files? (a
-  parsed file graph), which are only needed when meta has no :state.
+  storage (before this session's txs); :triggers-current?
+  (search/triggers-current?, ignored when absent); :blocks-empty? and
+  :has-files? (a parsed file graph), which are only needed when meta has no
+  :state.
   Returns {:action :trust} or {:action :walk :truncate? :cursor :reason}."
-  [{:keys [state cursor dirty? indexed-tx]} {:keys [blocks-empty? has-files? stored-max-tx]}]
+  [{:keys [state cursor dirty? indexed-tx schema]}
+   {:keys [blocks-empty? has-files? stored-max-tx triggers-current?]}]
   (cond
-    ;; No state row: a new graph (every tx will be indexed as it happens), or
-    ;; an index from before search_meta existed. Heal a legacy index only when
-    ;; it is empty, instead of walking every upgraded graph.
+    ;; Tables and triggers from another version: no schema row (an index from
+    ;; before versions), an older or newer one, or a version row over triggers
+    ;; a build without versions recreated. Their blocks_fts rowids are not the
+    ;; blocks rowids, so no row can be kept: truncate (which recreates the
+    ;; triggers and records search/schema-version in one transaction) and
+    ;; walk. Checked first: an old index is never resumed or trusted. Until the
+    ;; truncate commits, the old triggers stay in place (slow, but correct) and
+    ;; the old version stays recorded, so a quit before it migrates again.
+    (or (not= schema search/schema-version) (false? triggers-current?))
+    {:action :walk :truncate? true :cursor 0 :reason "schema"}
+
+    ;; No state row (at the current version, so a search db created by
+    ;; create-tables-and-triggers!): a new graph (every tx will be indexed as
+    ;; it happens), or a parsed graph whose search db is new, which is walked
+    ;; when empty. An index from before search_meta has no schema row and
+    ;; took the rule above.
     (nil? state)
     (if (and blocks-empty? has-files?)
       {:action :walk :truncate? false :cursor 0 :reason "empty"}
@@ -405,13 +425,15 @@
           conn (worker-state/get-datascript-conn repo)]
       (when (and sdb conn)
         (let [m (search/get-meta sdb)
+              triggers-current? (search/triggers-current? sdb)
               blocks-empty? (when (nil? (:state m)) (search/blocks-empty? sdb))
               has-files? (when (and blocks-empty? file-graph?)
                            (some? (first (d/datoms @conn :avet :file/path))))
               {:keys [action truncate? cursor reason]}
               (open-action m {:blocks-empty? blocks-empty?
                               :has-files? has-files?
-                              :stored-max-tx stored-max-tx})
+                              :stored-max-tx stored-max-tx
+                              :triggers-current? triggers-current?})
               max-tx (:max-tx @conn)
               gen (or (:gen m) 1)
               token (inc (or (:token (repo-state repo)) 0))]
@@ -425,7 +447,8 @@
                                     :restarts 0})
           (log-step! "open" {:action (name action) :reason reason :state (:state m)
                              :cursor (:cursor m) :indexed-tx (:indexed-tx m)
-                             :stored-max-tx stored-max-tx})
+                             :stored-max-tx stored-max-tx
+                             :schema (:schema m) :triggers-current? triggers-current?})
           (case action
             :trust
             (do
@@ -437,7 +460,8 @@
               ;; Persist the decision first: if the app quits before the walk
               ;; starts, later txs advance the watermark and would hide the gap.
               ;; One transaction; cursor 0 so a heal can never resume from a
-              ;; stale cursor.
+              ;; stale cursor. A "schema" walk needs no extra row: search_meta
+              ;; keeps the old version until the truncate commits.
               (if truncate?
                 (search/set-meta-tx! sdb {:state "building" :dirty? true :cursor 0})
                 (search/set-meta-tx! sdb {:state "building" :cursor (or cursor 0) :gen gen

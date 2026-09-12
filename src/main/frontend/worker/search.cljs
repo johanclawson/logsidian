@@ -42,33 +42,93 @@
                         (log-score (- max-score min-score)))]
       (max 0.0 (min 1.0 normalized)))))
 
+(def schema-version
+  "Version of the search db's tables and triggers, kept in search_meta under
+  \"schema\". 1 (or no row): the triggers find a blocks_fts row by its id
+  column, which FTS5 can only do with a full scan (69 ms per row at 10k).
+  2: every blocks_fts row has the rowid of its blocks row and the triggers
+  delete by rowid (an FTS5 rowid lookup). An index at another version is
+  truncated and walked again (search-indexer/open-action, reason \"schema\")."
+  2)
+
+(def fts-triggers
+  "[name sql] of the triggers that keep blocks_fts in step with blocks. A
+  blocks_fts row has the rowid of its blocks row, so delete and update find it
+  by rowid. Only these triggers write blocks_fts, which keeps the two rowids
+  equal. blocks has an implicit rowid (a TEXT primary key, not WITHOUT ROWID);
+  SQLite may renumber such rowids on VACUUM, so the search db must never be
+  VACUUMed (a truncate is its compaction). Should the rowids ever diverge,
+  deletes and updates would silently hit the wrong blocks_fts rows; only a
+  rowid collision makes the insert trigger fail (FTS5 rowids are unique), and
+  that failed incremental sync marks the index dirty, which truncates and walks
+  it."
+  [["blocks_ad"
+    "CREATE TRIGGER IF NOT EXISTS blocks_ad AFTER DELETE ON blocks
+BEGIN
+    DELETE FROM blocks_fts WHERE rowid = old.rowid;
+END;"]
+   ["blocks_ai"
+    "CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks
+BEGIN
+    INSERT INTO blocks_fts (rowid, id, title, page)
+    VALUES (new.rowid, new.id, new.title, new.page);
+END;"]
+   ["blocks_au"
+    "CREATE TRIGGER IF NOT EXISTS blocks_au AFTER UPDATE ON blocks
+BEGIN
+    DELETE FROM blocks_fts WHERE rowid = old.rowid;
+    INSERT INTO blocks_fts (rowid, id, title, page)
+    VALUES (new.rowid, new.id, new.title, new.page);
+END;"]])
+
+(def ^:private trigger-markers
+  "What each current trigger's SQL contains (lower case). The version 1
+  triggers contain none of it."
+  {"blocks_ad" ["old.rowid"]
+   "blocks_ai" ["new.rowid"]
+   "blocks_au" ["old.rowid" "new.rowid"]})
+
+(defn current-triggers?
+  "Whether rows, [name sql] of the triggers on blocks as sqlite_master holds
+  them, are this version's fts-triggers (all present, all by rowid)."
+  [rows]
+  (let [by-name (into {} (keep (fn [[n s]] (when (string? s) [n (string/lower-case s)]))) rows)]
+    (every? (fn [[trigger-name markers]]
+              (when-let [s (get by-name trigger-name)]
+                (every? #(string/includes? s %) markers)))
+            trigger-markers)))
+
+(defn- query-rows
+  "Result rows of sql as vectors ([] when exec returns no row array)."
+  [^Object db sql]
+  (let [r (.exec db #js {:sql sql :rowMode "array"})]
+    (if (array? r) (js->clj r) [])))
+
+(defn triggers-current?
+  "Whether db's blocks triggers are this version's (see current-triggers?).
+  The schema row alone is not enough: a build without them truncating the
+  index recreates its own triggers but leaves search_meta as it is."
+  [^Object db]
+  (current-triggers?
+   (query-rows db "SELECT name, sql FROM sqlite_master WHERE type = 'trigger' AND tbl_name = 'blocks'")))
+
+(defn- search-tables-exist?
+  "Whether blocks or blocks_fts exists (a db from an earlier open)."
+  [^Object db]
+  (seq (query-rows db "SELECT name FROM sqlite_master WHERE type = 'table' AND name IN ('blocks', 'blocks_fts')")))
+
 (defn- add-blocks-fts-triggers!
-  "Table bindings of blocks tables and the blocks FTS virtual tables"
+  "Table bindings of blocks tables and the blocks FTS virtual tables. IF NOT
+  EXISTS: an existing db keeps the triggers it has until a truncate drops
+  them (search-indexer/on-open! decides when)."
   [db]
-  (let [triggers [;; delete
-                  "CREATE TRIGGER IF NOT EXISTS blocks_ad AFTER DELETE ON blocks
-                  BEGIN
-                      DELETE from blocks_fts where id = old.id;
-                  END;"
-                  ;; insert
-                  "CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks
-                  BEGIN
-                      INSERT INTO blocks_fts (id, title, page)
-                      VALUES (new.id, new.title, new.page);
-                  END;"
-                  ;; update
-                  "CREATE TRIGGER IF NOT EXISTS blocks_au AFTER UPDATE ON blocks
-                  BEGIN
-                      DELETE from blocks_fts where id = old.id;
-                      INSERT INTO blocks_fts (id, title, page)
-                      VALUES (new.id, new.title, new.page);
-                  END;"]]
-    (doseq [trigger triggers]
-      (.exec db trigger))))
+  (doseq [[_ trigger] fts-triggers]
+    (.exec db trigger)))
 
 (defn- create-blocks-table!
   [db]
-  ;; id -> block uuid, page -> page uuid
+  ;; id -> block uuid, page -> page uuid. A rowid table (not WITHOUT ROWID):
+  ;; its implicit rowid is the blocks_fts rowid (see fts-triggers).
   (.exec db "CREATE TABLE IF NOT EXISTS blocks (
                         id TEXT NOT NULL PRIMARY KEY,
                         title TEXT NOT NULL,
@@ -85,14 +145,31 @@
   ;; Index state (see get-meta). Not dropped by drop-tables-and-triggers!.
   (.exec db "CREATE TABLE IF NOT EXISTS search_meta (k TEXT PRIMARY KEY, v TEXT)"))
 
-(defn create-tables-and-triggers!
-  "Open a SQLite db for search index"
+(declare set-meta!)
+
+(defn create-tables-and-triggers!*
+  "Create the search tables and triggers; throws on failure. A new db (neither
+  blocks nor blocks_fts there yet, which includes the moment inside
+  truncate-table! after its drop) is created at schema-version. An existing db
+  keeps its tables, triggers and recorded version: search-indexer/on-open!
+  migrates an old one. truncate-table! uses this directly, so a failed CREATE
+  rolls its whole transaction back instead of recording a version over
+  missing tables."
   [db]
-  (try
+  (let [new-db? (not (search-tables-exist? db))]
     (create-blocks-table! db)
     (create-blocks-fts-table! db)
     (add-blocks-fts-triggers! db)
     (create-meta-table! db)
+    (when new-db?
+      (set-meta! db {:schema schema-version}))))
+
+(defn create-tables-and-triggers!
+  "Open a SQLite db for search index (create-tables-and-triggers!*, logging
+  instead of throwing, so a broken search db doesn't stop the graph opening)."
+  [db]
+  (try
+    (create-tables-and-triggers!* db)
     (catch :default e
       (prn "Failed to create tables and triggers")
       (js/console.error e)
@@ -122,16 +199,28 @@ DROP TRIGGER IF EXISTS blocks_au;
   (str "(" (->> (map (fn [id] (str "'" id "'")) ids)
                 (string/join ", ")) ")"))
 
+(def upsert-sql
+  "Insert or update one blocks row. The DO UPDATE only runs when title or page
+  differ (IS NOT: NULL-safe), so re-syncing an unchanged block writes nothing
+  and fires no trigger (it cost a blocks_fts delete + insert before)."
+  (str "INSERT INTO blocks (id, title, page) VALUES ($id, $title, $page)"
+       " ON CONFLICT (id) DO UPDATE SET title = excluded.title, page = excluded.page"
+       " WHERE blocks.title IS NOT excluded.title OR blocks.page IS NOT excluded.page"))
+
 (defn- upsert-row!
   "Upsert one blocks row. A row with a bad id, page or title is skipped (and
   logged) instead of throwing, so it can't roll back the rest of its batch or
-  pin a walk's cursor. Returns true when the row was written."
+  pin a walk's cursor. Returns true when the row was accepted: afterwards
+  blocks holds exactly this row, whether it was inserted, updated or already
+  equal (a no-op). false when it was skipped. The callers ignore the value;
+  their row counts (the walk's :rows, *sync-perf :rows, slow-sync :rows) are
+  rows handed to the index, so an unchanged row counts the same as before."
   [^Object tx id title page]
   (if (and (common-util/uuid-string? id)
            (common-util/uuid-string? page)
            (string? title))
     (do
-      (.exec tx #js {:sql "INSERT INTO blocks (id, title, page) VALUES ($id, $title, $page) ON CONFLICT (id) DO UPDATE SET (title, page) = ($title, $page)"
+      (.exec tx #js {:sql upsert-sql
                      :bind #js {:$id id
                                 :$title title
                                 :$page page}})
@@ -158,9 +247,10 @@ DROP TRIGGER IF EXISTS blocks_au;
    :cursor "blocks_cursor"           ; entity id the walk has indexed up to
    :gen "blocks_gen"                 ; bumped by every truncate
    :indexed-tx "blocks_indexed_tx"   ; max-tx of the last tx reflected in the index
-   :dirty? "blocks_dirty"})          ; an incremental sync failed: rebuild
+   :dirty? "blocks_dirty"            ; an incremental sync failed: rebuild
+   :schema "schema"})                ; schema-version of the tables and triggers
 
-(def ^:private int-meta-keys #{:cursor :gen :indexed-tx})
+(def ^:private int-meta-keys #{:cursor :gen :indexed-tx :schema})
 
 (defn meta->kvs
   "search_meta [k v] rows for the state map m. nil values are skipped."
@@ -206,7 +296,8 @@ DROP TRIGGER IF EXISTS blocks_au;
   (.transaction db (fn [tx] (set-meta! tx m))))
 
 (defn get-meta
-  "Persisted index state: {:state :cursor :gen :indexed-tx :dirty?}, integers parsed."
+  "Persisted index state: {:state :cursor :gen :indexed-tx :dirty? :schema},
+  integers parsed."
   [^Object db]
   (rows->meta (bean/->clj (.exec db #js {:sql "SELECT k, v FROM search_meta"
                                          :rowMode "array"}))))
@@ -579,18 +670,23 @@ DROP TRIGGER IF EXISTS blocks_au;
         (common-util/distinct-by :block/uuid result)))))
 
 (defn truncate-table!
-  "Drop and recreate the blocks tables. Records state building / cursor 0 /
-  gen + 1 (plus extra-meta) in the same SQLite transaction, so a quit after a
-  truncate resumes the walk instead of leaving an empty index that looks
-  complete. Returns the new gen."
+  "Drop and recreate the blocks tables and their triggers, at schema-version.
+  Records state building / cursor 0 / gen + 1 / schema (plus extra-meta) in
+  the same SQLite transaction, so a quit after a truncate resumes the walk
+  instead of leaving an empty index that looks complete, and the recorded
+  version always describes the triggers that exist. This is also the schema
+  migration: rows from an older version are dropped, never re-used."
   ([db] (truncate-table! db nil))
   ([^Object db extra-meta]
    (let [gen (inc (or (:gen (get-meta db)) 0))]
      (.transaction db (fn [tx]
                         (drop-tables-and-triggers! tx)
-                        (create-tables-and-triggers! tx)
+                        ;; throws on failure: the transaction rolls back and no
+                        ;; version is recorded over missing tables
+                        (create-tables-and-triggers!* tx)
                         (set-meta! tx (merge extra-meta
-                                             {:state "building" :cursor 0 :gen gen :dirty? false}))))
+                                             {:state "building" :cursor 0 :gen gen :dirty? false
+                                              :schema schema-version}))))
      gen)))
 
 (defn index-batch

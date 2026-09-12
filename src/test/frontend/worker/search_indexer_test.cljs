@@ -25,6 +25,10 @@
                   bind (when-not (string? arg) (gobj/get arg "bind"))
                   b #(gobj/get bind %)]
               (cond
+                ;; table/trigger probes: this fake keeps no schema objects
+                (string/includes? sql "sqlite_master")
+                #js []
+
                 (string/starts-with? sql "INSERT INTO search_meta")
                 (do (swap! store assoc-in [:meta (b "$k")] (str (b "$v"))) db)
 
@@ -121,7 +125,7 @@
       (is (= 1 (:n (search/index-batch db 0 {:max-items 1000 :max-chars 1 :deadline js/Infinity})))))))
 
 (deftest meta-round-trip-test
-  (let [m {:state "building" :cursor 123 :gen 2 :indexed-tx 536871000 :dirty? true}]
+  (let [m {:state "building" :cursor 123 :gen 2 :indexed-tx 536871000 :dirty? true :schema 2}]
     (is (every? string? (map second (search/meta->kvs m))) "values go to a TEXT column")
     (is (= m (search/rows->meta (search/meta->kvs m))) "integers come back as integers")
     (is (= {:dirty? false} (search/rows->meta [["blocks_dirty" "0"]])))
@@ -186,13 +190,16 @@
       (is (= 4 gen) "generation bumped")
       (is (= (inc n) (:transactions @store)) "drop, create and state in one transaction")
       (is (search/blocks-empty? db))
-      (is (= {:state "building" :cursor 0 :gen 4 :indexed-tx 7 :dirty? false}
-             (search/get-meta db))))
+      (is (= {:state "building" :cursor 0 :gen 4 :indexed-tx 7 :dirty? false
+              :schema search/schema-version}
+             (search/get-meta db))
+          "a truncate also records the schema version of the triggers it recreated"))
     (testing "set-meta-tx! writes a multi-key state change in one transaction"
       (let [n (:transactions @store)]
         (search/set-meta-tx! db {:state "building" :dirty? true :cursor 0})
         (is (= (inc n) (:transactions @store)))
-        (is (= {:state "building" :cursor 0 :gen 4 :indexed-tx 7 :dirty? true}
+        (is (= {:state "building" :cursor 0 :gen 4 :indexed-tx 7 :dirty? true
+                :schema search/schema-version}
                (search/get-meta db)))))))
 
 (deftest slice-action-test
@@ -213,41 +220,48 @@
         "cancel wins")))
 
 (deftest open-action-test
-  (testing "no state row"
-    (is (= {:action :trust}
-           (search-indexer/open-action {} {:blocks-empty? true :has-files? false}))
-        "a new graph: every tx is indexed as it happens")
-    (is (= {:action :walk :truncate? false :cursor 0 :reason "empty"}
-           (search-indexer/open-action {} {:blocks-empty? true :has-files? true}))
-        "an empty index on a parsed graph is healed")
-    (is (= {:action :trust}
-           (search-indexer/open-action {} {:blocks-empty? false :has-files? true}))
-        "a legacy index with rows is not walked"))
-  (testing "dirty"
-    (is (= {:action :walk :truncate? true :cursor 0 :reason "dirty"}
-           (search-indexer/open-action {:state "complete" :dirty? true :indexed-tx 10}
-                                       {:stored-max-tx 10}))))
-  (testing "watermark"
-    (is (= {:action :trust}
-           (search-indexer/open-action {:state "complete" :indexed-tx 10} {:stored-max-tx 10})))
-    (is (= {:action :trust}
-           (search-indexer/open-action {:state "complete" :indexed-tx 12} {:stored-max-tx 10})))
-    (is (= {:action :walk :truncate? true :cursor 0 :reason "gap"}
-           (search-indexer/open-action {:state "complete" :indexed-tx 9} {:stored-max-tx 10}))
-        "a stored tx the index never saw")
-    (is (= "gap" (:reason (search-indexer/open-action {:state "complete"} {:stored-max-tx 10})))))
-  (testing "building"
-    (is (= {:action :walk :truncate? false :cursor 77 :reason "resume"}
-           (search-indexer/open-action {:state "building" :cursor 77 :indexed-tx 10}
-                                       {:stored-max-tx 10})))
-    (is (= "gap" (:reason (search-indexer/open-action {:state "building" :cursor 77 :indexed-tx 9}
-                                                      {:stored-max-tx 10})))
-        "a gap below the cursor can't be resumed"))
-  (testing "state read back from search_meta (TEXT)"
-    (let [m (search/rows->meta [["blocks_state" "building"]
-                                ["blocks_cursor" "77"]
-                                ["blocks_indexed_tx" "10"]])]
-      (is (= 77 (:cursor (search-indexer/open-action m {:stored-max-tx 10})))))))
+  ;; An index at the current schema version; the version rule itself is in
+  ;; frontend.worker.search-schema-test.
+  (let [open (fn [m facts]
+               (search-indexer/open-action (assoc m :schema search/schema-version)
+                                           (assoc facts :triggers-current? true)))]
+    (testing "no state row"
+      (is (= {:action :trust}
+             (open {} {:blocks-empty? true :has-files? false}))
+          "a new graph: every tx is indexed as it happens")
+      (is (= {:action :walk :truncate? false :cursor 0 :reason "empty"}
+             (open {} {:blocks-empty? true :has-files? true}))
+          "an empty index on a parsed graph is healed")
+      (is (= {:action :trust}
+             (open {} {:blocks-empty? false :has-files? true}))
+          "rows but no state row is not walked"))
+    (testing "dirty"
+      (is (= {:action :walk :truncate? true :cursor 0 :reason "dirty"}
+             (open {:state "complete" :dirty? true :indexed-tx 10}
+                   {:stored-max-tx 10}))))
+    (testing "watermark"
+      (is (= {:action :trust}
+             (open {:state "complete" :indexed-tx 10} {:stored-max-tx 10})))
+      (is (= {:action :trust}
+             (open {:state "complete" :indexed-tx 12} {:stored-max-tx 10})))
+      (is (= {:action :walk :truncate? true :cursor 0 :reason "gap"}
+             (open {:state "complete" :indexed-tx 9} {:stored-max-tx 10}))
+          "a stored tx the index never saw")
+      (is (= "gap" (:reason (open {:state "complete"} {:stored-max-tx 10})))))
+    (testing "building"
+      (is (= {:action :walk :truncate? false :cursor 77 :reason "resume"}
+             (open {:state "building" :cursor 77 :indexed-tx 10}
+                   {:stored-max-tx 10})))
+      (is (= "gap" (:reason (open {:state "building" :cursor 77 :indexed-tx 9}
+                                  {:stored-max-tx 10})))
+          "a gap below the cursor can't be resumed"))
+    (testing "state read back from search_meta (TEXT)"
+      (let [m (search/rows->meta [["blocks_state" "building"]
+                                  ["blocks_cursor" "77"]
+                                  ["blocks_indexed_tx" "10"]
+                                  ["schema" (str search/schema-version)]])]
+        (is (= search/schema-version (:schema m)) "parsed as an integer")
+        (is (= 77 (:cursor (search-indexer/open-action m {:stored-max-tx 10}))))))))
 
 (deftest next-batch-size-test
   (is (= 64 (search-indexer/next-batch-size 64 8 8)))
