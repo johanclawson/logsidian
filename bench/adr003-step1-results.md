@@ -549,6 +549,225 @@ The next candidates are:
   linear shortcut registration and a Map LRU for the block AST cache (about
   0.5 s profiled together).
 
+### RC2: all fixes together (build of a866a35, 2026-09-12, `~/.cache/lsbench/rc2/`)
+
+RC2 contains:
+
+- search step 4 with the maintenance fix (FTS5 automerge back on, the tick
+  keeps checkpoints and idle merges);
+- boot fixes 1-3 plus the two follow-ups (linear shortcut registration and
+  a Map LRU for the block AST cache);
+- the restored-node LRU;
+- the reopen reconcile changes;
+- the write guard.
+
+The typing runs now take 10 saves (`LSBENCH_TYPE_BURSTS=10`).
+
+**Full index walk at 10k (manual rebuild, 69 938 rows):**
+
+| | FTS build | step 4 | RC2 |
+|---|---|---|---|
+| walk | 254 s | 153 s | **180 s** |
+| longest slice | 757 ms | 5 416 ms | **722 ms** |
+| p99 slice | 269 ms | 94 ms | 233 ms |
+| slices > 100 ms | 266 | 34 | 180 |
+| WAL frames, maximum | – | 3 746 | 974 |
+| longest merge step | – | 151 ms | 40 ms |
+
+- **The step-4 whole-index crisis merges are gone.** The slowest slice is
+  722 ms, and the WAL never passes the fallback threshold.
+- **The walk is better than the FTS build on every row.** It takes 180 s
+  where the arbiter predicted 200–230 s.
+- **The price of a merged index:** the p99 slice and the count over 100 ms
+  are back near the FTS build's shape.
+
+**Typing, 10 saves on the trusted 10k index** (`save-block`):
+
+| | median | max |
+|---|---|---|
+| worker time per save | 94 ms | 200 ms |
+| store (two commits) | 25 ms | 69 ms |
+| search sync (one row) | 24 ms | 39 ms |
+
+The worst worker stall (get-initial-data) is still 9.6 s at 10k.
+
+**Restored-node LRU** (`gctest/rc2`, the same search four times around a
+forced `gc()`):
+
+| run | step 4 restores | RC2 restores | RC2 search-blocks total |
+|---|---|---|---|
+| cold | 1 438 | 1 290 | 1 070 ms |
+| warm | 653 | **0** | 392 ms |
+| after `gc()` | 729 | **0** | 375 ms |
+| warm again | 0 | 0 | 213 ms |
+
+After a GC no index node has to be restored, and a repeated search stays
+cheap. The first search hit on the trusted 10k graph went from 1 885 to
+1 518 ms.
+
+**Boot, longest boot task per launch:**
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| before | 6 164 | 4 808 | 5 879 | 5 617 ms |
+| boot fixes 1-3 | 3 058 | 2 910 | 2 831 | 2 933 ms |
+| RC2 (+ follow-ups) | 2 406 | 2 686 | 2 623 | **2 572 ms** |
+
+The full suite gated RC2 once. One test got a foreign rejection that another
+test leaked. The cause is a promesa 11.0.678 bug in the drain loop, shared
+by unrelated promise chains: one thrown handler rejected later ones. It is
+now patched with a local override of `promesa/impl/promise.js` (32f102e),
+and the leaking test is fixed (995fe78). The regression test
+`frontend.promesa-drain-test` has two cases.
+
+- Without the override: both fail. The chain after a throwing one was
+  rejected with the other chain's error (`{:error "only b fails"}` where
+  `{:ok :c}` was expected). A neighbour of a `p/do` that threw
+  synchronously received that error too, which explains the earlier
+  "p/catch did not catch" observation.
+- With the override: both pass (2 tests, 5 assertions), and so does the
+  repo-test + node-cache-test pair that exposed the leak (18 tests, 80
+  assertions).
+
+### RC3: save fixes, block identity, promesa patch (`~/.cache/lsbench/rc3/`, 2026-09-12)
+
+RC3 is RC2 plus:
+
+- the save fixes (08c44c8, 174503a);
+- block identity across re-parses (424246d);
+- the promesa drain patch (32f102e);
+- the repo-test leak fix (995fe78).
+
+**Build.** The one-JVM release build was killed three times by the
+harness's low-memory guard. It succeeded with one target per JVM (now
+`build-perf.sh LOWMEM=1`).
+
+**Gates.**
+
+- Full suite: 437 tests, 2 876 assertions, with only the known
+  get-class-objects-test error.
+- **All 8 safety scenarios pass** with the guard present. The only app
+  errors left are ResizeObserver warnings; the INode save failures of
+  earlier runs are gone.
+- **Release gate pass:** reopening the g-real copy changed 0 of 569 files
+  and made no new backup.
+
+| | RC2 | RC3 |
+|---|---|---|
+| full walk at 10k | 180 s | **158 s** |
+| longest slice | 722 ms | **280 ms** |
+| p99 slice | 233 ms | 209 ms |
+| search hit, 10k walk / trusted 10k / real | 1 498 / 1 518 / 1 235 ms | 1 381 / 1 366 / 985 ms |
+| restores after a forced GC | 0 | 0 |
+| boot, longest task (mean of 3) | 2 572 ms | 2 777 ms |
+
+**Open: a UI-thread regression while typing.** Boot, reopen, idle and the
+reindex window are unchanged. The typing window is not:
+
+| UI long tasks while typing | RC2 | RC3 |
+|---|---|---|
+| walk-10k run | 8 (923 ms) | 54 (7 134 ms) |
+| trusted 10k | 27 (3 261 ms) | 94 (13 345 ms) |
+| g-real | 5 (578 ms) | 35 (5 957 ms) |
+
+On the real graph the median save rose from 88 to 136 ms. The candidates
+are the UI save rescue, block identity, and the promesa fix (chains that
+the bug rejected silently now complete). A CPU profile of typing is running
+(`typeprof/rc3`).
+
+**Reviews** (`bench/reviews-rc3.md`, Codex high effort):
+
+- write guard: do not ship yet (4 HIGH);
+- save fixes: ship with fixes (5 HIGH);
+- promesa patch: ship;
+- block identity: review pending.
+
+### RC2 data safety and release gate (`safety/20260912-141614`, 2026-09-12)
+
+This is the first harness run of a build with the write guard. The guard
+was active in every scenario: its LSGUARD lines were seen.
+
+| scenario | master | step-4 build | RC2 |
+|---|---|---|---|
+| offline-edit-reopen | fail | pass | pass |
+| idrepair-race | pass | pass | pass |
+| live-external-edit | pass | pass | pass |
+| config-offline-then-delete-home | fail | fail | pass* |
+| burst-writes | fail | pass | pass |
+| typing-roundtrip | pass | pass | pass |
+| two-ops-one-flush | fail | fail | **pass** |
+| typing-through-external-rewrite | fail | fail | **pass** |
+
+\* **The config scenario was reported as a fail, but the guard did what it
+should.** `config.edn` kept the offline edit. Deleting the home page made the
+app try twice to rewrite `config.edn` from its pre-edit copy. The guard
+refused both writes, and each proposal is kept under
+`logseq/bak/conflicts/logseq/config/`. The harness counted those refusals as
+a failure because the scenario was not marked as staging a conflict; it is
+now (c953cfb).
+
+The trade-off is disk wins. The app's intended change, dropping
+`:default-home` for the deleted page, is not applied; the user gets a notice
+and a copy.
+
+**typing-through-external-rewrite passes.** An external rewrite during
+typing is no longer overwritten by a stale save proposal. This was the
+guard's main target, and it fails on both master and the step-4 build.
+
+**Release gate: pass.** The RC2 build reopened the real-graph copy with no
+typing: 569 files, 0 changed, 0 added, 0 removed, 0 new backups
+(`bench/manifest.py`).
+
+### Data safety: step-4 build vs master (`bench/lssafety.js`, 2026-09-12)
+
+First runs of the data-safety harness (`~/.cache/lsbench/safety/20260912-124151`
+= the step-4 build, `…-125731` = master's launcher build). It uses generated
+graph copies; files are checked byte for byte after the app closes. Neither
+build has the write guard yet.
+
+| scenario | step-4 build | master |
+|---|---|---|
+| offline-edit-reopen | pass | **fail**: search misses the offline edits |
+| idrepair-race | pass | pass |
+| live-external-edit | pass | pass |
+| config-offline-then-delete-home | **fail** | **fail** |
+| burst-writes | pass | **fail**: typed text missing or duplicated |
+| typing-roundtrip | pass | pass |
+| two-ops-one-flush | **fail**: one keystroke lost | **fail**: other lines changed |
+| typing-through-external-rewrite | **fail** | **fail** |
+
+- **Search after offline edits.** Master's index does not pick up files
+  edited while the app was closed. The step-4 build's per-transaction
+  indexing (`:from-disk?` transactions included) does.
+- **config-offline-then-delete-home is an upstream data-loss bug.** On
+  reopen, deleting the home page (its file was deleted offline) rewrote
+  `config.edn` from the app's stale copy. The offline edit ended up only in
+  `logseq/bak/`. The write guard targets this.
+- **typing-through-external-rewrite is the upstream overwrite.** A save
+  proposal made before an external rewrite replaced it on disk. The external
+  text survives only in `logseq/bak/`. This is the guard's main target.
+- **two-ops-one-flush on the step-4 build is not a write-path failure.**
+  The harness typed `two qstcdc4d61a`, and the file holds `two qstdc4d61a`,
+  which is exactly what the editor had. One keystroke was lost while the new
+  block's editor was being set up after Enter. The harness now checks the
+  file against the editor's actual text, and reports lost keystrokes as a
+  separate warning.
+- **The errors both builds logged are real, not shutdown noise.** They are
+  "Unexpected webworker error", "Promise error" and ExceptionInfo records.
+  I first matched their times to a launch's close using two different
+  clocks, which was wrong. On one clock they fall well before any close.
+
+  They are a failed save: `thread-api/apply-outliner-ops` / `save-block`
+  throws "No protocol method INode.-save defined for type object". It
+  happens in two places:
+  - in idrepair-race, during the reopen reconcile (the missing-id repair's
+    own save);
+  - in live-external-edit, as a typed save right after a same-page re-read.
+
+  Master shows it too (idrepair-race), so it is an upstream bug, and it is
+  now under investigation. A save that fails can lose typing. The harness
+  now records `t0_ms` per launch and counts real post-close errors apart.
+
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
 `slow-slice` split of the 258 slices over 100 ms: median 167 ms = **index 7 ms
