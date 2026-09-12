@@ -629,6 +629,42 @@ and the leaking test is fixed (995fe78). The regression test
   repo-test + node-cache-test pair that exposed the leak (18 tests, 80
   assertions).
 
+### RC2 data safety and release gate (`safety/20260912-141614`, 2026-09-12)
+
+This is the first harness run of a build with the write guard. The guard
+was active in every scenario: its LSGUARD lines were seen.
+
+| scenario | master | step-4 build | RC2 |
+|---|---|---|---|
+| offline-edit-reopen | fail | pass | pass |
+| idrepair-race | pass | pass | pass |
+| live-external-edit | pass | pass | pass |
+| config-offline-then-delete-home | fail | fail | pass* |
+| burst-writes | fail | pass | pass |
+| typing-roundtrip | pass | pass | pass |
+| two-ops-one-flush | fail | fail | **pass** |
+| typing-through-external-rewrite | fail | fail | **pass** |
+
+\* **The config scenario was reported as a fail, but the guard did what it
+should.** `config.edn` kept the offline edit. Deleting the home page made the
+app try twice to rewrite `config.edn` from its pre-edit copy. The guard
+refused both writes, and each proposal is kept under
+`logseq/bak/conflicts/logseq/config/`. The harness counted those refusals as
+a failure because the scenario was not marked as staging a conflict; it is
+now (c953cfb).
+
+The trade-off is disk wins. The app's intended change, dropping
+`:default-home` for the deleted page, is not applied; the user gets a notice
+and a copy.
+
+**typing-through-external-rewrite passes.** An external rewrite during
+typing is no longer overwritten by a stale save proposal. This was the
+guard's main target, and it fails on both master and the step-4 build.
+
+**Release gate: pass.** The RC2 build reopened the real-graph copy with no
+typing: 569 files, 0 changed, 0 added, 0 removed, 0 new backups
+(`bench/manifest.py`).
+
 ### Data safety: step-4 build vs master (`bench/lssafety.js`, 2026-09-12)
 
 First runs of the data-safety harness (`~/.cache/lsbench/safety/20260912-124151`
