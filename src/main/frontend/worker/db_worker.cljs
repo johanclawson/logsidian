@@ -50,6 +50,7 @@
             [logseq.db.common.reference :as db-reference]
             [logseq.db.common.sqlite :as common-sqlite]
             [logseq.db.common.view :as db-view]
+            [logseq.db.file-based.journal-window :as journal-window]
             [logseq.db.frontend.class :as db-class]
             [logseq.db.frontend.schema :as db-schema]
             [logseq.db.sqlite.create-graph :as sqlite-create-graph]
@@ -520,10 +521,45 @@
     (reset! worker-state/*deleted-block-uuid->db-id {}))
   (start-db! repo opts))
 
+(defn- q-fast-path
+  "File graphs: the journals NOW/NEXT window queries (and user queries of the
+   same shape) answered by index walks, logseq.db.file-based.journal-window.
+   Returns {:result ..} for a hit, nil when d/q has to run the query: another
+   shape, a db the walk cannot answer, or an error. Logs one LSPERF
+   q-fastpath line per hit, with the SQLite restores the walk caused."
+  [repo db inputs]
+  (when-not (sqlite-util/db-based-graph? repo)
+    (try
+      (let [t0 (js/performance.now)
+            restores0 (:restores @*perf)
+            plan (journal-window/plan (first inputs) (rest inputs))
+            stats (if (= ::journal-window/no-match plan)
+                    ::journal-window/no-match
+                    ;; eager: walks, restores and pulls all happen here, not
+                    ;; later in the transit write (thread-api sync-ms)
+                    (journal-window/run-stats db plan))]
+        (when-not (= ::journal-window/no-match stats)
+          (js/console.log
+           (str "LSPERF "
+                (js/JSON.stringify
+                 (clj->js {:event "q-fastpath"
+                           :pages (:pages stats)
+                           :blocks (:blocks stats)
+                           :hits (:hits stats)
+                           :ms (/ (js/Math.round (* 10 (- (js/performance.now) t0))) 10)
+                           :restores (- (:restores @*perf) restores0)}))))
+          stats))
+      (catch :default e
+        (js/console.error "q-fastpath failed, running d/q instead" e)
+        nil))))
+
 (def-thread-api :thread-api/q
   [repo inputs]
   (when-let [conn (worker-state/get-datascript-conn repo)]
-    (apply d/q (first inputs) @conn (rest inputs))))
+    (let [db @conn]
+      (if-let [stats (q-fast-path repo db inputs)]
+        (:result stats)
+        (apply d/q (first inputs) db (rest inputs))))))
 
 (def-thread-api :thread-api/get-file-paths
   [repo {:keys [exclude-mldoc?]}]
