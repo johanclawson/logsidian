@@ -39,16 +39,28 @@
   (let [repo (state/get-current-repo)
         db-based? (config/db-based-graph? repo)]
     [:<>
-     (ui/menu-background-color #(property-handler/batch-set-block-property! repo
-                                                                            (state/get-selection-block-ids)
-                                                                            (pu/get-pid :logseq.property/background-color)
-                                                                            %)
-                               #(property-handler/batch-remove-block-property! repo
+     (ui/menu-background-color #(editor-handler/<with-failure-notice!
+                                 "Setting the background color"
+                                 (fn []
+                                   (property-handler/batch-set-block-property! repo
                                                                                (state/get-selection-block-ids)
-                                                                               (pu/get-pid :logseq.property/background-color)))
-     (ui/menu-heading #(editor-handler/batch-set-heading! (state/get-selection-block-ids) %)
-                      #(editor-handler/batch-set-heading! (state/get-selection-block-ids) true)
-                      #(editor-handler/batch-remove-heading! (state/get-selection-block-ids)))
+                                                                               (pu/get-pid :logseq.property/background-color)
+                                                                               %)))
+                               #(editor-handler/<with-failure-notice!
+                                 "Removing the background color"
+                                 (fn []
+                                   (property-handler/batch-remove-block-property! repo
+                                                                                  (state/get-selection-block-ids)
+                                                                                  (pu/get-pid :logseq.property/background-color)))))
+     (ui/menu-heading #(editor-handler/<with-failure-notice!
+                        "Setting the heading"
+                        (fn [] (editor-handler/batch-set-heading! (state/get-selection-block-ids) %)))
+                      #(editor-handler/<with-failure-notice!
+                        "Setting the heading"
+                        (fn [] (editor-handler/batch-set-heading! (state/get-selection-block-ids) true)))
+                      #(editor-handler/<with-failure-notice!
+                        "Removing the heading"
+                        (fn [] (editor-handler/batch-remove-heading! (state/get-selection-block-ids)))))
 
      (shui/dropdown-menu-separator)
 
@@ -217,9 +229,15 @@
                                                                              (pu/get-pid :logseq.property/background-color)))
 
          (ui/menu-heading heading
-                          #(editor-handler/set-heading! block-id %)
-                          #(editor-handler/set-heading! block-id true)
-                          #(editor-handler/remove-heading! block-id))
+                          #(editor-handler/<with-failure-notice!
+                            "Setting the heading"
+                            (fn [] (editor-handler/set-heading! block-id %)))
+                          #(editor-handler/<with-failure-notice!
+                            "Setting the heading"
+                            (fn [] (editor-handler/set-heading! block-id true)))
+                          #(editor-handler/<with-failure-notice!
+                            "Removing the heading"
+                            (fn [] (editor-handler/remove-heading! block-id))))
 
          (shui/dropdown-menu-separator)
 

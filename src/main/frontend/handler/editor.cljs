@@ -997,6 +997,24 @@
       (let [input-id (state/get-edit-input-id)]
         (state/set-edit-content! input-id new-content)))))
 
+(defn <with-failure-notice!
+  "For a fire-and-forget UI action: calls f, which may return a promise, and
+   resolves to its result. When f throws or its promise rejects (db and
+   outliner transactions reject since frontend.db.transact/worker-call
+   settles), logs the error, shows \"<action> failed: <error>\" to the user
+   and resolves to nil, so no unhandled rejection escapes."
+  [action f]
+  (-> (try
+        (p/promise (f))
+        (catch :default e
+          (p/rejected e)))
+      (p/catch (fn [error]
+                 (log/error :ui-action/failed {:action action :error error})
+                 (notification/show!
+                  (str action " failed: " (or (ex-message error) (:ex-message error) (str error)))
+                  :error)
+                 nil))))
+
 (defn set-blocks-id!
   "Persist block uuid to file if the uuid is valid, and it's not persisted in file.
    Accepts a list of uuids."
@@ -1009,10 +1027,14 @@
   ([block-id]
    (copy-block-ref! block-id #(str %)))
   ([block-id tap-clipboard]
-   (p/do!
-    (save-current-block!)
-    (set-blocks-id! [block-id])
-    (util/copy-to-clipboard! (tap-clipboard block-id)))))
+   ;; copies only once the id is persisted: a ref to an id missing from the
+   ;; file would dangle after a reload
+   (<with-failure-notice!
+    "Copying the block reference"
+    #(p/do!
+      (save-current-block!)
+      (set-blocks-id! [block-id])
+      (util/copy-to-clipboard! (tap-clipboard block-id))))))
 
 (defn select-block!
   [block-uuid]
@@ -1110,8 +1132,12 @@
                                        :markdown
                                        (str (string/join (repeat (dec level) "\t")) "- " (ref/->block-ref id))))))
                             (string/join "\n\n"))]
-      (set-blocks-id! (map :id blocks))
-      (util/copy-to-clipboard! copy-str))))
+      ;; copies only once the ids are persisted, see copy-block-ref!
+      (<with-failure-notice!
+       "Copying the block references"
+       #(p/do!
+         (set-blocks-id! (map :id blocks))
+         (util/copy-to-clipboard! copy-str))))))
 
 (defn copy-block-embeds
   []
@@ -1126,8 +1152,12 @@
                     (some->> ids
                              (map (fn [id] (util/format "{{embed ((%s))}}" id)))
                              (string/join "\n\n")))]
-      (set-blocks-id! ids)
-      (util/copy-to-clipboard! ids-str))))
+      ;; copies only once the ids are persisted, see copy-block-ref!
+      (<with-failure-notice!
+       "Copying the block embeds"
+       #(p/do!
+         (set-blocks-id! ids)
+         (util/copy-to-clipboard! ids-str))))))
 
 (defn get-selected-toplevel-block-uuids
   []

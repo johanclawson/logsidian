@@ -131,7 +131,9 @@
               (create-page-with-exported-tree! block)
               (recur))
             (let [result (async/<! (p->c (db-async/<get-all-referenced-blocks-uuid (state/get-current-repo))))]
-              (editor/set-blocks-id! result)
+              (editor/<with-failure-notice!
+               "Saving the ids of referenced blocks"
+               #(editor/set-blocks-id! result))
               (async/offer! imported-chan true)))))
 
       (catch :default e

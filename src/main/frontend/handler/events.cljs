@@ -261,7 +261,9 @@
 
 (defmethod handle :editor/set-heading [[_ block heading]]
   (when-let [id (:block/uuid block)]
-    (editor-handler/set-heading! id heading)))
+    (editor-handler/<with-failure-notice!
+     "Setting the heading"
+     #(editor-handler/set-heading! id heading))))
 
 (defmethod handle :graph/restored [[_ graph]]
   (when graph (assets-handler/ensure-assets-dir! graph))

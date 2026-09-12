@@ -302,7 +302,10 @@
                                     [(.-minX ^js bounds) (+ 64 (.-maxY ^js bounds))]
                                     [(+ 64 (.-maxX ^js bounds)) (.-minY ^js bounds)]))))
           shape (->logseq-portal-shape block-uuid point)]
-      (when (uuid? block-uuid) (editor-handler/set-blocks-id! [block-uuid]))
+      (when (uuid? block-uuid)
+        (editor-handler/<with-failure-notice!
+         "Saving the id of the portal's block"
+         #(editor-handler/set-blocks-id! [block-uuid])))
       (.createShapes api (clj->js shape))
       (when link?
         (.createNewLineBinding api source-shape (:id shape))))))
