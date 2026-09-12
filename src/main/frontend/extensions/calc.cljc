@@ -2,22 +2,25 @@
   (:refer-clojure :exclude [eval numerator denominator])
   (:require #?(:clj [clojure.java.io :as io])
             #?(:clj [instaparse.core :as insta]
-               :cljs [instaparse.core :as insta :refer-macros [defparser]])
+               :cljs [instaparse.core :as insta :include-macros true])
 
             #?(:cljs [rum.core :as rum])
 
-            #?(:cljs [shadow.resource :as rc])
             [bignumber.js :as bn]
             [clojure.string :as string]
-            [frontend.util :as util]))
+            [frontend.util :as util])
+  #?(:cljs (:require-macros [frontend.extensions.calc-grammar :refer [defparser-from-resource]])))
 
 #?(:cljs (set! *warn-on-infer* false))
 
 ;; ======================================================================
 ;; Interpreter
 
+;; cljs: the grammar is inlined as a string literal at macro time so that
+;; instaparse's defparser precompiles it; the old (defparser parse (rc/inline ...))
+;; built the parser at runtime, costing ~1.9 s of the boot long task.
 #?(:clj (def parse (insta/parser (io/resource "grammar/calc.bnf")))
-   :cljs (defparser parse (rc/inline "grammar/calc.bnf")))
+   :cljs (defparser-from-resource parse "grammar/calc.bnf"))
 
 (def constants {"PI" (bn/BigNumber "3.14159265358979323846")
                 "E"  (bn/BigNumber "2.71828182845904523536")})

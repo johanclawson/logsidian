@@ -249,6 +249,7 @@
            clojure.test.check.properties/for-all clojure.core/for
            ;; src/main
            frontend.namespaces/import-vars potemkin/import-vars
+           frontend.extensions.calc-grammar/defparser-from-resource clojure.core/def
            ;; src/test
            frontend.test.helper/deftest-async clojure.test/deftest
            frontend.worker.rtc.idb-keyval-mock/with-reset-idb-keyval-mock cljs.test/async
