@@ -168,3 +168,45 @@ No LOW findings for A. No new HIGH, MEDIUM, or LOW defects found in B; findings 
 ## Review 3: block identity
 
 Codex hit its usage limit (until 20:43); a Fable review stands in, Codex re-runs after 20:45.
+
+### Stand-in: Fable, 2026-09-12
+
+Reviewed 424246d (design bench/decision-block-identity.md + implementation),
+read from the commit's own sources; nbb probes of the pure matcher and of
+parse-file twice on a conn.
+
+1. [HIGH] Rule 5 hands a deleted block's uuid to the next changed block in
+   the gap; the editor then writes the user's text into that block.
+   block_identity.cljs:155-159 (match-gap zips left-old/left-new by level, no
+   content check); editor.cljs:349-380 and outliner core.cljs:599-640 resolve
+   by uuid with no check that the entity still holds the editor's start text.
+   Probes: "- a\n- b\n- c" -> "- a\n- c typed" gives "c typed" <- old[b];
+   insert before an edited block shifts uuids; a page-properties pre-block
+   added externally takes the first block's uuid. Worst case: user edits b on
+   PC1, PC2 deletes b and edits c, OneDrive delivers; u_b now titles
+   "c typed"; the user's save overwrites it -> PC2's edit destroyed, b
+   resurrected, silently, and the guard passes (the re-parse stamped
+   :file/content with disk). Before 424246d the text was appended (nothing
+   lost). Fix: pair leftovers only when counts are equal and a similarity
+   holds (same first line, or common prefix+suffix >= 50 %); never pair a
+   pre-block with a non-pre-block; plus a :base-title save guard (the editor
+   passes its start/last-sent text; a mismatch with the entity's current
+   title takes the keep-user-edit path instead of overwriting).
+2. [MEDIUM] Undo after a from-disk re-parse rewrites live entities
+   (undo_redo.cljs:180-191 reverse-datoms without value checks;
+   gen-undo-ops! ignores from-disk txs). Fix: drop undo/redo ops whose eids
+   intersect a from-disk tx's eids (modules/outliner/pipeline.cljs:56-59).
+3. [MEDIUM] Rule 5 degrades to positional zipping when editor-stored titles
+   differ from parser titles (editor trims; parser does not; writer adds
+   collapsed::). Fix: string/trimr keys; an nbb parity test that serialises
+   a parsed page with the writer, re-parses, asserts the fast path.
+4. [LOW] Dead macro handling; orphaned macro entities per kept block.
+5. [LOW] Collapse race window (not a regression).
+6. [LOW] updated-at/created-at of kept blocks not refreshed.
+7. [LOW] Performance plausible, unmeasured in the app (nbb: 5 716 blocks,
+   fast path 138 ms, anchor path 524 ms).
+Clean: no uuid issued twice; implementer decisions verified; retain/retract
+path; search upserts; upstream 0.10.9 claim verified.
+Verdict: do not ship as is; ship with fixes 1 and 2 (3 in the same change).
+
+RC4 round 1 (branch rc4/fixes) fixed 1 (a0e558e, 9bb07be), 2 (5ea2d9f) and 3 (0b37eb1).
