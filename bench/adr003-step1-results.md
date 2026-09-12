@@ -629,6 +629,59 @@ and the leaking test is fixed (995fe78). The regression test
   repo-test + node-cache-test pair that exposed the leak (18 tests, 80
   assertions).
 
+### RC3: save fixes, block identity, promesa patch (`~/.cache/lsbench/rc3/`, 2026-09-12)
+
+RC3 is RC2 plus:
+
+- the save fixes (08c44c8, 174503a);
+- block identity across re-parses (424246d);
+- the promesa drain patch (32f102e);
+- the repo-test leak fix (995fe78).
+
+**Build.** The one-JVM release build was killed three times by the
+harness's low-memory guard. It succeeded with one target per JVM (now
+`build-perf.sh LOWMEM=1`).
+
+**Gates.**
+
+- Full suite: 437 tests, 2 876 assertions, with only the known
+  get-class-objects-test error.
+- **All 8 safety scenarios pass** with the guard present. The only app
+  errors left are ResizeObserver warnings; the INode save failures of
+  earlier runs are gone.
+- **Release gate pass:** reopening the g-real copy changed 0 of 569 files
+  and made no new backup.
+
+| | RC2 | RC3 |
+|---|---|---|
+| full walk at 10k | 180 s | **158 s** |
+| longest slice | 722 ms | **280 ms** |
+| p99 slice | 233 ms | 209 ms |
+| search hit, 10k walk / trusted 10k / real | 1 498 / 1 518 / 1 235 ms | 1 381 / 1 366 / 985 ms |
+| restores after a forced GC | 0 | 0 |
+| boot, longest task (mean of 3) | 2 572 ms | 2 777 ms |
+
+**Open: a UI-thread regression while typing.** Boot, reopen, idle and the
+reindex window are unchanged. The typing window is not:
+
+| UI long tasks while typing | RC2 | RC3 |
+|---|---|---|
+| walk-10k run | 8 (923 ms) | 54 (7 134 ms) |
+| trusted 10k | 27 (3 261 ms) | 94 (13 345 ms) |
+| g-real | 5 (578 ms) | 35 (5 957 ms) |
+
+On the real graph the median save rose from 88 to 136 ms. The candidates
+are the UI save rescue, block identity, and the promesa fix (chains that
+the bug rejected silently now complete). A CPU profile of typing is running
+(`typeprof/rc3`).
+
+**Reviews** (`bench/reviews-rc3.md`, Codex high effort):
+
+- write guard: do not ship yet (4 HIGH);
+- save fixes: ship with fixes (5 HIGH);
+- promesa patch: ship;
+- block identity: review pending.
+
 ### RC2 data safety and release gate (`safety/20260912-141614`, 2026-09-12)
 
 This is the first harness run of a build with the write guard. The guard
