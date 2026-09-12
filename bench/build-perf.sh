@@ -5,7 +5,10 @@
 #                 printing, main.js ~36 MB instead of ~11 MB)
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
-export NODE_OPTIONS="--max-old-space-size=6144"
+# NODE_OPTIONS_BUILD overrides the webpack/node heap (default 6 GB); with
+# JAVA_TOOL_OPTIONS=-Xmx3g it keeps the build under the harness's memory
+# threshold when other sessions share the VM
+export NODE_OPTIONS="${NODE_OPTIONS_BUILD:---max-old-space-size=6144}"
 cd "${1:-$HOME/dev/logsidian}"
 echo "[$(date '+%H:%M:%S')] repo: $(pwd)"
 ts() { date '+%H:%M:%S'; }
