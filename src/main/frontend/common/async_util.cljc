@@ -30,6 +30,45 @@
        d)))
 
 #?(:cljs
+   (defn <map-bounded
+     "Like `(p/all (map f xs))`, but with at most `n` calls of `f` in flight: the
+      next item starts only when an earlier call has settled. Resolves to a
+      vector of the results in the order of `xs`.
+
+      A call that throws or rejects does not stop the others. Its slot holds
+      the error, so a caller that must tell failures apart catches inside `f`.
+
+      Why: p/all over a large seq starts every call at once. The reopen
+      reconcile did that for every graph file, which queued one worker pull per
+      file at once (ADR-003)."
+     [n f xs]
+     (let [items (vec xs)
+           total (count items)
+           n (max 1 n)
+           *results (volatile! (vec (repeat total nil)))
+           *next (volatile! 0)
+           *active (volatile! 0)]
+       (p/create
+        (fn [done _reject]
+          (letfn [(start-more! []
+                    (while (and (< @*next total) (< @*active n))
+                      (let [i @*next]
+                        (vswap! *next inc)
+                        (vswap! *active inc)
+                        ;; p/do turns a synchronous throw of f into a rejection
+                        (-> (p/do (f (nth items i)))
+                            (p/catch identity)
+                            (p/then (fn [v]
+                                      (vswap! *results assoc i v)
+                                      (vswap! *active dec)
+                                      (if (and (= @*next total) (zero? @*active))
+                                        (done @*results)
+                                        (start-more!))))))))]
+            (if (zero? total)
+              (done [])
+              (start-more!))))))))
+
+#?(:cljs
    (defn drain-chan
      "drop all stuffs in CH, and return all of them"
      [ch]

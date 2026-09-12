@@ -2,6 +2,7 @@
   "Main ns that handles file watching events from electron's main process"
   (:require [clojure.set :as set]
             [clojure.string :as string]
+            [frontend.common.async-util :as async-util]
             [frontend.config :as config]
             [frontend.db :as db]
             [frontend.db.async :as db-async]
@@ -41,6 +42,9 @@
           missing-blocks))))))
 
 (defn- handle-add-and-change!
+  "Resolves to true once the new content was handed to alter-file. Returns nil
+   when the path is hidden or the content is unchanged. The reopen reconcile
+   counts the true results as changed files."
   [repo path content db-content ctime mtime backup?]
   (let [config (state/get-config repo)
         path-hidden-patterns (:hidden config)]
@@ -58,10 +62,16 @@
                                                             :from-disk? true
                                                             :fs/event :fs/local-file-change
                                                             :ctime ctime
-                                                            :mtime mtime})]
-        (set-missing-block-ids! content)))))
+                                                            :mtime mtime})
+              _ (set-missing-block-ids! content)]
+        true))))
 
-(defn handle-changed!
+(defn- <handle-changed
+  "handle-changed! as a promise that settles once the event's work is done: the
+   worker pull of the db content, the backup, the reparse or the page delete.
+   Resolves to true when an add or change was handed to alter-file (see
+   handle-add-and-change!). load-graph-files! awaits it, so its concurrency cap
+   also bounds the pulls and reparses; handle-changed! leaves them detached."
   [type {:keys [dir path content stat global-dir] :as payload}]
   (let [repo (state/get-current-repo)]
     (when dir
@@ -128,16 +138,61 @@
 
                 :else
                 (log/error :fs/watcher-no-handler {:type type
-                                                   :payload payload})))))
+                                                   :payload payload})))))))))
 
-      ;; return nil, otherwise the entire db will be transferred by ipc
-        nil))))
+(defn handle-changed!
+  [type payload]
+  (<handle-changed type payload)
+  ;; return nil, otherwise the entire db will be transferred by ipc
+  nil)
+
+(def ^:private reconcile-concurrency
+  "Graph files the reopen reconcile works on at once. Each one costs a stat and
+   a read IPC call, a worker pull and, when changed, a reparse. The former p/all
+   started all of them at once and so queued one pull per graph file in the
+   worker. ADR-003 step 1 caps it to test whether that queue causes the reopen
+   stalls (H2). No bound on the stall is predicted: the LSPERF line measures it."
+  16)
+
+(def ^:private reconcile-delete-concurrency
+  "Page deletes in flight at once for files that are gone from disk. Each is an
+   outliner transact in the worker."
+  4)
+
+(defn- log-reconcile-perf!
+  "ADR-003 instrumentation: one LSPERF line per reopen reconcile. max-queue-ms
+   is the longest wait from the start of the file phase (after the page deletes
+   and the 500 ms delay) until a file got a slot. max-file-ms is the slowest
+   file, from its stat to its reparse settling."
+  [{:keys [files deleted t0 files-t0 changed errors delete-errors max-file-ms max-queue-ms]}]
+  (let [now (js/performance.now)
+        round #(js/Math.round (or % 0))]
+    (js/console.log
+     (str "LSPERF "
+          (js/JSON.stringify
+           (clj->js {:event "reconcile"
+                     :thread "ui"
+                     :concurrency reconcile-concurrency
+                     :files files
+                     :changed changed
+                     :deleted deleted
+                     :errors errors
+                     :delete-errors delete-errors
+                     :total-ms (round (- now t0))
+                     :files-ms (round (- now files-t0))
+                     :max-file-ms (round max-file-ms)
+                     :max-queue-ms (round max-queue-ms)
+                     :t (round now)}))))))
 
 (defn load-graph-files!
   "This fn replaces the former initial fs watcher"
   [graph]
   (when graph
-    (let [repo-dir (config/get-repo-dir graph)]
+    (let [repo-dir (config/get-repo-dir graph)
+          t0 (js/performance.now)
+          ;; LSPERF counters for this run, logged by log-reconcile-perf!
+          *perf (volatile! {:changed 0 :errors 0 :delete-errors 0
+                            :max-file-ms 0 :max-queue-ms 0})]
       ;; read all files in the repo dir, notify if readdir error
       (p/let [;; all paths, md/org included, or deleted-files would miss them
               db-files (db-async/<get-file-paths graph)
@@ -177,24 +232,52 @@
                                          :total (count files)})
         (p/do!
          (when (seq deleted-files)
-           (p/all (map (fn [path]
-                         (when-let [page-name (file-model/get-file-page path)]
-                           (println "Delete page: " page-name ", file path: " path ".")
-                           (page-handler/<delete! page-name #())))
-                       deleted-files)))
+           (async-util/<map-bounded
+            reconcile-delete-concurrency
+            (fn [path]
+              (-> (p/do
+                   (when-let [page-name (file-model/get-file-page path)]
+                     (println "Delete page: " page-name ", file path: " path ".")
+                     (page-handler/<delete! page-name #())))
+                  (p/catch (fn [e]
+                             (vswap! *perf update :delete-errors inc)
+                             (js/console.error "Reconcile: deleting the page of" path "failed:" e)))))
+            deleted-files))
          (-> (p/delay 500) ;; workaround for notification ui not showing
-             (p/then #(p/all (map (fn [file-rpath]
-                                    (p/let [stat (fs/stat repo-dir file-rpath)
-                                            content (fs/read-file repo-dir file-rpath)
-                                            type (if (db/file-exists? graph file-rpath)
-                                                   "change"
-                                                   "add")]
-                                      (handle-changed! type
-                                                       {:dir repo-dir
-                                                        :path file-rpath
-                                                        :content content
-                                                        :stat stat})))
-                                  files)))
+             (p/then
+              (fn [_]
+                (let [files-t0 (js/performance.now)]
+                  (p/let [_ (async-util/<map-bounded
+                             reconcile-concurrency
+                             (fn [file-rpath]
+                               (let [start (js/performance.now)]
+                                 (vswap! *perf update :max-queue-ms max (- start files-t0))
+                                 ;; Caught per file: one unreadable or failing file is
+                                 ;; logged and counted, and the others still load.
+                                 (-> (p/let [stat (fs/stat repo-dir file-rpath)
+                                             content (fs/read-file repo-dir file-rpath)
+                                             type (if (db/file-exists? graph file-rpath)
+                                                    "change"
+                                                    "add")
+                                             changed? (<handle-changed type
+                                                                       {:dir repo-dir
+                                                                        :path file-rpath
+                                                                        :content content
+                                                                        :stat stat})]
+                                       (when (true? changed?)
+                                         (vswap! *perf update :changed inc)))
+                                     (p/catch (fn [e]
+                                                (vswap! *perf update :errors inc)
+                                                (js/console.error "Reconcile: loading" file-rpath "failed:" e)))
+                                     (p/then (fn [_]
+                                               (vswap! *perf update :max-file-ms max
+                                                       (- (js/performance.now) start)))))))
+                             files)]
+                    (log-reconcile-perf! (assoc @*perf
+                                                :files (count files)
+                                                :deleted (count deleted-files)
+                                                :t0 t0
+                                                :files-t0 files-t0))))))
              (p/then (fn []
                        (when notification-uid
                          (prn ::init-notify)

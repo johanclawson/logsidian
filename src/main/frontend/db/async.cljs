@@ -198,9 +198,15 @@
         [?referee-b :block/refs ?refed-b]]))
 
 (defn <get-file
+  "Content of the file at `path` in the worker db, or nil when there is no such
+   file. Unlike <pull it does not transact the pulled entity into the UI conn:
+   the UI already holds every file's content from get-initial-data, and later
+   from-disk changes reach it through :sync-db-changes (pipeline/invoke-hooks
+   passes :from-disk? txs straight through), so that transact was redundant.
+   It cost one UI transact per graph file in the reopen reconcile (ADR-003)."
   [graph path]
   (when (and graph path)
-    (p/let [result (<pull graph [:file/path path])]
+    (p/let [result (state/<invoke-db-worker :thread-api/pull graph [:file/content] [:file/path path])]
       (:file/content result))))
 
 (defn <get-date-scheduled-or-deadlines
