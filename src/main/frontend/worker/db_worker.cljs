@@ -8,7 +8,7 @@
             [clojure.set]
             [clojure.string :as string]
             [datascript.core :as d]
-            [datascript.storage :refer [IStorage] :as storage]
+            [datascript.storage :as storage]
             [frontend.common.cache :as common.cache]
             [frontend.common.graph-view :as graph-view]
             [frontend.common.missionary :as c.m]
@@ -26,6 +26,7 @@
             [frontend.worker.file.reset :as file-reset]
             [frontend.worker.handler.page :as worker-page]
             [frontend.worker.handler.page.file-based.rename :as file-worker-page-rename]
+            [frontend.worker.node-cache :as node-cache]
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.rtc.asset-db-listener]
             [frontend.worker.rtc.client-op :as client-op]
@@ -137,6 +138,7 @@
     (worker-util/post-message :notification ["The SQLite db will be exported to avoid any data-loss." :warning false])
     (worker-util/post-message :export-current-db [])
     (.exec sqlite-db #js {:sql "delete from kvs"})
+    (node-cache/clear-for! sqlite-db)
     (d/reset-conn! datascript-conn db)))
 
 (defn- fix-broken-graph
@@ -166,8 +168,11 @@
 ;; prefixed "LSPERF " carrying one JSON object each. Not for merging as-is.
 (def ^:private perf-tick-ms 20)
 (defonce ^:private *perf-last-tick (atom (js/performance.now)))
+;; :restores / :restore-ms count SQLite reads (node cache misses) and their
+;; time; :cache-hits counts restores served by frontend.worker.node-cache.
+;; DataScript restore calls = restores + cache-hits.
 (defonce ^:private *perf
-  (atom {:restores 0 :restore-ms 0 :max-lag 0 :phase-start (js/performance.now)}))
+  (atom {:restores 0 :restore-ms 0 :cache-hits 0 :max-lag 0 :phase-start (js/performance.now)}))
 
 (defn- perf-log! [event m]
   (js/console.log
@@ -183,6 +188,16 @@
 (defonce ^:private perf-heartbeat
   (js/setInterval (fn [] (perf-note-lag! (js/performance.now))) perf-tick-ms))
 
+(defn- perf-node-cache
+  "Node cache gauges, summed over the open SQLite handles."
+  []
+  (let [stats (keep node-cache/stats-for
+                    (mapcat (fn [{:keys [db client-ops]}] [db client-ops])
+                            (vals @*sqlite-conns)))]
+    {:cache-entries (reduce + 0 (map :entries stats))
+     :cache-mb (/ (js/Math.round (/ (reduce + 0 (map :bytes stats)) 104857.6)) 10)
+     :cache-evictions (reduce + 0 (map :evictions stats))}))
+
 (defn perf-phase!
   "Log one record for the phase that just ended, then reset the counters.
    The stall still in progress is counted here, since the heartbeat cannot
@@ -191,22 +206,26 @@
   ([phase extra]
    (let [now (js/performance.now)
          _ (perf-note-lag! now)
-         {:keys [restores restore-ms max-lag phase-start]} @*perf]
+         {:keys [restores restore-ms cache-hits max-lag phase-start]} @*perf]
      (perf-log! "phase" (merge {:phase phase
                                 :elapsed-ms (js/Math.round (- now phase-start))
                                 :max-lag-ms (js/Math.round (max 0 max-lag))
                                 :restores restores
-                                :restore-ms (js/Math.round restore-ms)}
+                                :restore-ms (js/Math.round restore-ms)
+                                :cache-hits (or cache-hits 0)}
+                               (perf-node-cache)
                                extra))
-     (swap! *perf assoc :restores 0 :restore-ms 0 :max-lag 0 :phase-start now))))
+     (swap! *perf assoc :restores 0 :restore-ms 0 :cache-hits 0 :max-lag 0 :phase-start now))))
 
 (defonce ^:private perf-activity
-  ;; Once a second, report any window with restores or a stall over 50 ms,
-  ;; so work after startup (reconcile, queries) is visible too.
+  ;; Once a second, report any window with restores (from SQLite or the node
+  ;; cache) or a stall over 50 ms, so work after startup (reconcile, queries)
+  ;; is visible too.
   (js/setInterval
    (fn []
-     (let [{:keys [restores max-lag]} @*perf]
-       (when (or (pos? restores) (> max-lag 50)) (perf-phase! "activity"))))
+     (let [{:keys [restores cache-hits max-lag]} @*perf]
+       (when (or (pos? restores) (pos? cache-hits) (> max-lag 50))
+         (perf-phase! "activity"))))
    1000))
 
 ;; Time spent in the SQLite storage adapter's -store (transit-write + upsert),
@@ -215,23 +234,27 @@
 ;; ---------------------------------------------------------------------------
 
 (defn- restore-data-from-addr*
-  "Update sqlite-cli/restore-data-from-addr when making changes"
+  "Update sqlite-cli/restore-data-from-addr when making changes. Returns
+   [data chars], chars being the length of the stored text (it sizes the node
+   cache entry), or nil when there is no row."
   [db addr]
   (assert (some? db) "sqlite db not exists")
   (when-let [result (-> (.exec db #js {:sql "select content, addresses from kvs where addr = ?"
                                        :bind #js [addr]
                                        :rowMode "array"})
                         first)]
-    (let [[content addresses] (bean/->clj result)
-          addresses (when addresses
-                      (js/JSON.parse addresses))
+    (let [[content addresses-json] (bean/->clj result)
+          addresses (when addresses-json
+                      (js/JSON.parse addresses-json))
           data (sqlite-util/transit-read content)]
-      (if (and addresses (map? data))
-        (assoc data :addresses addresses)
-        data))))
+      [(if (and addresses (map? data))
+         (assoc data :addresses addresses)
+         data)
+       (+ (count content) (count addresses-json))])))
 
 (defn restore-data-from-addr
-  "Timed wrapper around restore-data-from-addr* (perf instrumentation)."
+  "Timed wrapper around restore-data-from-addr* (perf instrumentation). Only
+   node cache misses get here."
   [db addr]
   (let [t0 (js/performance.now)
         r (restore-data-from-addr* db addr)]
@@ -240,11 +263,20 @@
                              (update :restore-ms + (- (js/performance.now) t0)))))
     r))
 
+(defn- perf-note-cache-hit! []
+  (swap! *perf update :cache-hits (fnil inc 0)))
+
 (defn new-sqlite-storage
-  "Update sqlite-cli/new-sqlite-storage when making changes"
+  "Update sqlite-cli/new-sqlite-storage when making changes. The node cache in
+   front (frontend.worker.node-cache) is worker-only and changes no results:
+   every store drops its addresses from the cache before the upsert."
   [^Object db]
-  (reify IStorage
-    (-store [_ addr+data-seq _delete-addrs]
+  (node-cache/cached-storage
+   (node-cache/cache-for db)
+   {:read-row (fn [addr] (restore-data-from-addr db addr))
+    :on-hit perf-note-cache-hit!
+    :write-rows!
+    (fn [addr+data-seq _delete-addrs]
       (let [t0 (js/performance.now)
             data (map
                   (fn [[addr data]]
@@ -260,10 +292,7 @@
         (swap! *perf-store (fn [m] (-> m
                                        (update :calls inc)
                                        (update :ms + (- (js/performance.now) t0)))))
-        r))
-
-    (-restore [_ addr]
-      (restore-data-from-addr db addr))))
+        r))}))
 
 (defn- close-db-aux!
   [repo ^Object db ^Object search ^Object client-ops]
@@ -272,6 +301,9 @@
   (swap! *client-ops-conns dissoc repo)
   (file-paths/forget! repo)
   (search-indexer/close! repo)
+  ;; Old db values may outlive the conn; their caches should not.
+  (node-cache/clear-for! db)
+  (node-cache/clear-for! client-ops)
   (when db (.close db))
   (when search (.close search))
   (when client-ops (.close client-ops))
@@ -332,6 +364,8 @@
       (println :debug "gc current graph")
       (doseq [db (if @*publishing? [sqlite-db] [sqlite-db client-ops-db])]
         (sqlite-gc/gc-kvs-table! db {:full-gc? full-gc?})
+        ;; gc deletes kvs rows behind the storage's back
+        (node-cache/clear-for! db)
         (.exec db "VACUUM"))
       (ldb/transact! datascript-conn [{:db/ident :logseq.kv/graph-last-gc-at
                                        :kv/value (common-util/time-ms)}]))))
@@ -566,6 +600,7 @@
     (try
       (let [t0 (js/performance.now)
             restores0 (:restores @*perf)
+            cache-hits0 (:cache-hits @*perf)
             plan (journal-window/plan (first inputs) (rest inputs))
             stats (if (= ::journal-window/no-match plan)
                     ::journal-window/no-match
@@ -581,7 +616,8 @@
                            :blocks (:blocks stats)
                            :hits (:hits stats)
                            :ms (/ (js/Math.round (* 10 (- (js/performance.now) t0))) 10)
-                           :restores (- (:restores @*perf) restores0)}))))
+                           :restores (- (:restores @*perf) restores0)
+                           :cache-hits (- (or (:cache-hits @*perf) 0) (or cache-hits0 0))}))))
           stats))
       (catch :default e
         (js/console.error "q-fastpath failed, running d/q instead" e)
@@ -776,7 +812,10 @@
   [repo data]
   (when-not (string/blank? repo)
     (p/let [pool (<get-opfs-pool repo)]
-      (<import-db pool data)
+      ;; Still not awaited. The import replaces the file under any open handle
+      ;; of this repo, so drop that handle's cached rows once it has landed.
+      (p/then (<import-db pool data)
+              (fn [_] (node-cache/clear-for! (worker-state/get-sqlite-conn repo :db))))
       nil)))
 
 (def-thread-api :thread-api/search-blocks
@@ -822,7 +861,7 @@
     (reset! *perf-store {:ms 0 :calls 0})
     (vreset! search-indexer/*sync-perf {:ms 0 :rows 0})
     (let [t0 (js/performance.now)
-          {restores0 :restores restore-ms0 :restore-ms} @*perf]
+          {restores0 :restores restore-ms0 :restore-ms cache-hits0 :cache-hits} @*perf]
       (try
         (worker-util/profile
          "apply outliner ops"
@@ -839,7 +878,7 @@
         (finally
           (let [{store-ms :ms store-calls :calls} @*perf-store
                 {search-ms :ms search-rows :rows} @search-indexer/*sync-perf
-                {:keys [restores restore-ms]} @*perf
+                {:keys [restores restore-ms cache-hits]} @*perf
                 round #(js/Math.round (or % 0))]
             (js/console.log
              (str "LSPERF "
@@ -853,7 +892,8 @@
                              :search-ms (round search-ms)
                              :search-rows search-rows
                              :restores (- (or restores 0) (or restores0 0))
-                             :restore-ms (round (- (or restore-ms 0) (or restore-ms0 0)))}))))))))))
+                             :restore-ms (round (- (or restore-ms 0) (or restore-ms0 0)))
+                             :cache-hits (- (or cache-hits 0) (or cache-hits0 0))}))))))))))
 
 (def-thread-api :thread-api/file-writes-finished?
   [repo]
