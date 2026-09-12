@@ -1131,3 +1131,60 @@ gives 6.5× the stall, and two thirds of it is restoring nodes from SQLite.
 Extrapolated to 100k journals: over a minute of blocked worker on every
 reopen. This is the one stall on the everyday path that scales with the
 graph.
+
+## Build (b): the perf-only release candidate (2026-09-12)
+
+Branch `perf/release-b` at `4a7a9fa` = `046febb` (the last commit before the
+reconcile work) + `de62e81` (test-only) + the bench from the perf branch. No
+file-write path is changed and the promesa patch is not in it
+(`bench/decision-shipping.md`). Built with `LOWMEM=1`, `--debug`.
+
+- **Tests:** 391 tests, 2 574 assertions, 0 failures, 1 error:
+  `get-class-objects-test`, a DB-graph test; no commit in (b) touches it or
+  the code it tests.
+- **Walk at 10k, vs RC2:** 179.8 → 158.1 s; longest slice 722 → 317 ms; p99
+  233 → 220 ms. The worker's longest stall, 9.7 → 8.9 s, is the known
+  `get-initial-data` at 10k, not a slice.
+- **Boot, 3 launches:** longest boot task 2 697 / 2 694 / 2 794 ms.
+- **Node LRU (gctest):** cold 1 290 restores, then 0 warm, 0 after a forced
+  GC, 0 again.
+- **Release gate: pass.** Reopen of the g-real copy: 569 files, 0 changed,
+  added or removed, 0 new backups.
+
+| safety scenario | master | build (b) | RC3 |
+|---|---|---|---|
+| offline-edit-reopen | fail | pass | pass |
+| idrepair-race | pass | pass | pass |
+| live-external-edit | pass | pass | pass |
+| config-offline-then-delete-home | fail | fail | pass |
+| burst-writes | fail | pass | pass |
+| typing-roundtrip | pass | pass | pass |
+| two-ops-one-flush | fail | pass | pass |
+| typing-through-external-rewrite | fail | fail | pass |
+
+(b)'s two failures are the upstream bugs master has too; in both the other
+text survives in `logseq/bak/` (`~/.cache/lsbench/safety/20260912-172244`).
+
+### The typing "regression" was the harness
+
+Typing-phase UI long tasks on g-real had gone 5 (RC2) → 35 (RC3) → 68 (b),
+although (b)'s app code is a subset of RC2's. Outside the typing phase all
+three builds had the same UI busy time (30-34 s on the walk, 10-15 s on
+g-real). Cause: every run typed 350 characters into the same block of the
+reused graph copies and never removed them. By 17:30 the g-real block had
+2 008 characters and the g-10k one 2 911, and react-textarea-autosize
+re-measures the whole textarea per keystroke (the RC3 profile's 23 %).
+
+The harness now puts the block back (6d14667). A/B on g-real after stripping
+both blocks (`~/.cache/lsbench/abtype`), 10 bursts of 40 keystrokes, block
+restored after every run:
+
+| run | typing-phase long tasks | ms | longest |
+|---|---|---|---|
+| (b) 1 | 0 | 0 | – |
+| RC3 1 | 1 | 106 | 106 |
+| (b) 2 | 1 | 105 | 105 |
+| RC3 2 | 1 | 179 | 179 |
+
+Neither build regresses typing. Typing numbers are comparable only between
+runs on the same block length.
