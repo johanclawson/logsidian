@@ -287,14 +287,28 @@
                    (js/console.error error))))))
 
 (defn alter-files
+  "Writes files, [path content] pairs, as guarded writes.
+   With :base in opts (a page save from the worker, which posts one file per
+   message), base is every write's expected content (nil: a new file) and
+   the db is not updated: the worker already put the content into
+   :file/content when it stamped the base (frontend.worker.file/send-proposal!).
+   Advancing it again here would let a refused, stale proposal overwrite the
+   disk content its refusal's reparse installed. Without :base the expected
+   content is the db's current content, and update-db? (default true) puts
+   the new content into the db."
   [repo files {:keys [reset? update-db?]
                :or {reset? false
                     update-db? true}
                :as opts}]
   ;; old file content
-  (let [file->content (let [paths (map first files)]
-                        (zipmap paths
-                                (map (fn [path] (db/get-file repo path)) paths)))]
+  (let [stamped? (contains? opts :base)
+        update-db? (and update-db? (not stamped?))
+        file->content (if stamped?
+                        (zipmap (map (comp common-util/path-normalize first) files)
+                                (repeat (:base opts)))
+                        (let [paths (map first files)]
+                          (zipmap paths
+                                  (map (fn [path] (db/get-file repo path)) paths))))]
     ;; update db
     (when update-db?
       (p/all

@@ -13,9 +13,13 @@
 (defmulti handle identity)
 
 (defmethod handle :write-files [_ _worker data]
-  (let [{:keys [request-id page-id repo files]} data]
+  (let [{:keys [request-id page-id repo files]} data
+        ;; :base, the file content the worker stamped when it serialized
+        ;; the page (frontend.worker.file/send-proposal!), is the guarded
+        ;; write's expected content; nil means a new file
+        opts (if (contains? data :base) {:base (:base data)} {})]
     (->
-     (p/let [_ (file-handler/alter-files repo files {})]
+     (p/let [_ (file-handler/alter-files repo files opts)]
        (state/<invoke-db-worker :thread-api/page-file-saved request-id page-id))
      (p/catch (fn [error]
                 (notification/show!

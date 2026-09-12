@@ -35,6 +35,15 @@
       (string? old-content) old-content
       (nil? old-content) {:absent true})))
 
+(defn- log-guard!
+  "One console line per guarded write outcome, which the bench harness
+   collects like the LSPERF lines: LSGUARD {\"path\",\"result\",\"copy\"}, copy
+   being the conflict copy's path, or null."
+  [rpath outcome copy-path]
+  (js/console.log
+   (str "LSGUARD "
+        (js/JSON.stringify (clj->js {:path rpath :result outcome :copy copy-path})))))
+
 (defn- <handle-refused-write!
   "A guarded writeFile refused to write rpath: the disk no longer holds what the
    app last saw (\"mismatch\"), or a new file's path is taken (\"exists\"). The
@@ -61,6 +70,7 @@
                           (p/catch (fn [error]
                                      (log/error :write-file/conflict-copy-failed {:path rpath :error error})
                                      nil)))]
+      (log-guard! rpath outcome copy-path)
       (if (string? copy-path)
         (do
           (state/pub-event! [:notification/show
@@ -112,6 +122,7 @@
             (case outcome
               "written"
               (do
+                (log-guard! rpath outcome nil)
                 (when-not skip-transact?
                   (db/set-file-last-modified-at! repo rpath (gobj/get result "mtime")))
                 (when ok-handler
@@ -128,6 +139,7 @@
                                  (or (when (object? result) (gobj/get result "error"))
                                      (str "unexpected result " (pr-str outcome))))
                     error (ex-info message {:path file-fpath :result outcome})]
+                (log-guard! rpath "io-error" nil)
                 (state/pub-event! [:notification/show {:content message
                                                        :status :error
                                                        :clear? false}])

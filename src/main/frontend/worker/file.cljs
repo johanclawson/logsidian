@@ -3,7 +3,6 @@
   (:require [cljs-time.coerce :as tc]
             [cljs-time.core :as t]
             [clojure.core.async :as async]
-            [clojure.set :as set]
             [clojure.string :as string]
             [datascript.core :as d]
             [frontend.common.async-util :as async-util]
@@ -15,7 +14,6 @@
             [lambdaisland.glogi :as log]
             [logseq.common.date :as common-date]
             [logseq.common.path :as path]
-            [logseq.common.util :as common-util]
             [logseq.db :as ldb]
             [logseq.db.file-based.entity-util :as file-entity-util]
             [logseq.outliner.tree :as otree]
@@ -113,9 +111,33 @@
 
 (defn- remove-transit-ids [block] (dissoc block :db/id :block/file))
 
+(defn send-proposal!
+  "Posts a page's new file content to the renderer (:write-files), which writes
+   it through the guarded writeFile against :base, and stamps that base.
+   The base is the file's :file/content in the worker's db at serialization:
+   the content the page's previous proposal left there (below), or the disk
+   content a load or a reset from disk put there. Then :file/content becomes
+   this proposal, so the next serialization of the page (in the same flush, a
+   later one, or after a stall) takes it as its base. A reset from disk
+   overwrites :file/content with the disk content: a proposal serialized
+   before the reset carries a pre-reset base and is refused, one serialized
+   after it carries the disk content and is written.
+   The transact touches only the file entity: no page is updated, so no page
+   save follows (pipeline/invoke-hooks-default), and it is the tx the
+   renderer's alter-files used to send through db/set-file-content!."
+  [repo conn request-id page-id file-path content]
+  (let [base (:file/content (d/entity @conn [:file/path file-path]))]
+    (wfu/post-message :write-files {:request-id request-id
+                                    :page-id page-id
+                                    :repo repo
+                                    :files [[file-path content]]
+                                    :base base})
+    (ldb/transact! conn [{:file/path file-path :file/content content}] {:skip-refresh? true})))
+
 (defn- save-tree-aux!
-  [repo db page-block tree blocks-just-deleted? context request-id]
-  (let [page-block (d/pull db '[*] (:db/id page-block))
+  [repo conn page-block tree blocks-just-deleted? context request-id]
+  (let [db @conn
+        page-block (d/pull db '[*] (:db/id page-block))
         init-level 1
         file-db-id (-> page-block :block/file :db/id)
         file-path (-> (d/entity db file-db-id) :file/path)
@@ -127,14 +149,8 @@
                                       (string/triml))
                                      (common-file/tree->file-content repo db tree {:init-level init-level} context))]
                    (when-not (and (string/blank? new-content) (not blocks-just-deleted?))
-                     (let [files [[file-path new-content]]]
-                       (when (seq files)
-                         (let [page-id (:db/id page-block)]
-                           (wfu/post-message :write-files {:request-id request-id
-                                                           :page-id page-id
-                                                           :repo repo
-                                                           :files files})
-                           :sent)))))
+                     (send-proposal! repo conn request-id (:db/id page-block) file-path new-content)
+                     :sent))
                  ;; In e2e tests, "card" page in db has no :file/path
                  (js/console.error "File path from page-block is not valid" page-block tree))]
     (when-not (= :sent result)          ; page may not exists now
@@ -144,7 +160,7 @@
   [repo conn page-block tree blocks-just-deleted? context request-id]
   {:pre [(map? page-block)]}
   (when repo
-    (let [ok-handler #(save-tree-aux! repo @conn page-block tree blocks-just-deleted? context request-id)
+    (let [ok-handler #(save-tree-aux! repo conn page-block tree blocks-just-deleted? context request-id)
           file (or (:block/file page-block)
                    (when-let [page-id (:db/id (:block/page page-block))]
                      (:block/file (d/entity @conn page-id))))]
@@ -183,16 +199,39 @@
                   (dissoc-request! request-id)))))))
       (dissoc-request! request-id))))
 
+(defn coalesce-page-writes
+  "The page writes of one flush, [repo page-id outliner-op epoch request-id]
+   tuples in arrival order, as {:keep tuples :drop-ids request-ids}: one
+   tuple per [repo page-id], the last one (its op decides
+   blocks-just-deleted?, right for any op sequence), carrying the highest
+   request id of its page so that acknowledging it clears the page's older
+   requests (dissoc-request!), and the other request ids to drop.
+   One serialization per page and flush means one proposal per page, so a
+   write cannot be refused against the page's own first write. Deduping by
+   [repo page-id outliner-op] let type-then-Enter (:save-block then
+   :insert-blocks) through as two proposals with the same base."
+  [pages]
+  (let [pages (vec pages)
+        page-key (fn [[repo page-id]] [repo page-id])
+        groups (group-by page-key pages)
+        ;; index of each page's last tuple, to keep arrival order
+        last-index (reduce-kv (fn [m i tuple] (assoc m (page-key tuple) i)) {} pages)
+        keep (->> last-index
+                  (sort-by val)
+                  (mapv (fn [[k i]]
+                          (assoc (nth pages i) 4 (apply max (map last (get groups k)))))))
+        keep-ids (set (map last keep))]
+    {:keep keep
+     :drop-ids (into #{} (comp (map last) (remove keep-ids)) pages)}))
+
 (defn write-files!
   [conn pages context]
   (when (seq pages)
-    (let [all-request-ids (set (map last pages))
-          distincted-pages (common-util/distinct-by #(take 3 %) pages)
-          repeated-ids (set/difference all-request-ids (set (map last distincted-pages)))]
-      (doseq [id repeated-ids]
+    (let [{:keys [keep drop-ids]} (coalesce-page-writes pages)]
+      (doseq [id drop-ids]
         (dissoc-request! id))
 
-      (doseq [[repo page-id outliner-op _time request-id] distincted-pages]
+      (doseq [[repo page-id outliner-op _time request-id] keep]
         (try (do-write-file! repo conn page-id outliner-op context request-id)
              (catch :default e
                (worker-util/post-message :notification
