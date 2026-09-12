@@ -549,6 +549,45 @@ The next candidates are:
   linear shortcut registration and a Map LRU for the block AST cache (about
   0.5 s profiled together).
 
+### Data safety: step-4 build vs master (`bench/lssafety.js`, 2026-09-12)
+
+First runs of the data-safety harness (`~/.cache/lsbench/safety/20260912-124151`
+= the step-4 build, `…-125731` = master's launcher build). It uses generated
+graph copies; files are checked byte for byte after the app closes. Neither
+build has the write guard yet.
+
+| scenario | step-4 build | master |
+|---|---|---|
+| offline-edit-reopen | pass | **fail**: search misses the offline edits |
+| idrepair-race | pass | pass |
+| live-external-edit | pass | pass |
+| config-offline-then-delete-home | **fail** | **fail** |
+| burst-writes | pass | **fail**: typed text missing or duplicated |
+| typing-roundtrip | pass | pass |
+| two-ops-one-flush | **fail**: one keystroke lost | **fail**: other lines changed |
+| typing-through-external-rewrite | **fail** | **fail** |
+
+- **Search after offline edits.** Master's index does not pick up files
+  edited while the app was closed. The step-4 build's per-transaction
+  indexing (`:from-disk?` transactions included) does.
+- **config-offline-then-delete-home is an upstream data-loss bug.** On
+  reopen, deleting the home page (its file was deleted offline) rewrote
+  `config.edn` from the app's stale copy. The offline edit ended up only in
+  `logseq/bak/`. The write guard targets this.
+- **typing-through-external-rewrite is the upstream overwrite.** A save
+  proposal made before an external rewrite replaced it on disk. The external
+  text survives only in `logseq/bak/`. This is the guard's main target.
+- **two-ops-one-flush on the step-4 build is not a write-path failure.**
+  The harness typed `two qstcdc4d61a`, and the file holds `two qstdc4d61a`,
+  which is exactly what the editor had. One keystroke was lost while the new
+  block's editor was being set up after Enter. The harness now checks the
+  file against the editor's actual text, and reports lost keystrokes as a
+  separate warning.
+- **The errors both builds logged** ("Unexpected webworker error",
+  "Promise error") come about 1 s after the harness closes the priming
+  launch. They are shutdown noise from worker calls still pending, and are
+  now counted separately.
+
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
 `slow-slice` split of the 258 slices over 100 ms: median 167 ms = **index 7 ms
