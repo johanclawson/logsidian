@@ -1283,6 +1283,11 @@ scenarios['config-offline-then-delete-home'] = {
     ctx.write(CFG, cfg);
     ctx.unlink(HOMEP);
     ctx.step('offline: config.edn edited, Home.md deleted');
+    // Deleting the home page makes the app rewrite config.edn from its copy
+    // from before the offline edit. On a guarded build that write is refused
+    // (a conflict copy under logseq/bak/conflicts/), which is the correct
+    // outcome here; the pass condition is that the file keeps the edit.
+    ctx.stagesConflict = true;
     const b = await reopen(ctx);
     await sleep(3000);
     await diskQuiet(ctx.graph, 3000, 30000);
