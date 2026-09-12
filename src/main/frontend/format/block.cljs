@@ -1,7 +1,6 @@
 (ns frontend.format.block
   "Block code needed by app but not graph-parser"
   (:require [cljs-time.format :as tf]
-            [cljs.cache :as cache]
             [clojure.string :as string]
             [frontend.common.cache :as common.cache]
             [frontend.config :as config]
@@ -95,7 +94,7 @@ and handles unexpected failure."
           block (dissoc block :block.temp/ast-body :block/level)]
       (if uuid (assoc block :block/uuid uuid) block))))
 
-(defonce *blocks-ast-cache (volatile! (cache/lru-cache-factory {} :threshold 5000)))
+(defonce *blocks-ast-cache (volatile! (common.cache/lru-cache-factory {} :threshold 5000)))
 
 (defn- parse-title-and-body-helper
   [format content]
