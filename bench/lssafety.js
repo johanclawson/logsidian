@@ -1,0 +1,1332 @@
+#!/usr/bin/env node
+// lssafety.js - data-safety end-to-end harness for Logsidian file graphs.
+//
+// README
+// ======
+// The regression gate for changes that touch file writes and the reopen
+// reconcile. The bar: an external or offline edit must never be lost from its
+// file. A copy in logseq/bak/ does NOT count as preserved (it is reported, so a
+// failure says whether the edit is recoverable).
+//
+// Every scenario generates a fresh small graph copy from a template (30
+// journals, 10 pages with block refs, a "Race Page" with an id-less block, a
+// Home page set as :default-home and favourite in logseq/config.edn), opens it
+// once in the app (the "prime" launch: Add new graph -> parse), then acts,
+// closes the app and compares every file on disk byte for byte against what
+// it must contain. It records every file's sha256 before/after, lists the new
+// files in logseq/bak/, diffs unexpected changes and captures the app's
+// console errors (LSERR, console.error, pageerror).
+//
+//   1 offline-edit-reopen   Edits made while the app is closed (3 journals, 2
+//     pages: append, change a block, delete a block) survive the reopen
+//     reconcile byte for byte, and the app's search finds each new token (the
+//     DB really took the edits in, it did not just leave the files alone).
+//   2 idrepair-race         The known missing-id repair race: an early journal
+//     J gains, offline, a ((uuid)) ref to a block B whose file (P) has no id::,
+//     while P is also edited offline. On reopen the reconcile handles J first
+//     (journals sort before pages) and the repair writes id:: into P from the
+//     DB's OLD copy of P. Passes only if P's offline edit is still in P (an
+//     added "id:: <uuid>" line is allowed). B's uuid is only known at runtime
+//     (a file cannot name the DB uuid of an id-less block), so the prime launch
+//     reads it from the DOM; :default-home is the Race Page so B is loaded in
+//     the UI db when the reconcile runs (set-missing-block-ids! reads the UI db).
+//   3 live-external-edit    With the app open and idle, a journal is rewritten
+//     from outside (write-temp-and-rename, as OneDrive or another PC does). After
+//     typing into a different page the external version must still be on disk.
+//     Typing into the SAME page right after an external rewrite (race: before
+//     the watcher's 2 s awaitWriteFinish fires) and after the UI showed it
+//     (settled) is recorded as "policy": outcome merged / backup+overwrite /
+//     typed-dropped, with the bak copies; the policy decides pass/fail later.
+//   4 config-offline-then-delete-home  config.edn is edited offline (comment +
+//     key) and the :default-home page's file is deleted offline. On reopen the
+//     page delete runs set-config! (:default-home) from the DB's old config
+//     before the reconcile has read the new one. config.edn must still carry
+//     the offline edit (the app may change :default-home around it).
+//   5 burst-writes          Several saves into one page within ~1 s while an
+//     external writer appends to a different file: every typed token is in
+//     the page exactly once and the other file is exactly base + appends.
+//   6 typing-roundtrip      Typing into a journal, close, reopen: the typed text
+//     is in the file exactly once, the reopen does not rewrite the file, and no
+//     other file changed.
+//
+// Statuses: pass / fail / error (harness trouble: the app could not be driven).
+// Checks carry a severity: fail (gates), warn (reported), policy, info.
+//
+// usage: node lssafety.js [--only=a,b] [--out=DIR] [--timeout=SEC]
+//                         [--same-page-delay=MS] [--list] [--selftest=DIR]
+//   --out       run directory, must be under ~/.cache/lsbench
+//               (default ~/.cache/lsbench/safety/<timestamp>)
+//   --timeout   per scenario, default 900 s
+//   --selftest  checks the pure helpers (template, edits, verify) in DIR; no app
+// env: LSSAFETY_APP or LSBENCH_APP = app binary (default: the perf worktree's
+//      build), LSSAFETY_PLAYWRIGHT = playwright module path.
+// Exit code: 0 all pass, 1 any fail/error, 2 usage or refused path.
+//
+// Launch code copied (not shared) from lsbench.js so lsbench.js stays as is:
+// Playwright _electron, --ozone-platform=headless, isolated HOME/XDG dirs and
+// --user-data-dir, dialog stub + "Add new graph" for the first open, LSPERF /
+// LSUI / LSSEARCH / LSERR console records, thread CPU from /proc (restricted
+// here to the launched app's own process tree).
+'use strict';
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const crypto = require('crypto');
+
+const HOME = os.homedir();
+const BASE = path.join(HOME, '.cache', 'lsbench');
+const DEFAULT_APP = path.join(HOME, 'dev/logsidian-perf/static/out/Logseq-linux-x64/Logseq');
+const APP = process.env.LSSAFETY_APP || process.env.LSBENCH_APP || DEFAULT_APP;
+const SCENARIOS = ['offline-edit-reopen', 'idrepair-race', 'live-external-edit',
+  'config-offline-then-delete-home', 'burst-writes', 'typing-roundtrip'];
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const errText = (e) => String((e && e.message) || e);
+// every await on the app is bounded: a wedged main thread must not hang the run
+const within = (p, ms, what) => {
+  let t;
+  return Promise.race([p, new Promise((_, rej) => {
+    t = setTimeout(() => rej(new Error(`${what}: no answer in ${ms} ms`)), ms);
+    t.unref();
+  })]).finally(() => clearTimeout(t));
+};
+const sha256 = (buf) => crypto.createHash('sha256').update(buf).digest('hex');
+const log = (...a) => console.error(`[lssafety ${new Date().toISOString().slice(11, 19)}]`, ...a);
+
+// ---- path safety ---------------------------------------------------------------
+// realpath of the deepest existing ancestor plus the rest, so symlinks are seen
+function realish(p) {
+  let cur = path.resolve(p);
+  const rest = [];
+  while (!fs.existsSync(cur)) {
+    rest.unshift(path.basename(cur));
+    const up = path.dirname(cur);
+    if (up === cur) break;
+    cur = up;
+  }
+  return path.join(fs.realpathSync(cur), ...rest);
+}
+const under = (p, dir) => p === dir || p.startsWith(dir + path.sep);
+// Refuses ~/OneDrive (Johan's real graph) anywhere in the path or its realpath,
+// ~/.claude and the main checkout; with requireBase, anything outside ~/.cache/lsbench.
+function assertSafePath(p, { requireBase = true } = {}) {
+  const abs = path.resolve(p);
+  const real = realish(abs);
+  for (const x of [abs, real]) {
+    if (/(^|\/)onedrive(\/|$)/i.test(x) || under(x, path.join(HOME, 'OneDrive'))) throw new Error(`refusing a path under ~/OneDrive: ${p}`);
+    if (under(x, path.join(HOME, '.claude'))) throw new Error(`refusing a path under ~/.claude: ${p}`);
+    if (under(x, path.join(HOME, 'dev', 'logsidian'))) throw new Error(`refusing a path in the main checkout: ${p}`);
+  }
+  if (requireBase && !under(real, realish(BASE)) || (requireBase && real === realish(BASE))) {
+    throw new Error(`refusing a path outside ${BASE}: ${p}`);
+  }
+  return abs;
+}
+
+// ---- template graph ------------------------------------------------------------
+const JOURNAL_DAYS = 30;
+const PAGES = 10;
+const two = (n) => String(n).padStart(2, '0');
+const isoDay = (d) => `2026-07-${two(d)}`;
+const journalRel = (d) => `journals/2026_07_${two(d)}.md`;
+const pageName = (n) => `Page ${two(n)}`;
+const pageRel = (name) => `pages/${name}.md`;
+// deterministic uuids for blocks that carry id:: in their file
+const uuidFor = (n) => `6a5afe00-0000-4000-8000-${String(n).padStart(12, '0')}`;
+const RACE_PAGE = 'Race Page';
+const RACE_B = 'Race target block B without id';
+
+function configEdn({ home = 'Home' } = {}) {
+  return [
+    '{:meta/version 1',
+    ' :preferred-format :markdown',
+    ' :preferred-workflow :now',
+    ' :hidden []',
+    ' :journal/page-title-format "yyyy-MM-dd"',
+    ' :journal/file-name-format "yyyy_MM_dd"',
+    ' :file/name-format :triple-lowbar',
+    ' :export/bullet-indentation :tab',
+    ' :feature/enable-journals? true',
+    ' :favorites ["home"]',
+    ` :default-home {:page "${home}"}}`,
+    '',
+  ].join('\n');
+}
+// Files are written the way the app serialises them (tree->file-content: "- "
+// bullets, tab indentation, "  " before a level-1 block's property lines, no
+// trailing newline), so a page the app rewrites differs only where it must.
+function journalContent(d) {
+  const D = isoDay(d);
+  const target = ((d - 1) % PAGES) + 1;
+  const lines = [
+    `- Journal ${D} note alpha`,
+    `- Journal ${D} links [[${pageName(target)}]]`,
+    `\t- Journal ${D} child block`,
+    `- Journal ${D} block to change`,
+    `- Journal ${D} block to delete`,
+  ];
+  if (d % 3 === 0) lines.push(`- Journal ${D} refers to ((${uuidFor(100 + target)}))`);
+  return lines.join('\n');
+}
+function pageContent(n) {
+  const N = pageName(n);
+  return [
+    `- ${N} block one plain text`,
+    `- ${N} block two with id`,
+    `  id:: ${uuidFor(100 + n)}`,
+    `- ${N} block three links [[${pageName((n % PAGES) + 1)}]]`,
+    `\t- ${N} child block`,
+    `- ${N} block to change`,
+    `- ${N} block to delete`,
+    `- ${N} block four repair candidate without id`,
+  ].join('\n');
+}
+function makeTemplate({ home = 'Home' } = {}) {
+  const files = { 'logseq/config.edn': configEdn({ home }) };
+  for (let d = 1; d <= JOURNAL_DAYS; d++) files[journalRel(d)] = journalContent(d);
+  for (let n = 1; n <= PAGES; n++) files[pageRel(pageName(n))] = pageContent(n);
+  files[pageRel('Home')] = ['- Safety graph home page', `- Start at [[${pageName(1)}]] or [[${isoDay(1)}]]`].join('\n');
+  files[pageRel(RACE_PAGE)] = ['- Race page intro block', `- ${RACE_B}`, '- Race page tail block'].join('\n');
+  return { files, home };
+}
+function writeFiles(dir, files) {
+  for (const [rel, content] of Object.entries(files)) {
+    const abs = path.join(dir, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, content);
+  }
+}
+
+// ---- edits (pure string helpers) -----------------------------------------------
+function appendBlock(content, text) {
+  return `${content}${!content || content.endsWith('\n') ? '' : '\n'}- ${text}`;
+}
+function topLevelIndex(lines, prefix) {
+  const hits = [];
+  lines.forEach((l, i) => { if (l.startsWith(`- ${prefix}`)) hits.push(i); });
+  if (hits.length !== 1) throw new Error(`expected one block starting "${prefix}", found ${hits.length}`);
+  return hits[0];
+}
+function replaceBlockLine(content, prefix, newText) {
+  const lines = content.split('\n');
+  lines[topLevelIndex(lines, prefix)] = `- ${newText}`;
+  return lines.join('\n');
+}
+// removes a top-level block with its property lines and children
+function deleteBlock(content, prefix) {
+  const lines = content.split('\n');
+  const i = topLevelIndex(lines, prefix);
+  let j = i + 1;
+  while (j < lines.length && lines[j] !== '' && !lines[j].startsWith('- ')) j++;
+  lines.splice(i, j - i);
+  return lines.join('\n');
+}
+const countOf = (s, t) => (t ? s.split(t).length - 1 : 0);
+
+// ---- snapshots and diffs -------------------------------------------------------
+function walk(dir, rel = '', out = []) {
+  let ents = [];
+  try { ents = fs.readdirSync(path.join(dir, rel), { withFileTypes: true }); } catch (_) { return out; }
+  for (const e of ents) {
+    const r = rel ? `${rel}/${e.name}` : e.name;
+    if (e.isDirectory()) walk(dir, r, out);
+    else if (e.isFile()) out.push(r);
+  }
+  return out;
+}
+function snapshotDir(dir) {
+  const m = new Map();
+  for (const r of walk(dir).sort()) {
+    try {
+      const buf = fs.readFileSync(path.join(dir, r));
+      m.set(r, { sha: sha256(buf), size: buf.length, text: buf.toString('utf8') });
+    } catch (_) { /* vanished meanwhile */ }
+  }
+  return m;
+}
+function classify(rel) {
+  if (rel.startsWith('logseq/bak/')) return 'bak';
+  if (rel.startsWith('logseq/.recycle/')) return 'recycle';
+  if (rel.startsWith('logseq/version-files/')) return 'version';
+  if (rel.split('/').some((s) => s.startsWith('.'))) return 'hidden';
+  return 'graph';
+}
+function diffSnapshots(a, b) {
+  const out = { added: [], removed: [], changed: [] };
+  for (const [r, x] of b) {
+    if (!a.has(r)) out.added.push(r);
+    else if (a.get(r).sha !== x.sha) out.changed.push(r);
+  }
+  for (const r of a.keys()) if (!b.has(r)) out.removed.push(r);
+  return out;
+}
+// LCS line diff, changed lines with one line of context, capped
+function lineDiff(a, b, cap = 40) {
+  const x = (a || '').split('\n');
+  const y = (b || '').split('\n');
+  if (x.length * y.length > 4e6) return [`(too large to diff: ${x.length} vs ${y.length} lines)`];
+  const n = x.length; const m = y.length;
+  const L = Array.from({ length: n + 1 }, () => new Uint16Array(m + 1));
+  for (let i = n - 1; i >= 0; i--) for (let j = m - 1; j >= 0; j--) L[i][j] = x[i] === y[j] ? L[i + 1][j + 1] + 1 : Math.max(L[i + 1][j], L[i][j + 1]);
+  const ops = [];
+  let i = 0; let j = 0;
+  while (i < n || j < m) {
+    if (i < n && j < m && x[i] === y[j]) { ops.push([' ', x[i]]); i++; j++; }
+    else if (i < n && (j === m || L[i + 1][j] >= L[i][j + 1])) { ops.push(['-', x[i]]); i++; }
+    else { ops.push(['+', y[j]]); j++; }
+  }
+  const keep = ops.map((o, k) => o[0] !== ' ' || (ops[k - 1] && ops[k - 1][0] !== ' ') || (ops[k + 1] && ops[k + 1][0] !== ' '));
+  const lines = ops.filter((_, k) => keep[k]).map(([s, l]) => `${s}${JSON.stringify(l).slice(1, -1)}`);
+  return lines.length > cap ? [...lines.slice(0, cap), `... ${lines.length - cap} more`] : lines;
+}
+const ID_LINE = /^\s*id:: [0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\s*$/i;
+// drops "id:: <uuid>" lines of `actual` that `reference` does not have (the
+// app's missing-id repair adds them; that is not a loss)
+function stripAddedIdLines(actual, reference) {
+  const ref = new Set(reference.split('\n').filter((l) => ID_LINE.test(l)).map((l) => l.trim()));
+  return actual.split('\n').filter((l) => !(ID_LINE.test(l) && !ref.has(l.trim()))).join('\n');
+}
+const bakOf = (rel, bakNew) => {
+  const stem = rel.replace(/\.[^./]+$/, '');
+  return bakNew.filter((b) => b.path.startsWith(`logseq/bak/${stem}/`));
+};
+
+// ---- verification --------------------------------------------------------------
+// Expectation kinds (path relative to the graph):
+//   exact    {content, tokens}  file must equal content (added id:: lines -> warn)
+//   contains {fragments}        every fragment must be in the file
+//   absent   {severity}         file must not exist
+//   typed    {base, target, typed:[..], tokens:[..]}  typed page: each token once,
+//            the target block line = base line + typed, every other line kept
+//   policy / ignore             excluded from the untouched-files check
+function checkExpectation(e, after, bakNew) {
+  const a = after.get(e.path);
+  const sev = e.severity || 'fail';
+  const name = `${e.kind} ${e.path}${e.why ? ` (${e.why})` : ''}`;
+  const baks = bakOf(e.path, bakNew);
+  if (e.kind === 'absent') {
+    return { name, severity: sev, ok: !a, detail: a ? 'file exists' : 'absent' };
+  }
+  if (e.kind === 'exact') {
+    if (!a) return { name, severity: sev, ok: false, detail: 'file missing', in_bak: baks.some((b) => b.text === e.content) ? 'exact' : 'no' };
+    if (a.text === e.content) return { name, severity: sev, ok: true, detail: 'byte-identical' };
+    if (stripAddedIdLines(a.text, e.content) === e.content) {
+      return { name, severity: sev, ok: true, detail: 'identical except id:: lines the app added', warn: true };
+    }
+    const lost = (e.tokens || []).filter((t) => !a.text.includes(t));
+    const inBak = baks.some((b) => b.text === e.content) ? 'exact'
+      : (lost.length && baks.some((b) => lost.every((t) => b.text.includes(t))) ? 'tokens' : 'no');
+    return { name, severity: sev, ok: false, detail: lost.length ? `edit lost (missing ${lost.join(', ')})` : 'content differs', in_bak: inBak, diff: lineDiff(e.content, a.text) };
+  }
+  if (e.kind === 'contains') {
+    if (!a) return { name, severity: sev, ok: false, detail: 'file missing' };
+    const missing = e.fragments.filter((f) => !a.text.includes(f));
+    return { name, severity: sev, ok: !missing.length, detail: missing.length ? `missing ${JSON.stringify(missing)}` : 'all fragments present',
+      exact: e.content != null ? a.text === e.content : undefined,
+      in_bak: missing.length ? (baks.some((b) => missing.every((f) => b.text.includes(f))) ? 'yes' : 'no') : undefined,
+      diff: e.content != null && a.text !== e.content ? lineDiff(e.content, a.text) : undefined };
+  }
+  if (e.kind === 'typed') {
+    if (!a) return { name, severity: sev, ok: false, detail: 'file missing' };
+    const counts = Object.fromEntries(e.tokens.map((t) => [t, countOf(a.text, t)]));
+    const norm = (s) => s.split('\n').filter((l) => l.trim() && !ID_LINE.test(l)).map((l) => l.trim());
+    const baseLines = norm(e.base);
+    const idx = baseLines.findIndex((l) => l.replace(/^-\s*/, '').startsWith(e.target));
+    const want = baseLines.slice();
+    if (idx >= 0) want[idx] = baseLines[idx] + e.typed.join('');
+    const got = norm(a.text);
+    const semantic = idx >= 0 && JSON.stringify(want) === JSON.stringify(got);
+    const raw = e.base.split('\n');
+    const ri = raw.findIndex((l) => l.replace(/^\s*-\s*/, '').startsWith(e.target));
+    if (ri >= 0) raw[ri] += e.typed.join('');
+    const once = Object.values(counts).every((c) => c === 1);
+    return { name, severity: sev, ok: once && semantic, token_counts: counts,
+      detail: !once ? 'typed text missing or duplicated' : (semantic ? 'typed once, other lines kept' : 'other lines changed'),
+      byte_exact: a.text === raw.join('\n'), diff: semantic ? undefined : lineDiff(want.join('\n'), got.join('\n')) };
+  }
+  return { name, severity: 'info', ok: true, detail: e.kind };
+}
+function verify(before, after, expectations, { bakNew = [] } = {}) {
+  const checks = expectations.map((e) => checkExpectation(e, after, bakNew));
+  const covered = new Set(expectations.map((e) => e.path));
+  let identical = 0;
+  for (const [rel, b] of before) {
+    if (classify(rel) !== 'graph' || covered.has(rel)) continue;
+    const a = after.get(rel);
+    if (!a) checks.push({ name: `untouched ${rel}`, severity: 'fail', ok: false, detail: 'file removed' });
+    else if (a.sha !== b.sha) {
+      const onlyIds = stripAddedIdLines(a.text, b.text) === b.text;
+      checks.push({ name: `untouched ${rel}`, severity: onlyIds ? 'warn' : 'fail', ok: false,
+        detail: onlyIds ? 'only id:: lines added' : 'unexpected change', diff: lineDiff(b.text, a.text) });
+    } else identical++;
+  }
+  for (const rel of after.keys()) {
+    if (classify(rel) === 'graph' && !before.has(rel) && !covered.has(rel)) {
+      checks.push({ name: `new file ${rel}`, severity: 'warn', ok: false, detail: 'created by the app' });
+    }
+  }
+  checks.push({ name: 'untouched files byte-identical', severity: 'info', ok: true, detail: `${identical} files` });
+  return checks;
+}
+function newBaks(before, after, tokens = []) {
+  const out = [];
+  for (const [rel, x] of after) {
+    if (classify(rel) !== 'bak') continue;
+    if (before.has(rel) && before.get(rel).sha === x.sha) continue;
+    out.push({ path: rel, sha: x.sha, size: x.size, text: x.text, tokens: tokens.filter((t) => x.text.includes(t)) });
+  }
+  return out;
+}
+function samePageOutcome({ finalText, extTokens, revertedText, typedToken, bakTexts }) {
+  const ext = !!finalText && extTokens.every((t) => finalText.includes(t)) && !(revertedText && finalText.includes(revertedText));
+  const typed = !!finalText && finalText.includes(typedToken);
+  const extInBak = bakTexts.some((b) => extTokens.every((t) => b.includes(t)));
+  const outcome = ext && typed ? 'merged'
+    : !ext && typed ? (extInBak ? 'backup+overwrite' : 'overwrite-without-backup')
+      : ext && !typed ? 'typed-dropped (refused or superseded)' : 'both-lost';
+  return { outcome, external_survived: ext, typed_survived: typed, external_in_bak: extInBak };
+}
+
+// ---- disk activity -------------------------------------------------------------
+function dirSignature(dir) {
+  const h = crypto.createHash('sha1');
+  for (const r of walk(dir).sort()) {
+    try { const st = fs.statSync(path.join(dir, r)); h.update(`${r}\0${st.size}\0${st.mtimeMs}\n`); } catch (_) {}
+  }
+  return h.digest('hex');
+}
+// true once nothing under dir changed (names, sizes, mtimes) for ms
+async function diskQuiet(dir, ms, maxWait) {
+  let sig = dirSignature(dir);
+  let since = Date.now();
+  const end = Date.now() + maxWait;
+  while (Date.now() < end) {
+    await sleep(300);
+    const s = dirSignature(dir);
+    if (s !== sig) { sig = s; since = Date.now(); } else if (Date.now() - since >= ms) return true;
+  }
+  return false;
+}
+async function waitFileContains(abs, tokens, maxMs) {
+  const end = Date.now() + maxMs;
+  while (Date.now() < end) {
+    try { const t = fs.readFileSync(abs, 'utf8'); if (tokens.every((x) => t.includes(x))) return true; } catch (_) {}
+    await sleep(250);
+  }
+  return false;
+}
+
+// ---- /proc helpers -------------------------------------------------------------
+function procStat(pid) {
+  const st = fs.readFileSync(`/proc/${pid}/stat`, 'utf8');
+  return st.slice(st.lastIndexOf(')') + 2).split(' '); // [0]=state [1]=ppid ... [11]=utime [12]=stime
+}
+function descendants(root) {
+  const kids = new Map();
+  for (const p of fs.readdirSync('/proc')) {
+    if (!/^\d+$/.test(p)) continue;
+    try { const pp = procStat(p)[1]; if (!kids.has(pp)) kids.set(pp, []); kids.get(pp).push(p); } catch (_) {}
+  }
+  const out = [];
+  const q = [String(root)];
+  while (q.length) { const p = q.shift(); for (const c of kids.get(p) || []) { out.push(c); q.push(c); } }
+  return out;
+}
+const exeIs = (pid, exe) => { try { return fs.readlinkSync(`/proc/${pid}/exe`) === exe; } catch (_) { return false; } };
+
+// ---- app driver ----------------------------------------------------------------
+let electronMod = null;
+function electron() {
+  if (electronMod) return electronMod;
+  const candidates = [process.env.LSSAFETY_PLAYWRIGHT,
+    path.join(HOME, 'dev/logsidian-perf/node_modules/playwright'),
+    path.join(HOME, 'dev/logsidian/node_modules/playwright')].filter(Boolean); // last: read-only use
+  for (const c of candidates) { try { electronMod = require(c)._electron; return electronMod; } catch (_) {} }
+  throw new Error('playwright not found (set LSSAFETY_PLAYWRIGHT)');
+}
+const liveApps = new Set();
+
+class App {
+  constructor(ctx, label) {
+    this.ctx = ctx;
+    this.label = label;
+    this.t0 = Date.now();
+    this.records = [];
+    this.lserr = [];
+    this.consoleErrors = [];
+    this.markers = {};
+    this.lastActivity = Date.now();
+    this.prevTicks = new Map();
+    this.closed = false;
+    this.info = { label };
+  }
+  wall() { return Date.now() - this.t0; }
+
+  async launch({ openDialogWith } = {}) {
+    if (this.ctx.aborted) throw new Error('scenario aborted');
+    const prof = this.ctx.profile;
+    const home = path.join(prof, 'home');
+    fs.mkdirSync(home, { recursive: true });
+    this.consoleLog = fs.createWriteStream(path.join(this.ctx.out, `${this.label}-console.log`));
+    this.app = await within(electron().launch({
+      executablePath: APP,
+      args: ['--no-sandbox', '--ozone-platform=headless', `--user-data-dir=${prof}/chromium`],
+      env: { ...process.env, HOME: home, XDG_CONFIG_HOME: `${home}/.config`, XDG_DATA_HOME: `${home}/.local/share`,
+        XDG_CACHE_HOME: `${home}/.cache`, XDG_STATE_HOME: `${home}/.local/state`, ELECTRON_ENABLE_LOGGING: '1' },
+      timeout: 120000,
+    }), 150000, 'electron.launch');
+    liveApps.add(this);
+    this.pid = this.app.process().pid;
+    this.app.on('window', (w) => this.attach(w));
+    for (const w of this.app.windows()) this.attach(w);
+    if (openDialogWith) {
+      await within(this.app.evaluate(({ dialog }, g) => {
+        dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [g] });
+      }, openDialogWith), 30000, 'stub dialog');
+    }
+    // the splash screen is its own window; wait for the one that renders the app
+    const end = Date.now() + 120000;
+    while (!this.page && Date.now() < end) {
+      for (const w of this.app.windows()) {
+        if (await within(w.$('#app-container, #main-container, .cp__sidebar-main-layout'), 5000, 'find window').catch(() => null)) this.page = w;
+      }
+      if (!this.page) await sleep(500);
+    }
+    if (!this.page) throw new Error('app window never rendered');
+    this.info.window_ms = this.wall();
+    this.page.on('pageerror', (e) => this.lserr.push({ wall: this.wall(), kind: 'pageerror', msg: errText(e).slice(0, 1500) }));
+    this.page.on('crash', () => this.lserr.push({ wall: this.wall(), kind: 'crash', msg: 'renderer crashed' }));
+    await this.observeUi();
+    this.cpuTimer = setInterval(() => this.sampleCpu(), 1000);
+    this.cpuTimer.unref();
+    this.ctx.step(`${this.label}: window after ${this.info.window_ms} ms`);
+    return this;
+  }
+
+  attach(w) {
+    w.on('console', (m) => {
+      const t = m.text();
+      this.consoleLog.write(`${this.wall()}\t${m.type()}\t${t.slice(0, 600)}\n`);
+      if (t.startsWith('LSPERF ') || t.startsWith('LSUI ')) {
+        const ui = t.startsWith('LSUI ');
+        try { this.records.push({ wall: this.wall(), ...(ui ? { event: 'ui' } : {}), ...JSON.parse(t.slice(ui ? 5 : 7)) }); } catch (_) {}
+        this.lastActivity = Date.now();
+      } else if (t.startsWith('LSSEARCH ')) {
+        try { this.records.push({ wall: this.wall(), event: 'search', ...JSON.parse(t.slice(9)) }); } catch (_) {}
+      } else if (t.startsWith('LSERR ')) {
+        try { this.lserr.push({ wall: this.wall(), ...JSON.parse(t.slice(6)) }); } catch (_) { this.lserr.push({ wall: this.wall(), msg: t.slice(0, 1500) }); }
+      } else if (m.type() === 'error') {
+        if (this.consoleErrors.length < 100) this.consoleErrors.push({ wall: this.wall(), msg: t.slice(0, 600) });
+      }
+      if (t.includes('initial-watcher')) this.markers.initialWatcher = this.markers.initialWatcher || Date.now();
+      if (/Delete page:|Bak Error|backup|Write file failed|Write to the file|restore-graph!|graph\/added/i.test(t)) {
+        this.records.push({ wall: this.wall(), log: t.slice(0, 300) });
+      }
+    });
+  }
+
+  async observeUi() {
+    // release builds log nothing on their own: surface swallowed errors (LSERR)
+    // and renderer long tasks (LSUI), as lsbench.js does
+    await within(this.page.evaluate(() => {
+      if (window.__lsui) return;
+      window.__lsui = true;
+      const show = (kind, x) => {
+        const msg = x && (x.stack || x.message) ? `${x.message || ''}\n${x.stack || ''}` : String(x);
+        console.log('LSERR ' + JSON.stringify({ kind, msg: msg.slice(0, 1500) }));
+      };
+      window.addEventListener('unhandledrejection', (e) => show('unhandledrejection', e.reason));
+      window.addEventListener('error', (e) => show('error', e.error || e.message));
+      new PerformanceObserver((list) => {
+        for (const e of list.getEntries()) {
+          if (e.duration >= 100) console.log('LSUI ' + JSON.stringify({ dur: Math.round(e.duration), start: Math.round(e.startTime) }));
+        }
+      }).observe({ type: 'longtask', buffered: true });
+    }), 30000, 'observeUi').catch(() => {});
+  }
+
+  // Thread CPU of this app's renderer (db worker = DedicatedWorker, UI = Logseq):
+  // a worker inside one long synchronous task reports nothing until it ends,
+  // so silence alone can mean busy. Only this app's own process tree counts.
+  sampleCpu() {
+    try {
+      const pct = { DedicatedWorker: 0, Logseq: 0 };
+      const now = Date.now();
+      for (const pid of descendants(this.pid)) {
+        if (!exeIs(pid, APP)) continue;
+        let cmd = '';
+        try { cmd = fs.readFileSync(`/proc/${pid}/cmdline`, 'utf8'); } catch (_) { continue; }
+        if (!cmd.includes('--type=renderer')) continue;
+        for (const tid of fs.readdirSync(`/proc/${pid}/task`)) {
+          try {
+            const name = fs.readFileSync(`/proc/${pid}/task/${tid}/comm`, 'utf8').trim();
+            if (!(name in pct)) continue;
+            const st = fs.readFileSync(`/proc/${pid}/task/${tid}/stat`, 'utf8');
+            const rest = st.slice(st.lastIndexOf(')') + 2).split(' ');
+            const ticks = Number(rest[11]) + Number(rest[12]);
+            const last = this.prevTicks.get(`${pid}/${tid}`);
+            this.prevTicks.set(`${pid}/${tid}`, [ticks, now]);
+            if (last && now > last[1]) pct[name] += (100 * (ticks - last[0]) / 100) / ((now - last[1]) / 1000);
+          } catch (_) {}
+        }
+      }
+      if (pct.DedicatedWorker > 50 || pct.Logseq > 50) {
+        this.lastActivity = Date.now();
+        this.records.push({ wall: this.wall(), event: 'cpu', worker: Math.round(pct.DedicatedWorker), ui: Math.round(pct.Logseq) });
+      }
+    } catch (_) {}
+  }
+
+  async quiet(ms, maxWait) {
+    const end = Date.now() + maxWait;
+    while (Date.now() < end) { if (Date.now() - this.lastActivity > ms) return true; await sleep(250); }
+    return false;
+  }
+
+  async shot(name) {
+    await within(this.page.screenshot({ path: path.join(this.ctx.out, `${this.label}-${name}.png`) }), 15000, 'screenshot').catch(() => {});
+  }
+
+  async escape() {
+    for (let i = 0; i < 2; i++) { await within(this.page.keyboard.press('Escape'), 5000, 'Escape').catch(() => {}); await sleep(120); }
+  }
+
+  // First open of a fresh profile: stubbed folder dialog + "Add new graph"
+  // (repo.cljs; the All graphs page is the fallback), then parse + quiet.
+  async openGraph(maxMs = 300000) {
+    const page = this.page;
+    await sleep(5000);
+    const clickText = (t) => within(page.evaluate((t) => {
+      const el = [...document.querySelectorAll('button, a, [role=menuitem], [role=button]')]
+        .find((e) => (e.innerText || '').trim().includes(t));
+      if (!el) return false;
+      el.click();
+      return true;
+    }, t), 10000, 'click text').catch(() => false);
+    let clicked = false;
+    for (const attempt of ['menu', 'graphs']) {
+      if (attempt === 'graphs') await within(page.evaluate(() => { location.hash = '#/graphs'; }), 10000, 'goto graphs').catch(() => {});
+      await sleep(1500);
+      if (await clickText('Add new graph')) { clicked = attempt; break; }
+      if (attempt === 'menu') {
+        await within(page.evaluate(() => document.querySelector('.cp__graphs-selector a.item')?.click()), 10000, 'graph menu').catch(() => {});
+        await sleep(800);
+        if (await clickText('Add new graph')) { clicked = attempt; break; }
+      }
+    }
+    const r = { clicked };
+    if (!clicked) { await this.shot('open-failed'); return r; }
+    // container.cljs shows "Parsing files n/total" until parsing ends
+    const parsing = () => within(page.evaluate(() => document.body.innerText.includes('Parsing files')), 10000, 'parsing?').catch(() => false);
+    const deadline = Date.now() + maxMs;
+    const s0 = Date.now();
+    let seen = false;
+    while (!seen && Date.now() - s0 < 60000) { seen = await parsing(); if (!seen) await sleep(250); }
+    r.parse_seen = seen;
+    while (seen && Date.now() < deadline && (await parsing())) await sleep(500);
+    r.parse_end_ms = this.wall();
+    r.quiet = await this.quiet(8000, Math.max(20000, deadline - Date.now()));
+    r.disk_quiet = await diskQuiet(this.ctx.graph, 3000, 60000);
+    await this.shot('opened');
+    this.info.open = r;
+    this.ctx.step(`${this.label}: graph opened ${JSON.stringify(r)}`);
+    return r;
+  }
+
+  // Reopen: the profile restores the graph; the reconcile (load-graph-files!)
+  // then reads every file. Done when the build's LSPERF reconcile line arrives
+  // (perf/step4-reconcile), else when the app went quiet (thread CPU, LSPERF,
+  // LSUI) for long enough, then once the graph dir stopped changing.
+  async waitReconcile(maxMs = 180000) {
+    const start = Date.now();
+    const deadline = start + maxMs;
+    let how = null;
+    while (Date.now() < deadline) {
+      if (this.records.some((r) => r.event === 'reconcile')) { how = 'lsperf'; break; }
+      const q = Date.now() - this.lastActivity;
+      if (this.markers.initialWatcher && q > 8000 && Date.now() - this.markers.initialWatcher > 8000) { how = 'marker+quiet'; break; }
+      if (Date.now() - start > 20000 && q > 10000) { how = 'quiet'; break; }
+      await sleep(500);
+    }
+    // deferred id repairs and page deletes write after the line: settle on disk
+    await sleep(2000);
+    const quiet = await this.quiet(4000, Math.max(5000, deadline - Date.now()));
+    const disk = await diskQuiet(this.ctx.graph, 3000, 60000);
+    const r = { how: how || 'timeout', ms: Date.now() - start, quiet, disk_quiet: disk,
+      record: this.records.find((x) => x.event === 'reconcile') || null };
+    this.info.reconcile = r;
+    await this.shot('reconciled');
+    this.ctx.step(`${this.label}: reconcile ${r.how} after ${r.ms} ms`);
+    return r;
+  }
+
+  async blockIdByText(text) {
+    return within(this.page.evaluate((t) => {
+      const root = document.querySelector('#main-content-container') || document;
+      for (const el of root.querySelectorAll('.ls-block[blockid]')) {
+        const c = el.querySelector('.block-content');
+        if (c && c.innerText.trim().startsWith(t)) return el.getAttribute('blockid');
+      }
+      return null;
+    }, text), 10000, 'blockIdByText').catch(() => null);
+  }
+
+  // route /page/:name (routes.cljs); waits until a block starting with waitText renders
+  async gotoPage(name, waitText, maxMs = 30000) {
+    await this.escape();
+    await within(this.page.evaluate((n) => { location.hash = '#/page/' + encodeURIComponent(n); }, name), 10000, 'navigate');
+    const end = Date.now() + maxMs;
+    while (Date.now() < end) {
+      const id = await this.blockIdByText(waitText);
+      if (id) return id;
+      await sleep(300);
+    }
+    await this.shot(`goto-failed-${name.replace(/\W+/g, '_')}`);
+    return null;
+  }
+
+  async uiHasText(text) {
+    return within(this.page.evaluate((t) => ((document.querySelector('#main-content-container') || document.body).innerText || '').includes(t), text), 10000, 'uiHasText').catch(() => false);
+  }
+
+  // click the block's .block-content (block.cljs) to open the editor (a TEXTAREA
+  // inside the same .ls-block), append text at the end, Escape saves
+  async typeInto(blockId, text, { fast = false } = {}) {
+    const page = this.page;
+    const t0 = Date.now();
+    const loc = () => page.locator(`#main-content-container .ls-block[blockid="${blockId}"] .block-content`).first();
+    const editing = () => within(page.waitForFunction((id) => {
+      const a = document.activeElement;
+      return !!(a && a.tagName === 'TEXTAREA' && a.closest(`[blockid="${id}"]`));
+    }, blockId, { timeout: fast ? 2000 : 4000, polling: 50 }), 8000, 'editing?').then(() => true).catch(() => false);
+    let ok = false;
+    for (let i = 0; i < 3 && !ok; i++) {
+      await loc().scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+      await loc().click({ timeout: 5000 }).catch(() => {});
+      ok = await editing();
+    }
+    if (!ok) return { ok: false, why: 'editor did not open', ms: Date.now() - t0 };
+    await within(page.keyboard.press('Control+End'), 5000, 'Control+End');
+    await within(page.keyboard.type(text, { delay: fast ? 0 : 15 }), 20000, 'type');
+    await sleep(fast ? 40 : 300);
+    await within(page.keyboard.press('Escape'), 5000, 'Escape');
+    return { ok: true, ms: Date.now() - t0 };
+  }
+
+  // Ctrl+K search (cmdk/core.cljs input.cp__cmdk-search-input). A hit is the
+  // token inside a result group that has a header, i.e. not the "Create" group.
+  async search(token, maxMs = 30000) {
+    await this.escape();
+    await within(this.page.keyboard.press('Control+k'), 5000, 'Control+k').catch(() => {});
+    const input = await within(this.page.waitForSelector('input.cp__cmdk-search-input', { timeout: 10000 }), 15000, 'search input').catch(() => null);
+    if (!input) return { token, hit: false, error: 'no search input' };
+    await within(input.fill(token), 10000, 'fill').catch(() => {});
+    const t0 = Date.now();
+    let hit = false;
+    while (!hit && Date.now() - t0 < maxMs) {
+      hit = await within(this.page.evaluate((tok) => [...document.querySelectorAll('.search-results')].some((r) => {
+        const head = r.parentElement && r.parentElement.firstElementChild;
+        return head && head !== r && !/^\s*Create/.test(head.innerText || '') && (r.innerText || '').toLowerCase().includes(tok.toLowerCase());
+      }), token), 10000, 'search poll').catch(() => false);
+      if (!hit) await sleep(250);
+    }
+    await this.shot(`search-${token}`);
+    await this.escape();
+    return { token, hit, ms: Date.now() - t0 };
+  }
+
+  async notifications() {
+    return within(this.page.evaluate(() => [...document.querySelectorAll('.ui__notifications')]
+      .map((e) => (e.innerText || '').trim()).filter(Boolean)), 10000, 'notifications').catch(() => []);
+  }
+
+  // leave the editor, let the worker's 1 s write batch and the IPC writes land
+  async settle() {
+    await this.escape();
+    await sleep(1500);
+    const disk = await diskQuiet(this.ctx.graph, 3000, 30000);
+    const quiet = await this.quiet(3000, 30000);
+    return { disk, quiet };
+  }
+
+  async close() {
+    if (this.closed || !this.app) return;
+    this.closed = true;
+    clearInterval(this.cpuTimer);
+    const c = { ok: true };
+    try { if (this.page) this.info.notifications = await this.notifications(); } catch (_) {}
+    let kids = [];
+    try { kids = descendants(this.pid); } catch (_) {}
+    try { await within(this.app.close(), 30000, 'app.close'); } catch (e) { c.ok = false; c.error = errText(e); }
+    // hard stop for anything of this app still alive (only our own tree, only this binary)
+    let killed = 0;
+    for (const p of [String(this.pid), ...kids]) {
+      if (exeIs(p, APP)) { try { process.kill(Number(p), 'SIGKILL'); killed++; } catch (_) {} }
+    }
+    if (killed) { c.killed = killed; await sleep(1000); }
+    liveApps.delete(this);
+    this.info.close = c;
+    try { this.consoleLog.end(); } catch (_) {}
+    fs.writeFileSync(path.join(this.ctx.out, `${this.label}-records.json`), JSON.stringify(this.records, null, 1));
+    this.ctx.step(`${this.label}: closed ${JSON.stringify(c)}`);
+  }
+
+  summary() {
+    return { ...this.info, launched_wall_ms: this.info.window_ms, records: this.records.length,
+      lserr: this.lserr, console_errors: this.consoleErrors.slice(0, 30) };
+  }
+}
+
+// ---- scenario context ----------------------------------------------------------
+function makeCtx(name, root, opts, templateOpts = {}) {
+  const dir = assertSafePath(path.join(root, name));
+  if (fs.existsSync(dir)) throw new Error(`scenario dir exists already: ${dir}`);
+  const ctx = { name, dir, graph: path.join(dir, 'graph'), profile: path.join(dir, 'profile'), out: path.join(dir, 'out'),
+    opts, apps: [], aborted: false, timeline: [], t0: Date.now(), tokens: [] };
+  for (const d of [ctx.graph, path.join(ctx.profile, 'home'), ctx.out]) fs.mkdirSync(assertSafePath(d), { recursive: true });
+  ctx.tpl = makeTemplate(templateOpts);
+  writeFiles(ctx.graph, ctx.tpl.files);
+  ctx.abs = (rel) => {
+    const abs = path.join(ctx.graph, rel);
+    if (!abs.startsWith(ctx.graph + path.sep)) throw new Error(`path escapes the graph: ${rel}`);
+    return assertSafePath(abs);
+  };
+  ctx.read = (rel) => fs.readFileSync(ctx.abs(rel), 'utf8');
+  ctx.write = (rel, content) => fs.writeFileSync(ctx.abs(rel), content);
+  // as OneDrive / another PC: write a hidden temp file next to it, then rename
+  ctx.writeExternal = (rel, content) => {
+    const abs = ctx.abs(rel);
+    const tmp = path.join(path.dirname(abs), `.${path.basename(abs)}.lssafety~`);
+    fs.writeFileSync(tmp, content);
+    fs.renameSync(tmp, abs);
+  };
+  ctx.unlink = (rel) => fs.unlinkSync(ctx.abs(rel));
+  ctx.snapshot = () => snapshotDir(ctx.graph);
+  ctx.step = (msg) => { ctx.timeline.push({ t: Date.now() - ctx.t0, msg }); log(`${name}: ${msg}`); };
+  ctx.tok = (tag) => { const t = `qs${tag}${crypto.randomBytes(4).toString('hex')}`; ctx.tokens.push(t); return t; };
+  ctx.launch = async (label, o) => {
+    const a = new App(ctx, label);
+    ctx.apps.push(a);
+    return a.launch(o);
+  };
+  return ctx;
+}
+
+// first open of the fresh graph copy; later launches restore it
+async function prime(ctx, hook) {
+  const a = await ctx.launch('prime', { openDialogWith: ctx.graph });
+  const r = await a.openGraph();
+  if (!r.clicked) throw new Error('could not click "Add new graph"');
+  const extra = hook ? await hook(a) : undefined;
+  await a.settle();
+  await a.close();
+  return extra;
+}
+async function reopen(ctx, label = 'reopen') {
+  const a = await ctx.launch(label);
+  await a.waitReconcile();
+  return a;
+}
+function check(res, name, ok, detail, severity = 'fail', extra = {}) {
+  res.checks.push({ name, severity, ok: !!ok, detail, ...extra });
+}
+
+// ---- scenarios -----------------------------------------------------------------
+const scenarios = {};
+
+scenarios['offline-edit-reopen'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const exp = [];
+    const J1 = journalRel(3); const J2 = journalRel(10); const J3 = journalRel(20);
+    const P1 = pageRel(pageName(3)); const P2 = pageRel(pageName(7));
+    const tA = ctx.tok('a'); const tB = ctx.tok('b'); const tC = ctx.tok('c'); const tD = ctx.tok('d');
+    const edits = [
+      [J1, (s) => appendBlock(s, `Appended offline ${tA}`), [tA], 'append'],
+      [J2, (s) => replaceBlockLine(s, `Journal ${isoDay(10)} block to change`, `Journal ${isoDay(10)} changed offline ${tB}`), [tB], 'change a block'],
+      [J3, (s) => deleteBlock(s, `Journal ${isoDay(20)} block to delete`), [], 'delete a block'],
+      [P1, (s) => appendBlock(s, `Page 03 appended offline ${tC}`), [tC], 'append'],
+      [P2, (s) => deleteBlock(replaceBlockLine(s, 'Page 07 block to change', `Page 07 changed offline ${tD}`), 'Page 07 block to delete'), [tD], 'change + delete'],
+    ];
+    for (const [rel, f, tokens, why] of edits) {
+      const content = f(ctx.read(rel));
+      ctx.write(rel, content);
+      exp.push({ path: rel, kind: 'exact', content, tokens, why: `offline ${why}` });
+    }
+    ctx.step('offline edits written');
+    const b = await reopen(ctx);
+    res.searches = [];
+    for (const t of [tA, tB, tC, tD]) {
+      const s = await b.search(t);
+      res.searches.push(s);
+      check(res, `search finds ${t}`, s.hit, s.error || (s.hit ? `hit after ${s.ms} ms` : 'not found'), 'fail');
+    }
+    const gone = await b.search(`Journal ${isoDay(20)} block to delete`, 5000);
+    check(res, 'deleted block no longer found by search', !gone.hit, gone.hit ? 'still found (DB kept the deleted block)' : 'not found', 'info');
+    await b.settle();
+    await b.close();
+    return { before, exp };
+  },
+};
+
+scenarios['idrepair-race'] = {
+  template: { home: RACE_PAGE },
+  async run(ctx, res) {
+    const P = pageRel(RACE_PAGE);
+    const J = journalRel(1); // first journal in the reconcile's sort order
+    const U = await prime(ctx, async (a) => {
+      const id = await a.gotoPage(RACE_PAGE.toLowerCase(), RACE_B);
+      await a.shot('race-page');
+      return id;
+    });
+    if (!U) throw new Error(`could not read the uuid of "${RACE_B}" from the DOM`);
+    res.block_b_uuid = U;
+    const pAfterPrime = ctx.read(P);
+    check(res, 'precondition: block B has no id:: in its file after the first open', !pAfterPrime.includes(U),
+      pAfterPrime.includes(U) ? 'the first open already wrote id:: (race cannot trigger)' : 'ok', 'info');
+    const before = ctx.snapshot();
+    const tJ = ctx.tok('j'); const tP = ctx.tok('p'); const tQ = ctx.tok('q');
+    const jContent = appendBlock(ctx.read(J), `Early journal refers to the race block ((${U})) ${tJ}`);
+    const pContent = appendBlock(replaceBlockLine(pAfterPrime, 'Race page intro block', `Race page intro edited offline ${tQ}`), `Race page offline edit ${tP}`);
+    ctx.write(J, jContent);
+    ctx.write(P, pContent);
+    ctx.step('offline edits written (J refers to B, P edited)');
+    const b = await reopen(ctx);
+    // the repair's write lands ~1 s after the repair (worker batch); give it room
+    await sleep(3000);
+    await diskQuiet(ctx.graph, 3000, 30000);
+    const s = await b.search(tP);
+    res.searches = [s];
+    check(res, `search finds ${tP}`, s.hit, s.error || (s.hit ? `hit after ${s.ms} ms` : 'not found'), 'warn');
+    await b.settle();
+    await b.close();
+    const exp = [
+      { path: P, kind: 'exact', content: pContent, tokens: [tP, tQ], why: 'offline edit of the page whose block lacks id::' },
+      { path: J, kind: 'exact', content: jContent, tokens: [tJ], why: 'offline edit adding the ((uuid)) ref' },
+    ];
+    res.after_hook = (after) => {
+      const a = after.get(P);
+      const text = a ? a.text : '';
+      res.race = { p_has_offline_edit: text.includes(tP) && text.includes(tQ), p_has_id_for_b: text.includes(`id:: ${U}`) };
+    };
+    return { before, exp };
+  },
+};
+
+scenarios['live-external-edit'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const exp = [];
+    const b = await reopen(ctx);
+    // A: external rewrite of a journal while idle, then typing elsewhere
+    const JX = journalRel(15);
+    const tE = ctx.tok('e'); const tE2 = ctx.tok('e');
+    const jxContent = `- Journal ${isoDay(15)} rewritten externally ${tE}\n- Second external block ${tE2}\n`;
+    ctx.writeExternal(JX, jxContent);
+    ctx.step('external rewrite of the journal');
+    await sleep(6000); // chokidar awaitWriteFinish (2 s) + reparse
+    await b.quiet(3000, 30000);
+    res.ui_saw_external = await (async () => {
+      await b.gotoPage(isoDay(15), `Journal ${isoDay(15)} rewritten externally`, 20000);
+      return b.uiHasText(tE);
+    })();
+    check(res, 'app shows the external journal edit', res.ui_saw_external, res.ui_saw_external ? 'visible' : 'not visible', 'info');
+    const P5 = pageRel(pageName(5));
+    const tF = ctx.tok('f');
+    const id5 = await b.gotoPage(pageName(5).toLowerCase(), 'Page 05 block one');
+    if (!id5) throw new Error('Page 05 did not render');
+    const typed5 = ` typed ${tF}`;
+    const r5 = await b.typeInto(id5, typed5);
+    check(res, 'typed into a different page', r5.ok, r5.why || `${r5.ms} ms`, 'fail');
+    res.page05_written = await waitFileContains(ctx.abs(P5), [tF], 20000);
+    await b.settle();
+    exp.push({ path: JX, kind: 'exact', content: jxContent, tokens: [tE, tE2], why: 'external rewrite while the app was open' });
+    exp.push({ path: P5, kind: 'typed', base: before.get(P5).text, target: 'Page 05 block one', typed: r5.ok ? [typed5] : [], tokens: r5.ok ? [tF] : [], why: 'typed page' });
+
+    // B and C (policy): typing into the SAME page after an external rewrite
+    res.policy = {};
+    const samePage = async (n, key, settled) => {
+      const rel = pageRel(pageName(n));
+      const N = pageName(n);
+      const tG = ctx.tok('g'); const tH = ctx.tok('h'); const tI = ctx.tok('i');
+      const id = await b.gotoPage(N.toLowerCase(), `${N} block one`);
+      if (!id) {
+        res.policy[key] = { error: `${N} did not render` };
+        check(res, `same page (${key}) could be driven`, false, `${N} did not render`, 'warn');
+        return res.policy[key];
+      }
+      const base = ctx.read(rel);
+      // block one stays identical so the click still finds it
+      const ext = appendBlock(replaceBlockLine(base, `${N} block to change`, `${N} changed externally ${tG}`), `${N} appended externally ${tH}`);
+      const disk0 = snapshotDir(ctx.graph);
+      ctx.writeExternal(rel, ext);
+      const o = { page: rel, settled, external_tokens: [tG, tH], typed_token: tI };
+      if (settled) {
+        const end = Date.now() + 20000;
+        while (Date.now() < end && !(await b.uiHasText(tG))) await sleep(300);
+        o.ui_showed_external = await b.uiHasText(tG);
+      } else {
+        await sleep(ctx.opts.samePageDelayMs);
+      }
+      o.delay_ms = settled ? undefined : ctx.opts.samePageDelayMs;
+      const id2 = (await b.blockIdByText(`${N} block one`)) || id;
+      const r = await b.typeInto(id2, ` typed ${tI}`);
+      o.typing = r;
+      await sleep(6000);
+      await b.settle();
+      o.notifications = await b.notifications();
+      const disk1 = snapshotDir(ctx.graph);
+      const finalText = disk1.has(rel) ? disk1.get(rel).text : null;
+      const baks = newBaks(disk0, disk1, [tG, tH, tI]).filter((x) => x.path.startsWith(`logseq/bak/pages/${N}/`));
+      Object.assign(o, samePageOutcome({ finalText, extTokens: [tG, tH], revertedText: `${N} block to change`, typedToken: tI, bakTexts: baks.map((x) => x.text) }));
+      o.bak_files = baks.map(({ text, ...x }) => x);
+      o.final_diff_vs_external = finalText === ext ? [] : lineDiff(ext, finalText || '');
+      res.policy[key] = o;
+      check(res, `same page (${settled ? 'settled' : `race, ${ctx.opts.samePageDelayMs} ms`}): ${o.outcome}`,
+        o.external_survived && o.typed_survived, JSON.stringify({ external_survived: o.external_survived, typed_survived: o.typed_survived, external_in_bak: o.external_in_bak }), 'policy');
+      exp.push({ path: rel, kind: 'policy' });
+      return o;
+    };
+    await samePage(6, 'same_page_race', false);
+    await samePage(8, 'same_page_settled', true);
+    const s = await b.search(tE);
+    res.searches = [s];
+    check(res, `search finds the external journal edit ${tE}`, s.hit, s.error || (s.hit ? 'hit' : 'not found'), 'info');
+    await b.close();
+    return { before, exp };
+  },
+};
+
+scenarios['config-offline-then-delete-home'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const CFG = 'logseq/config.edn';
+    const HOMEP = pageRel('Home');
+    const tK = ctx.tok('k');
+    const base = ctx.read(CFG);
+    if (!/\}\s*$/.test(base)) throw new Error('config.edn does not end with }');
+    const comment = `;; lssafety offline edit ${tK}`;
+    const key = ':ui/show-brackets? true';
+    const cfg = base.replace(/\}\s*$/, `\n ${comment}\n ${key}}\n`);
+    ctx.write(CFG, cfg);
+    ctx.unlink(HOMEP);
+    ctx.step('offline: config.edn edited, Home.md deleted');
+    const b = await reopen(ctx);
+    await sleep(3000);
+    await diskQuiet(ctx.graph, 3000, 30000);
+    await b.settle();
+    await b.close();
+    return { before, exp: [
+      { path: CFG, kind: 'contains', fragments: [comment, key], content: cfg, why: 'offline config edit (the app may change :default-home around it)' },
+      { path: HOMEP, kind: 'absent', severity: 'warn', why: 'deleted offline; recreated by the app?' },
+    ] };
+  },
+};
+
+scenarios['burst-writes'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const b = await reopen(ctx);
+    const P2 = pageRel(pageName(2));
+    const EXT = journalRel(25);
+    const id = await b.gotoPage(pageName(2).toLowerCase(), 'Page 02 block one');
+    if (!id) throw new Error('Page 02 did not render');
+    const tX = ctx.tok('x'); const tL = ctx.tok('l');
+    let ext = ctx.read(EXT);
+    // external writer: 6 appends, 150 ms apart, to a different file
+    const writer = (async () => {
+      for (let k = 1; k <= 6; k++) {
+        const add = `\n- External append ${k} ${tX}n${k}`;
+        fs.appendFileSync(ctx.abs(EXT), add);
+        ext += add;
+        await sleep(150);
+      }
+    })();
+    const typed = []; const tokens = []; const rounds = [];
+    const t0 = Date.now();
+    for (let k = 1; k <= 4; k++) {
+      const s = ` b${k}${tL}`;
+      const r = await b.typeInto(id, s, { fast: true });
+      rounds.push(r);
+      if (r.ok) { typed.push(s); tokens.push(`b${k}${tL}`); }
+    }
+    res.burst = { span_ms: Date.now() - t0, rounds };
+    await writer;
+    check(res, 'all typing rounds reached the editor', rounds.every((r) => r.ok), JSON.stringify(rounds.map((r) => r.ok)), 'warn');
+    if (!typed.length) throw new Error('no typing round reached the editor');
+    res.typed_written = await waitFileContains(ctx.abs(P2), tokens, 20000);
+    await sleep(3000);
+    await b.settle();
+    await b.close();
+    return { before, exp: [
+      { path: EXT, kind: 'exact', content: ext, tokens: [1, 2, 3, 4, 5, 6].map((k) => `${tX}n${k}`), why: 'external appends during the burst' },
+      { path: P2, kind: 'typed', base: before.get(P2).text, target: 'Page 02 block one', typed, tokens, why: 'burst of saves' },
+    ] };
+  },
+};
+
+scenarios['typing-roundtrip'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const J = journalRel(12);
+    const tM = ctx.tok('m');
+    const b = await reopen(ctx);
+    const id = await b.gotoPage(isoDay(12), `Journal ${isoDay(12)} note alpha`);
+    if (!id) throw new Error(`journal ${isoDay(12)} did not render`);
+    const typed = ` typed ${tM}`;
+    const r = await b.typeInto(id, typed);
+    if (!r.ok) throw new Error(`typing failed: ${r.why}`);
+    res.typed_written = await waitFileContains(ctx.abs(J), [tM], 20000);
+    await b.settle();
+    await b.close();
+    const mid = ctx.snapshot();
+    res.after_first_close_sha = mid.has(J) ? mid.get(J).sha : null;
+    const c = await reopen(ctx, 'reopen2');
+    const s = await c.search(tM);
+    res.searches = [s];
+    check(res, `search finds ${tM} after reopen`, s.hit, s.error || (s.hit ? 'hit' : 'not found'), 'warn');
+    await c.settle();
+    await c.close();
+    res.after_hook = (after) => {
+      const a = after.get(J); const m = mid.get(J);
+      check(res, 'reopen did not rewrite the typed journal', a && m && a.sha === m.sha,
+        a && m && a.sha === m.sha ? 'byte-identical across the reopen' : 'changed by the reopen', 'fail',
+        { diff: a && m && a.sha !== m.sha ? lineDiff(m.text, a.text) : undefined });
+    };
+    return { before, exp: [
+      { path: J, kind: 'typed', base: before.get(J).text, target: `Journal ${isoDay(12)} note alpha`, typed: [typed], tokens: [tM], why: 'typed journal' },
+    ] };
+  },
+};
+
+// ---- runner --------------------------------------------------------------------
+async function runScenario(name, root, opts) {
+  const def = scenarios[name];
+  const res = { scenario: name, status: 'error', reasons: [], warnings: [], checks: [], app: APP };
+  let ctx = null;
+  const started = Date.now();
+  let runP = null;
+  try {
+    ctx = makeCtx(name, root, opts, def.template);
+    res.dir = ctx.dir;
+    const s0 = ctx.snapshot();
+    res.template_files = s0.size;
+    let timer;
+    runP = def.run(ctx, res);
+    const out = await Promise.race([runP, new Promise((_, rej) => {
+      timer = setTimeout(() => { ctx.aborted = true; rej(new Error(`scenario timeout after ${opts.timeoutSec} s`)); }, opts.timeoutSec * 1000);
+    })]).finally(() => clearTimeout(timer));
+    // no app of this scenario is running any more (each run closes its own)
+    for (const a of ctx.apps) await a.close().catch(() => {});
+    const after = ctx.snapshot();
+    const { before, exp } = out;
+    // what the first open did to the template (the baseline is after it)
+    const pd = diffSnapshots(s0, before);
+    const primeChanged = pd.changed.filter((r) => classify(r) === 'graph').concat(pd.removed.filter((r) => classify(r) === 'graph'));
+    res.prime_changes = pd;
+    if (primeChanged.length) check(res, 'first open left existing files alone', false, primeChanged.join(', '), 'warn');
+    const bakNew = newBaks(before, after, ctx.tokens);
+    res.checks.push(...verify(before, after, exp, { bakNew }));
+    if (res.after_hook) { res.after_hook(after); delete res.after_hook; }
+    const d = diffSnapshots(before, after);
+    res.changed_files = d;
+    res.bak_new = bakNew.map(({ text, ...x }) => x);
+    res.recycle_new = d.added.filter((r) => classify(r) === 'recycle');
+    res.files = {};
+    for (const r of new Set([...before.keys(), ...after.keys()])) {
+      res.files[r] = { before: before.has(r) ? before.get(r).sha : null, after: after.has(r) ? after.get(r).sha : null };
+    }
+    const failed = res.checks.filter((c) => !c.ok && c.severity === 'fail');
+    res.reasons = failed.map((c) => `${c.name}: ${c.detail}${c.in_bak && c.in_bak !== 'no' ? ` (copy in logseq/bak: ${c.in_bak})` : ''}`);
+    res.warnings = res.checks.filter((c) => (!c.ok && c.severity === 'warn') || c.warn).map((c) => `${c.name}: ${c.detail}`);
+    res.policy_checks = res.checks.filter((c) => c.severity === 'policy').map((c) => `${c.name}: ${c.detail}`);
+    res.status = failed.length ? 'fail' : 'pass';
+  } catch (e) {
+    res.status = 'error';
+    res.reasons.push(`harness: ${errText(e)}`);
+    log(`${name}: ERROR ${e && e.stack || e}`);
+  } finally {
+    if (ctx) {
+      ctx.aborted = true;
+      for (const a of ctx.apps) await a.close().catch(() => {});
+      // a timed-out run may still be awaiting; let it fail against the closed app
+      if (runP) await within(runP.catch(() => {}), 60000, 'abandoned run').catch(() => {});
+      for (const a of ctx.apps) await a.close().catch(() => {});
+      res.launches = ctx.apps.map((a) => a.summary());
+      res.lserr_count = res.launches.reduce((n, l) => n + l.lserr.length, 0);
+      if (res.lserr_count) res.warnings.push(`app errors (LSERR/pageerror): ${res.lserr_count}`);
+      res.timeline = ctx.timeline;
+      res.tokens = ctx.tokens;
+    }
+    res.duration_ms = Date.now() - started;
+    if (ctx) fs.writeFileSync(path.join(ctx.dir, 'result.json'), JSON.stringify(res, null, 1));
+  }
+  return res;
+}
+
+function summaryTable(results) {
+  const rows = results.map((r) => [r.scenario, r.status.toUpperCase(),
+    `${r.checks.filter((c) => c.ok && c.severity === 'fail').length}/${r.checks.filter((c) => c.severity === 'fail').length}`,
+    String(r.warnings.length), String(r.policy_checks ? r.policy_checks.length : 0), String(r.bak_new ? r.bak_new.length : 0),
+    String(r.lserr_count || 0), `${Math.round(r.duration_ms / 1000)}s`, (r.reasons[0] || '').slice(0, 110)]);
+  const head = ['scenario', 'status', 'gates', 'warn', 'policy', 'bak', 'lserr', 'time', 'first reason'];
+  const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
+  const fmt = (r) => r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(w[i]))).join('  ');
+  return [fmt(head), fmt(w.map((n) => '-'.repeat(n))), ...rows.map(fmt)].join('\n');
+}
+
+async function main(argv) {
+  const o = { only: null, out: null, timeoutSec: 900, samePageDelayMs: 500, list: false, selftest: null };
+  for (const a of argv) {
+    let m;
+    if ((m = a.match(/^--only=(.+)$/))) o.only = m[1].split(',').map((s) => s.trim()).filter(Boolean);
+    else if ((m = a.match(/^--out=(.+)$/))) o.out = m[1];
+    else if ((m = a.match(/^--timeout=(\d+)$/))) o.timeoutSec = Number(m[1]);
+    else if ((m = a.match(/^--same-page-delay=(\d+)$/))) o.samePageDelayMs = Number(m[1]);
+    else if (a === '--list') o.list = true;
+    else if ((m = a.match(/^--selftest=(.+)$/))) o.selftest = m[1];
+    else { console.error(`unknown argument ${a}\n(see the header of lssafety.js)`); return 2; }
+  }
+  if (o.list) { console.log(SCENARIOS.join('\n')); return 0; }
+  if (o.selftest) return selftest(o.selftest);
+  const names = o.only || SCENARIOS;
+  const unknown = names.filter((n) => !scenarios[n]);
+  if (unknown.length) { console.error(`unknown scenario(s): ${unknown.join(', ')}; known: ${SCENARIOS.join(', ')}`); return 2; }
+  if (!fs.existsSync(APP)) { console.error(`no app binary at ${APP} (set LSSAFETY_APP)`); return 2; }
+  let root;
+  try {
+    root = assertSafePath(o.out || path.join(BASE, 'safety', new Date().toISOString().replace(/[:.]/g, '-')));
+  } catch (e) { console.error(errText(e)); return 2; }
+  fs.mkdirSync(root, { recursive: true });
+  log(`app ${APP}\n  run dir ${root}\n  scenarios ${names.join(', ')}`);
+  const results = [];
+  for (const n of names) {
+    log(`== ${n}`);
+    const r = await runScenario(n, root, o);
+    results.push(r);
+    console.log(`LSSAFETY_RESULT ${JSON.stringify({ scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [], result: path.join(r.dir || root, 'result.json') })}`);
+  }
+  const table = summaryTable(results);
+  fs.writeFileSync(path.join(root, 'summary.json'), JSON.stringify({ app: APP, root, results: results.map((r) => ({
+    scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [], duration_ms: r.duration_ms })) }, null, 1));
+  fs.writeFileSync(path.join(root, 'summary.txt'), `${table}\n`);
+  console.log(`\n${table}\n\nresults: ${root}`);
+  return results.every((r) => r.status === 'pass') ? 0 : 1;
+}
+
+// ---- self-test of the pure helpers (no app) ------------------------------------
+function selftest(dir) {
+  const assert = require('assert');
+  const abs = path.resolve(dir);
+  assertSafePath(abs, { requireBase: false });
+  // the guard itself
+  for (const bad of [path.join(HOME, 'OneDrive/Logseq'), path.join(HOME, 'OneDrive'), path.join(HOME, '.claude/x'), path.join(HOME, 'dev/logsidian/x'), '/tmp/x']) {
+    assert.throws(() => assertSafePath(bad), `guard must refuse ${bad}`);
+  }
+  assert.doesNotThrow(() => assertSafePath(path.join(BASE, 'safety', 'x')));
+  assert.throws(() => assertSafePath(BASE), 'the base itself is not a run dir');
+  const g = path.join(abs, `graph-${process.pid}`);
+  if (fs.existsSync(g)) throw new Error(`${g} exists`);
+  const tpl = makeTemplate();
+  writeFiles(g, tpl.files);
+  const s0 = snapshotDir(g);
+  assert.strictEqual(s0.size, 1 + JOURNAL_DAYS + PAGES + 2);
+  assert.ok(s0.get('logseq/config.edn').text.includes(':default-home {:page "Home"}'));
+  assert.ok(!s0.get(pageRel(RACE_PAGE)).text.includes('id::'));
+  // edits
+  const j = s0.get(journalRel(20)).text;
+  const jd = deleteBlock(j, `Journal ${isoDay(20)} block to delete`);
+  assert.ok(!jd.includes('block to delete') && jd.includes('block to change'));
+  const pd = deleteBlock(s0.get(pageRel(pageName(4))).text, 'Page 04 block two with id');
+  assert.ok(!pd.includes('id::') && pd.includes('block three'), 'delete removes the property line too');
+  assert.ok(pd.includes('\t- Page 04 child block'));
+  const jr = replaceBlockLine(j, `Journal ${isoDay(20)} block to change`, 'X');
+  assert.ok(jr.split('\n').includes('- X'));
+  assert.throws(() => replaceBlockLine(j, 'nope', 'x'));
+  assert.strictEqual(appendBlock('- a', 'b'), '- a\n- b');
+  assert.strictEqual(appendBlock('- a\n', 'b'), '- a\n- b');
+  // verify: exact / id-only additions / loss with bak / untouched / typed
+  const P = pageRel(RACE_PAGE);
+  const want = appendBlock(s0.get(P).text, 'offline tokx');
+  fs.writeFileSync(path.join(g, P), want);
+  const b1 = snapshotDir(g);
+  let c = verify(s0, b1, [{ path: P, kind: 'exact', content: want, tokens: ['tokx'] }]);
+  assert.ok(c.every((x) => x.ok), JSON.stringify(c));
+  const withId = want.replace(`- ${RACE_B}`, `- ${RACE_B}\n  id:: ${uuidFor(999)}`);
+  fs.writeFileSync(path.join(g, P), withId);
+  c = verify(s0, snapshotDir(g), [{ path: P, kind: 'exact', content: want, tokens: ['tokx'] }]);
+  assert.ok(c[0].ok && c[0].warn, 'added id:: line is not a loss');
+  // the race: P rewritten from the old copy + id, the edit only in bak
+  fs.writeFileSync(path.join(g, P), s0.get(P).text.replace(`- ${RACE_B}`, `- ${RACE_B}\n  id:: ${uuidFor(999)}`));
+  fs.mkdirSync(path.join(g, 'logseq/bak/pages/Race Page'), { recursive: true });
+  fs.writeFileSync(path.join(g, 'logseq/bak/pages/Race Page/2026-09-12T00_00_00.000Z.Desktop.md'), want);
+  const s2 = snapshotDir(g);
+  const baks = newBaks(b1, s2, ['tokx']);
+  assert.strictEqual(baks.length, 1);
+  c = verify(b1, s2, [{ path: P, kind: 'exact', content: want, tokens: ['tokx'] }], { bakNew: baks });
+  assert.ok(!c[0].ok && c[0].in_bak === 'exact' && /tokx/.test(c[0].detail), JSON.stringify(c[0]));
+  // untouched file changed -> fail, only id added -> warn, new file -> warn
+  const J5 = journalRel(5);
+  fs.writeFileSync(path.join(g, J5), s0.get(J5).text.replace('note alpha', 'note ALPHA'));
+  fs.writeFileSync(path.join(g, 'pages/New.md'), '- new');
+  c = verify(s0, snapshotDir(g), []);
+  assert.ok(c.some((x) => x.name === `untouched ${J5}` && x.severity === 'fail' && !x.ok));
+  assert.ok(c.some((x) => x.name === 'new file pages/New.md' && x.severity === 'warn'));
+  assert.ok(!c.some((x) => x.name.includes('logseq/bak')), 'bak is not a graph file');
+  // typed: once + other lines kept (tab->spaces tolerated, id line tolerated)
+  const T = pageRel(pageName(2));
+  const base = s0.get(T).text;
+  const typedOk = base.replace('- Page 02 block one plain text', '- Page 02 block one plain text b1tok b2tok').replace('\t- Page 02 child', '    - Page 02 child');
+  fs.writeFileSync(path.join(g, T), typedOk);
+  const e = { path: T, kind: 'typed', base, target: 'Page 02 block one', typed: [' b1tok', ' b2tok'], tokens: ['b1tok', 'b2tok'] };
+  c = checkExpectation(e, snapshotDir(g), []);
+  assert.ok(c.ok && !c.byte_exact, JSON.stringify(c));
+  fs.writeFileSync(path.join(g, T), `${typedOk}\n- dup b1tok`);
+  c = checkExpectation(e, snapshotDir(g), []);
+  assert.ok(!c.ok && c.token_counts.b1tok === 2);
+  fs.writeFileSync(path.join(g, T), typedOk.replace('- Page 02 block to delete\n', ''));
+  c = checkExpectation(e, snapshotDir(g), []);
+  assert.ok(!c.ok && c.detail === 'other lines changed', JSON.stringify(c));
+  // contains + absent
+  c = checkExpectation({ path: 'logseq/config.edn', kind: 'contains', fragments: [':favorites ["home"]', ';; nope'] }, snapshotDir(g), []);
+  assert.ok(!c.ok && /nope/.test(c.detail));
+  c = checkExpectation({ path: 'pages/Gone.md', kind: 'absent' }, snapshotDir(g), []);
+  assert.ok(c.ok);
+  // config offline edit shape
+  const cfg = s0.get('logseq/config.edn').text.replace(/\}\s*$/, '\n ;; lssafety offline edit t\n :ui/show-brackets? true}\n');
+  assert.ok(/:default-home \{:page "Home"\}\n ;; lssafety offline edit t\n :ui\/show-brackets\? true\}\n$/.test(cfg), cfg);
+  // same-page outcomes
+  assert.strictEqual(samePageOutcome({ finalText: 'g h i', extTokens: ['g', 'h'], typedToken: 'i', bakTexts: [] }).outcome, 'merged');
+  assert.strictEqual(samePageOutcome({ finalText: 'x i', extTokens: ['g', 'h'], typedToken: 'i', bakTexts: ['g h'] }).outcome, 'backup+overwrite');
+  assert.strictEqual(samePageOutcome({ finalText: 'g h', extTokens: ['g', 'h'], typedToken: 'i', bakTexts: [] }).outcome, 'typed-dropped (refused or superseded)');
+  // diffs
+  assert.deepStrictEqual(lineDiff('a\nb\nc', 'a\nB\nc'), [' a', '-b', '+B', ' c']);
+  assert.strictEqual(stripAddedIdLines(`x\n  id:: ${uuidFor(1)}\ny`, 'x\ny'), 'x\ny');
+  assert.strictEqual(classify('logseq/bak/pages/a/1.md'), 'bak');
+  assert.strictEqual(classify('journals/.x.md.lssafety~'), 'hidden');
+  assert.strictEqual(countOf('ab ab', 'ab'), 2);
+  console.log(`selftest ok (${g})`);
+  return 0;
+}
+
+module.exports = { makeTemplate, appendBlock, replaceBlockLine, deleteBlock, snapshotDir, verify, checkExpectation,
+  lineDiff, stripAddedIdLines, samePageOutcome, assertSafePath, classify, newBaks };
+
+if (require.main === module) {
+  const stop = async (sig) => {
+    log(`${sig}: closing ${liveApps.size} app(s)`);
+    for (const a of [...liveApps]) await a.close().catch(() => {});
+    process.exit(130);
+  };
+  process.on('SIGINT', () => stop('SIGINT'));
+  process.on('SIGTERM', () => stop('SIGTERM'));
+  main(process.argv.slice(2)).then((code) => process.exit(code), (e) => {
+    console.error('FAILED:', e && e.stack || e);
+    process.exit(1);
+  });
+}
