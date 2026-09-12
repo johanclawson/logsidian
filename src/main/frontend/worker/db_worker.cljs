@@ -958,6 +958,12 @@
   (when-let [conn (worker-state/get-datascript-conn repo)]
     (file/failed-writes repo @conn)))
 
+(def-thread-api :thread-api/unstamp-failed-file-write
+  [repo file-path proposal base]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (file/unstamp-failed-proposal! conn file-path proposal base))
+  nil)
+
 (def-thread-api :thread-api/sync-app-state
   [new-state]
   (when (and (contains? new-state :git/current-repo)

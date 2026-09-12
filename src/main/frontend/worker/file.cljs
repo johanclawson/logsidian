@@ -192,6 +192,23 @@
                                     :base base})
     (ldb/transact! conn [{:file/path file-path :file/content content}] {:skip-refresh? true})))
 
+(defn unstamp-failed-proposal!
+  "Undoes send-proposal!'s stamp once the renderer reports that the write of
+   proposal failed without changing the disk (io-error): :file/content goes
+   back to base (is retracted when base is nil, a new file), so the page's
+   next save is expected against the disk again and retries the write
+   instead of being refused against the unwritten proposal. Only while
+   :file/content still holds that proposal: a newer proposal stamped since
+   keeps its stamp. Returns true when it undid the stamp."
+  [conn file-path proposal base]
+  (when (= proposal (:file/content (d/entity @conn [:file/path file-path])))
+    (ldb/transact! conn
+                   [(if (some? base)
+                      {:file/path file-path :file/content base}
+                      [:db.fn/retractAttribute [:file/path file-path] :file/content])]
+                   {:skip-refresh? true})
+    true))
+
 (defn- save-tree-aux!
   [repo conn page-block tree blocks-just-deleted? context request-id]
   (let [db @conn

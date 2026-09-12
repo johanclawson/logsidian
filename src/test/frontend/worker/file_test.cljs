@@ -143,3 +143,25 @@
         (is (= [] (worker-file/failed-writes "repo" @conn))))
       (finally
         (reset! worker-file/*failed-writes {})))))
+
+(deftest unstamp-failed-proposal-test
+  (testing "a failed save gives its base back while its proposal is still the stamp"
+    (let [conn (page-conn "- A")]
+      (save-page! conn 1)
+      (is (true? (worker-file/unstamp-failed-proposal! conn "pages/a.md" "" "- A")))
+      (is (= "- A" (:file/content (d/entity @conn [:file/path "pages/a.md"]))))
+      (let [[[_ data]] (save-page! conn 2)]
+        (is (= "- A" (:base data)) "the next save is expected against the disk again: a retry"))))
+  (testing "a newer stamp is kept"
+    (let [conn (page-conn "- A")]
+      (save-page! conn 1)
+      (d/transact! conn [{:file/path "pages/a.md" :file/content "- newer"}])
+      (is (nil? (worker-file/unstamp-failed-proposal! conn "pages/a.md" "" "- A")))
+      (is (= "- newer" (:file/content (d/entity @conn [:file/path "pages/a.md"]))))))
+  (testing "a new file's failed save leaves no content, so the next save creates the file"
+    (let [conn (page-conn nil)]
+      (save-page! conn 1)
+      (is (true? (worker-file/unstamp-failed-proposal! conn "pages/a.md" "" nil)))
+      (is (nil? (:file/content (d/entity @conn [:file/path "pages/a.md"]))))
+      (let [[[_ data]] (save-page! conn 2)]
+        (is (nil? (:base data)))))))

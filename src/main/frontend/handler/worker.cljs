@@ -6,6 +6,7 @@
             [frontend.handler.notification :as notification]
             [frontend.state :as state]
             [frontend.undo-redo :as undo-redo]
+            [goog.object :as gobj]
             [lambdaisland.glogi :as log]
             [logseq.db :as ldb]
             [promesa.core :as p]))
@@ -19,7 +20,17 @@
         ;; write's expected content; nil means a new file
         opts (if (contains? data :base) {:base (:base data)} {})]
     (->
-     (p/let [results (file-handler/alter-files repo files opts)]
+     (p/let [results (file-handler/alter-files repo files opts)
+             ;; a write that failed without touching the disk (io-error)
+             ;; gives its base back to the worker, so the page's next save
+             ;; retries against the disk instead of being refused against
+             ;; this unwritten proposal (worker.file/unstamp-failed-proposal!)
+             _ (when (contains? data :base)
+                 (p/all (map (fn [[path content] result]
+                               (when (and (some? result) (= "io-error" (gobj/get result "result")))
+                                 (state/<invoke-db-worker :thread-api/unstamp-failed-file-write
+                                                          repo path content (:base data))))
+                             files results)))]
        (state/<invoke-db-worker :thread-api/page-file-saved request-id page-id
                                 (file-handler/alter-files-outcome results) repo))
      (p/catch (fn [error]
