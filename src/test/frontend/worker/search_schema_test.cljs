@@ -34,14 +34,16 @@
 
 (defn- fake-db
   "Stands in for a sqlite-wasm oo1 DB and keeps what the schema code reads
-  back: search_meta (values as TEXT), which of blocks/blocks_fts exist, and
-  the trigger SQL (as sqlite_master stores it: IF NOT EXISTS dropped; an
-  existing trigger is kept). Dropping blocks drops its triggers, as in
-  SQLite. Every statement is logged."
-  [{:keys [tables triggers meta]}]
+  back: search_meta (values as TEXT), which of blocks/blocks_fts exist, the
+  trigger SQL (as sqlite_master stores it: IF NOT EXISTS dropped; an
+  existing trigger is kept) and blocks_fts_config. Dropping blocks drops its
+  triggers, as in SQLite, and dropping blocks_fts its config. Every
+  statement is logged."
+  [{:keys [tables triggers meta fts-config]}]
   (let [store (atom {:tables (set tables)
                      :triggers (into {} triggers)
                      :meta (or meta {})
+                     :fts-config (or fts-config {})
                      :log []
                      :transactions 0})
         db #js {}]
@@ -63,6 +65,12 @@
                 (string/starts-with? sql "INSERT INTO search_meta")
                 (do (swap! store assoc-in [:meta (get bind "$k")] (str (get bind "$v"))) db)
 
+                (string/starts-with? sql "SELECT k, v FROM blocks_fts_config")
+                (clj->js (mapv (fn [[k v]] [k v]) (:fts-config @store)))
+
+                (string/starts-with? sql "INSERT INTO blocks_fts(blocks_fts, rank)")
+                (do (swap! store assoc-in [:fts-config (get bind "$k")] (get bind "$v")) db)
+
                 (string/starts-with? sql "CREATE TABLE IF NOT EXISTS blocks")
                 (do (swap! store update :tables conj "blocks") db)
 
@@ -78,7 +86,7 @@
                   db)
 
                 (string/includes? sql "DROP TABLE IF EXISTS blocks;")
-                (do (swap! store assoc :tables #{} :triggers {}) db)
+                (do (swap! store assoc :tables #{} :triggers {} :fts-config {}) db)
 
                 :else db))))
     (set! (.-transaction db) (fn [f]
@@ -143,22 +151,96 @@
     (is (false? (search/current-triggers? [["blocks_ad" nil] ["blocks_ai" nil] ["blocks_au" nil]])))))
 
 (deftest upsert-sql-test
-  (let [s (squash search/upsert-sql)]
-    (is (string/starts-with? s "insert into blocks (id, title, page) values ($id, $title, $page)"))
+  (let [s (squash search/upsert-sql)
+        at #(string/index-of s %)]
+    (is (string/starts-with? s (str "insert into blocks (id, title, page)"
+                                    " select j.value ->> 0, j.value ->> 1, j.value ->> 2"
+                                    " from json_each($rows) as j"))
+        "every row of the $rows JSON in one statement")
+    (testing "rows are written in target rowid order (FTS5 flushes a segment when a rowid goes back)"
+      (is (string/includes? s "left join blocks as b on b.id = j.value ->> 0")
+          "an existing row's rowid")
+      (is (string/includes? s "order by b.rowid is null, b.rowid, j.key")
+          "existing rows by rowid first, then new rows in input order"))
+    (testing "where true, then order by, then on conflict (the INSERT ... SELECT upsert parse rule)"
+      (is (< (at " where true ") (at " order by ") (at " on conflict (id) "))))
     (is (string/includes? s (str "on conflict (id) do update set title = excluded.title, page = excluded.page"
                                  " where blocks.title is not excluded.title"
                                  " or blocks.page is not excluded.page"))
-        "an unchanged row is not updated, so no trigger fires")))
+        "an unchanged row is not updated, so no trigger fires")
+    (is (not (string/includes? s "or replace")) "no delete + reinsert")))
+
+(deftest delete-sql-test
+  (is (= "delete from blocks where id in (select value from json_each($ids))"
+         (squash search/delete-sql))))
+
+(defn- json-bind
+  [entry k]
+  (js->clj (js/JSON.parse (get-in entry [:bind k]))))
 
 (deftest upsert-statement-test
   (let [{:keys [db store]} (fake-db {})
-        id (str (random-uuid))]
+        id (str (random-uuid))
+        id2 (str (random-uuid))]
     (search/commit-batch! db [{:id id :title "t" :page id}
-                              {:id "bad" :title "x" :page id}]
+                              {:id "bad" :title "x" :page id}
+                              {:id id2 :title "u" :page id}]
                           {:cursor 1})
-    (is (= [{:sql search/upsert-sql :bind {"$id" id "$title" "t" "$page" id}}]
-           (filterv #(string/starts-with? (:sql %) "INSERT INTO blocks ") (:log @store)))
-        "one upsert per good row; the bad row is skipped")))
+    (let [upserts (filterv #(string/starts-with? (:sql %) "INSERT INTO blocks ") (:log @store))]
+      (is (= [search/upsert-sql] (mapv :sql upserts)) "one statement per commit")
+      (is (= [[id "t" id] [id2 "u" id]] (json-bind (first upserts) "$rows"))
+          "the bad row is skipped; the good ones keep their order"))
+    (testing "no valid row: no upsert statement, the meta still commits"
+      (let [n (count (:log @store))]
+        (search/commit-batch! db [{:id "bad" :title "x" :page id}] {:cursor 2})
+        (is (not-any? #(string/starts-with? (:sql %) "INSERT INTO blocks ") (drop n (:log @store))))
+        (is (= 2 (:cursor (search/get-meta db))))))))
+
+(deftest sync-statements-test
+  (let [{:keys [db store]} (fake-db {})
+        [a b c] (repeatedly 3 #(str (random-uuid)))]
+    (search/sync-rows! db #{a b} [{:id c :title "first" :page c}
+                                  {:id c :title "last" :page c}]
+                       {:indexed-tx 7})
+    (let [log (:log @store)
+          kinds (keep (fn [{:keys [sql]}]
+                        (cond (string/starts-with? sql "DELETE FROM blocks") :delete
+                              (string/starts-with? sql "INSERT INTO blocks ") :upsert
+                              (string/starts-with? sql "INSERT INTO search_meta") :meta))
+                      log)]
+      (is (= [:delete :upsert :meta] kinds) "one delete, one upsert, then the watermark")
+      (is (= 1 (:transactions @store)) "in one transaction")
+      (is (= #{a b} (set (json-bind (first (filter #(= search/delete-sql (:sql %)) log)) "$ids")))
+          "every id in one $ids parameter")
+      (is (= [[c "last" c]] (json-bind (first (filter #(= search/upsert-sql (:sql %)) log)) "$rows"))
+          "one row per id, the last one winning"))
+    (testing "nothing removed or added: only the watermark"
+      (let [n (count (:log @store))]
+        (search/sync-rows! db #{} [] {:indexed-tx 8})
+        (is (every? #(string/starts-with? (:sql %) "INSERT INTO search_meta") (drop n (:log @store))))))))
+
+(deftest fts-config-test
+  (is (= {"automerge" 0 "crisismerge" 16 "usermerge" 4} search/fts-config))
+  (let [{:keys [db store]} (fake-db {})
+        fts-writes (fn [log] (filterv #(string/starts-with? (:sql %) "INSERT INTO blocks_fts(blocks_fts, rank)") log))]
+    (search/create-tables-and-triggers! db)
+    (testing "a new db gets the FTS5 merge settings"
+      (is (= search/fts-config (:fts-config @store)))
+      (is (= 3 (count (fts-writes (:log @store))))))
+    (testing "an open that finds them writes nothing"
+      (let [n (count (:log @store))]
+        (search/create-tables-and-triggers! db)
+        (is (empty? (fts-writes (drop n (:log @store)))))))
+    (testing "only a differing key is written"
+      (swap! store assoc-in [:fts-config "automerge"] 4)
+      (let [n (count (:log @store))]
+        (search/create-tables-and-triggers! db)
+        (is (= [{"$k" "automerge" "$v" 0}] (mapv :bind (fts-writes (drop n (:log @store))))))))
+    (testing "a truncate recreates blocks_fts and sets them inside its transaction"
+      (let [n (:transactions @store)]
+        (search/truncate-table! db)
+        (is (= (inc n) (:transactions @store)))
+        (is (= search/fts-config (:fts-config @store)))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Version decision

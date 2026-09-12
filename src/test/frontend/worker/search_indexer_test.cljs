@@ -12,12 +12,19 @@
 
 (def ^:private repo "search-indexer-test-repo")
 
+(defn- json-param
+  [bind k]
+  (js->clj (js/JSON.parse (gobj/get bind k))))
+
 (defn- fake-sdb
   "Stands in for a sqlite-wasm oo1 DB, for the statements the index uses.
   search_meta values are kept as strings, the way its TEXT column hands them
-  back."
+  back. Rows arrive as the $rows JSON of search/upsert-sql and deletes as the
+  $ids JSON of search/delete-sql; FTS5 commands (INSERT INTO blocks_fts(...))
+  set :fts-config. No timers: this db has no changes(), so
+  search-indexer/start-maint! ignores it."
   []
-  (let [store (atom {:meta {} :blocks {} :transactions 0})
+  (let [store (atom {:meta {} :blocks {} :fts-config {} :transactions 0})
         db #js {}]
     (set! (.-exec db)
           (fn [arg]
@@ -35,17 +42,28 @@
                 (string/starts-with? sql "SELECT k, v FROM search_meta")
                 (clj->js (mapv (fn [[k v]] [k v]) (:meta @store)))
 
-                (string/starts-with? sql "INSERT INTO blocks")
-                (do (swap! store assoc-in [:blocks (b "$id")] {:title (b "$title") :page (b "$page")}) db)
+                ;; before the INSERT INTO blocks branch: an FTS5 command is
+                ;; not a blocks row
+                (string/starts-with? sql "INSERT INTO blocks_fts(blocks_fts, rank)")
+                (do (swap! store assoc-in [:fts-config (b "$k")] (b "$v")) db)
+
+                (string/starts-with? sql "SELECT k, v FROM blocks_fts_config")
+                (clj->js (mapv (fn [[k v]] [k v]) (:fts-config @store)))
+
+                (string/starts-with? sql "INSERT INTO blocks ")
+                (do (swap! store update :blocks into
+                           (map (fn [[id title page]] [id {:title title :page page}]))
+                           (json-param bind "$rows"))
+                    db)
 
                 (string/starts-with? sql "SELECT 1 FROM blocks")
                 (clj->js (if (seq (:blocks @store)) [[1]] []))
 
-                (string/starts-with? sql "DELETE from blocks WHERE id IN")
-                (do (swap! store update :blocks #(apply dissoc % (map second (re-seq #"'([^']+)'" sql)))) db)
+                (string/starts-with? sql "DELETE FROM blocks WHERE id IN")
+                (do (swap! store update :blocks #(apply dissoc % (json-param bind "$ids"))) db)
 
                 (string/includes? sql "DROP TABLE IF EXISTS blocks;")
-                (do (swap! store assoc :blocks {}) db)
+                (do (swap! store assoc :blocks {} :fts-config {}) db)
 
                 :else db))))
     (set! (.-transaction db) (fn [f]
@@ -179,6 +197,103 @@
         (is (= {id2 {:title "new" :page page}} (:blocks @store)))
         (is (= 9 (:indexed-tx (search/get-meta db))))
         (is (= 2 (:transactions @store)))))))
+
+(deftest rows-json-validates-before-dedupe-test
+  (let [id (str (random-uuid))
+        id2 (str (random-uuid))
+        page (str (random-uuid))
+        rows (fn [xs] (some-> (search/rows->json xs) :json js/JSON.parse js->clj))]
+    (testing "a later bad row of an id does not replace the good one"
+      (is (= [[id "good" page]]
+             (rows [{:id id :title "good" :page page}
+                    {:id id :title "bad page" :page "not-a-uuid"}
+                    {:id id :title 42 :page page}]))))
+    (testing "the last valid row of an id wins, at the position of its first"
+      (is (= [[id "b" page] [id2 "x" page]]
+             (rows [{:id id :title "a" :page page}
+                    {:id id2 :title "x" :page page}
+                    {:id id :title "b" :page page}])))
+      (is (= 2 (:n (search/rows->json [{:id id :title "a" :page page}
+                                       {:id id2 :title "x" :page page}
+                                       {:id id :title "b" :page page}])))))
+    (testing "bad ids, pages and titles are skipped"
+      (is (= [[id2 "ok" page]]
+             (rows [{:id "not-a-uuid" :title "t" :page page}
+                    {:id id :title nil :page page}
+                    {:id id2 :title "ok" :page page}]))))
+    (testing "no valid row: nil, so no statement runs"
+      (is (nil? (search/rows->json [{:id "bad" :title "t" :page page}])))
+      (is (nil? (search/rows->json []))))
+    (testing "quotes, backslashes and non-ASCII survive the JSON parameter"
+      (let [t "a \"quote\" \\ back\\slash, möte 😀"]
+        (is (= [[id t page]] (rows [{:id id :title t :page page}])))))
+    (when (.-toWellFormed "")
+      (testing "a lone surrogate becomes U+FFFD, the bytes TextEncoder wrote before"
+        (is (= [[id "a\uFFFDb" page]] (rows [{:id id :title "a\uD800b" :page page}])))))))
+
+(deftest delete-blocks-by-ids-test
+  (let [{:keys [db store]} (fake-sdb)
+        page (str (random-uuid))
+        [a b c] (repeatedly 3 #(str (random-uuid)))]
+    (search/commit-batch! db (mapv (fn [id] {:id id :title id :page page}) [a b c]) {:cursor 1})
+    (is (= #{a b c} (set (keys (:blocks @store)))))
+    (search/delete-blocks! db #{a c})
+    (is (= #{b} (set (keys (:blocks @store)))) "every id in the one $ids parameter")
+    (search/delete-blocks! db [(uuid b)])
+    (is (empty? (:blocks @store)) "uuids are sent as their strings")
+    (let [n (:transactions @store)]
+      (search/sync-rows! db #{} [{:id a :title "t" :page page}] {:indexed-tx 3})
+      (is (= {a {:title "t" :page page}} (:blocks @store)) "no ids: no delete")
+      (is (= (inc n) (:transactions @store))))))
+
+(deftest orphan-queue-test
+  (let [conn (d/create-conn file-schema/schema)
+        live (random-uuid)
+        gone (str (random-uuid))]
+    (d/transact! conn [{:block/uuid live :block/name "live" :block/title "Live"}])
+    (search/take-orphans! repo)
+    (search/queue-orphans! repo [gone (str live)])
+    (search/queue-orphans! repo [gone])
+    (let [ids (search/take-orphans! repo)]
+      (is (= #{gone (str live)} ids) "queued once per id")
+      (is (nil? (search/take-orphans! repo)) "taking empties the queue")
+      (is (= [gone] (vec (search/still-orphans @conn ids)))
+          "a block that exists again (e.g. undo) is not deleted"))
+    (testing "the queue is capped"
+      (search/queue-orphans! repo (repeatedly 5000 #(str (random-uuid))))
+      (is (= 1000 (count (search/take-orphans! repo)))))))
+
+(deftest maint-action-test
+  (let [idle {:wrote? false :streak-ms 0 :quiet-ms 5000 :since-ckpt-ms 5000
+              :pending? false :merge? false :busy? false}
+        writing (assoc idle :wrote? true :quiet-ms 0 :pending? true)]
+    (is (= {:ckpt? false :merge nil} (search-indexer/maint-action idle)) "nothing to do")
+    (testing "writes that keep happening: a checkpoint about every tick"
+      (is (false? (:ckpt? (search-indexer/maint-action writing)))
+          "the first tick of a streak waits: one save gets the quiet checkpoint")
+      (is (true? (:ckpt? (search-indexer/maint-action (assoc writing :streak-ms 250)))))
+      (is (false? (:ckpt? (search-indexer/maint-action (assoc writing :streak-ms 500 :since-ckpt-ms 100))))
+          "never two within the gap"))
+    (testing "quiet: one checkpoint after a second without writes"
+      (is (false? (:ckpt? (search-indexer/maint-action (assoc idle :pending? true :quiet-ms 750)))))
+      (is (true? (:ckpt? (search-indexer/maint-action (assoc idle :pending? true :quiet-ms 1000)))))
+      (is (false? (:ckpt? (search-indexer/maint-action (assoc idle :pending? true :busy? true))))
+          "not while the user waits on the worker")
+      (is (false? (:ckpt? (search-indexer/maint-action (assoc idle :quiet-ms 1000))))
+          "nothing written since the last one"))
+    (testing "merges: one step while busy or writing, a run when idle"
+      (is (= :run (:merge (search-indexer/maint-action (assoc idle :merge? true)))))
+      (is (= :step (:merge (search-indexer/maint-action (assoc idle :merge? true :busy? true)))))
+      (is (= :step (:merge (search-indexer/maint-action (assoc writing :merge? true)))))
+      (is (nil? (:merge (search-indexer/maint-action writing))) "no merge work left"))))
+
+(deftest maint-inert-without-sqlite-test
+  (let [{:keys [db]} (fake-sdb)]
+    (is (nil? (search-indexer/start-maint! repo db)) "a fake db has no changes(): no tick")
+    (is (nil? (search-indexer/start-maint! repo nil)))
+    (is (false? (search-indexer/maint-running? repo)) "no timer left behind")
+    (search-indexer/close! repo)
+    (is (false? (search-indexer/maint-running? repo)))))
 
 (deftest truncate-table-records-state-test
   (let [{:keys [db store]} (fake-sdb)

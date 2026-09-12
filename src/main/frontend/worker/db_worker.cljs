@@ -351,14 +351,39 @@
                                        :client-ops client-ops-db})
       (doseq [db' dbs]
         (enable-sqlite-wal-mode! db'))
+      ;; The main db (the kvs table DataScript stores into) on NORMAL too. The
+      ;; wasm build defaults to FULL (DEFAULT_WAL_SYNCHRONOUS=2): an OPFS flush
+      ;; on every commit, and every DataScript transact commits, at least twice
+      ;; per save. WAL + NORMAL cannot corrupt the db; SQLite then syncs only at
+      ;; checkpoints and WAL restarts, so a power loss or OS crash can lose the
+      ;; last commits (the db stays consistent, one state older). The markdown
+      ;; files are the source of truth and are not fsynced either (no fsync in
+      ;; src/electron). A process kill or crash loses nothing, on the
+      ;; assumption that FileSystemSyncAccessHandle writes reach the OS
+      ;; without a flush (Chromium's implementation; the spec does not say).
+      (.exec db "PRAGMA synchronous=NORMAL")
       ;; The search db holds derived data and now commits once per DataScript
       ;; tx (search-indexer/sync-tx!): skip the WAL fsync on each commit. WAL +
       ;; NORMAL survives a process kill; a power loss can drop the last search
       ;; commits, which the watermark check on open sees as a gap and heals.
+      ;; With the main db on NORMAL the search db can also be the one ahead:
+      ;; rows for blocks the main db lost. A re-parse does not replace them (a
+      ;; file-graph block without id:: gets a new uuid), so search-blocks
+      ;; hides them and queues them for deletion (search/queue-orphans!).
       (.exec search-db "PRAGMA synchronous=NORMAL")
+      ;; Checkpoints leave the commit: search-indexer's maintenance tick runs
+      ;; them (PASSIVE) between tasks. The auto-checkpoint stays on as a hard
+      ;; cap for starved ticks (SQLite counts every frame, whoever wrote it);
+      ;; journal_size_limit truncates the WAL at its next restart (the 10k
+      ;; search db had a 79 MB WAL that never shrank). Both are per connection.
+      (.exec search-db (str "PRAGMA wal_autocheckpoint=" search-indexer/search-wal-autocheckpoint))
+      (.exec search-db (str "PRAGMA journal_size_limit=" search-indexer/search-journal-size-limit))
       (common-sqlite/create-kvs-table! db)
       (when-not @*publishing? (common-sqlite/create-kvs-table! client-ops-db))
       (search/create-tables-and-triggers! search-db)
+      ;; Only here, on the real open: checkpoints, FTS5 merges and orphan
+      ;; deletes for this search db, until close-db-aux! (search-indexer/close!)
+      (search-indexer/start-maint! repo search-db)
       (ldb/register-transact-pipeline-fn!
        (fn [tx-report]
          (worker-pipeline/transact-pipeline repo tx-report)))

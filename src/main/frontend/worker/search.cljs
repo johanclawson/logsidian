@@ -48,7 +48,16 @@
   column, which FTS5 can only do with a full scan (69 ms per row at 10k).
   2: every blocks_fts row has the rowid of its blocks row and the triggers
   delete by rowid (an FTS5 rowid lookup). An index at another version is
-  truncated and walked again (search-indexer/open-action, reason \"schema\")."
+  truncated and walked again (search-indexer/open-action, reason \"schema\").
+
+  The FTS5 merge settings (fts-config) are not part of the version. FTS5
+  persists them in blocks_fts_config and ensure-fts-config! writes them on
+  every open, so an existing version 2 index takes them without a walk. A
+  version 2 build without the maintenance tick (search-indexer/start-maint!;
+  such builds only ever ran in bench profiles) that opens an index this build
+  configured inherits automerge=0 and merges only by crisismerge: up to 15
+  segments per level, slower queries, no wrong results. Accepted instead of a
+  schema bump, which would walk every index again."
   2)
 
 (def fts-triggers
@@ -145,6 +154,29 @@ END;"]])
   ;; Index state (see get-meta). Not dropped by drop-tables-and-triggers!.
   (.exec db "CREATE TABLE IF NOT EXISTS search_meta (k TEXT PRIMARY KEY, v TEXT)"))
 
+(def fts-config
+  "FTS5 merge settings of blocks_fts (ADR-003 step 4).
+  - automerge 0: no incremental merge inside the committing statement. The
+    worker's maintenance tick merges instead, in bounded steps (merge-step!).
+  - usermerge 4: a merge step folds a level once it has 4 segments, the
+    fan-out automerge 4 had, so total merge work and segments per query stay
+    as they were.
+  - crisismerge 16 (the default, written out so it is explicit): the
+    backstop for starved ticks. A level that reaches 16 segments is merged
+    whole inside the commit, and that cascades upward, so it is not raised."
+  {"automerge" 0 "crisismerge" 16 "usermerge" 4})
+
+(defn- ensure-fts-config!
+  "Write each fts-config key blocks_fts_config does not already hold, so a
+  normal open writes nothing. FTS5 persists the values with the index; a new
+  blocks_fts (truncate-table!) gets them inside the truncate's transaction."
+  [^Object db]
+  (let [have (into {} (query-rows db "SELECT k, v FROM blocks_fts_config WHERE k IN ('automerge', 'crisismerge', 'usermerge')"))]
+    (doseq [[k v] fts-config]
+      (when-not (= v (get have k))
+        (.exec db #js {:sql "INSERT INTO blocks_fts(blocks_fts, rank) VALUES ($k, $v)"
+                       :bind #js {:$k k :$v v}})))))
+
 (declare set-meta!)
 
 (defn create-tables-and-triggers!*
@@ -154,11 +186,12 @@ END;"]])
   keeps its tables, triggers and recorded version: search-indexer/on-open!
   migrates an old one. truncate-table! uses this directly, so a failed CREATE
   rolls its whole transaction back instead of recording a version over
-  missing tables."
+  missing tables. Every call also applies fts-config (idempotent)."
   [db]
   (let [new-db? (not (search-tables-exist? db))]
     (create-blocks-table! db)
     (create-blocks-fts-table! db)
+    (ensure-fts-config! db)
     (add-blocks-fts-triggers! db)
     (create-meta-table! db)
     (when new-db?
@@ -190,55 +223,105 @@ DROP TRIGGER IF EXISTS blocks_ai;
 DROP TRIGGER IF EXISTS blocks_au;
 "))
 
-(defn- clj-list->sql
-  "Turn clojure list into SQL list
-   '(1 2 3 4)
-   ->
-   \"('1','2','3','4')\""
-  [ids]
-  (str "(" (->> (map (fn [id] (str "'" id "'")) ids)
-                (string/join ", ")) ")"))
-
 (def upsert-sql
-  "Insert or update one blocks row. The DO UPDATE only runs when title or page
-  differ (IS NOT: NULL-safe), so re-syncing an unchanged block writes nothing
-  and fires no trigger (it cost a blocks_fts delete + insert before)."
-  (str "INSERT INTO blocks (id, title, page) VALUES ($id, $title, $page)"
+  "Insert or update every row of $rows (rows->json) in ONE statement.
+  - One statement per commit keeps FTS5 at one new level-0 segment per
+    commit. FTS5 flushes its pending terms into a new segment at every
+    statement start (fts5SavepointMethod), so the per-row statements this
+    replaces wrote one segment per row, and merging them cost the commit
+    spikes.
+  - FTS5 also flushes whenever a written rowid is not above the one before
+    (sqlite3Fts5IndexBeginWrite), hence the ORDER BY: existing rows in blocks
+    rowid order, then new rows in input order. New rows get rowids above
+    every existing one. The update trigger deletes and reinserts a blocks_fts
+    row at the same rowid, which FTS5 allows without a flush.
+  - bench/sqlprobe-step4.py: 1 segment per mixed commit, 19-22 without the
+    ORDER BY, 50 for 50 per-row statements.
+  - WHERE true: SQLite's documented fix for the parse ambiguity of an
+    INSERT ... SELECT with ON CONFLICT.
+  - The DO UPDATE only runs when title or page differ (IS NOT: NULL-safe),
+    so re-syncing an unchanged block writes nothing and fires no trigger.
+  - Never INSERT OR REPLACE: it deletes and reinserts, firing the delete
+    trigger and renumbering rowids."
+  (str "INSERT INTO blocks (id, title, page)"
+       " SELECT j.value ->> 0, j.value ->> 1, j.value ->> 2"
+       " FROM json_each($rows) AS j LEFT JOIN blocks AS b ON b.id = j.value ->> 0"
+       " WHERE true"
+       " ORDER BY b.rowid IS NULL, b.rowid, j.key"
        " ON CONFLICT (id) DO UPDATE SET title = excluded.title, page = excluded.page"
        " WHERE blocks.title IS NOT excluded.title OR blocks.page IS NOT excluded.page"))
 
-(defn- upsert-row!
-  "Upsert one blocks row. A row with a bad id, page or title is skipped (and
-  logged) instead of throwing, so it can't roll back the rest of its batch or
-  pin a walk's cursor. Returns true when the row was accepted: afterwards
-  blocks holds exactly this row, whether it was inserted, updated or already
-  equal (a no-op). false when it was skipped. The callers ignore the value;
-  their row counts (the walk's :rows, *sync-perf :rows, slow-sync :rows) are
-  rows handed to the index, so an unchanged row counts the same as before."
-  [^Object tx id title page]
-  (if (and (common-util/uuid-string? id)
-           (common-util/uuid-string? page)
-           (string? title))
-    (do
-      (.exec tx #js {:sql upsert-sql
-                     :bind #js {:$id id
-                                :$title title
-                                :$page page}})
-      true)
-    (do
-      (js/console.warn "search: skipped a row with a bad id, page or title" id page)
-      false)))
+(def delete-sql
+  "Delete the blocks rows of $ids (a JSON array of block uuid strings) in one
+  statement; the delete trigger drops their blocks_fts rows. A DELETE with
+  triggers visits its rowids in order, so this adds one FTS5 segment
+  (bench/sqlprobe-step4.py), as the string-built IN list it replaces did."
+  "DELETE FROM blocks WHERE id IN (SELECT value FROM json_each($ids))")
+
+(defn- valid-row?
+  [id title page]
+  (and (common-util/uuid-string? id)
+       (common-util/uuid-string? page)
+       (string? title)))
+
+(defn- well-formed
+  "s with lone surrogates replaced by U+FFFD: the bytes TextEncoder wrote when
+  titles were bound one by one. JSON.stringify escapes a lone surrogate
+  instead, and SQLite's JSON decoder would store it as invalid UTF-8."
+  [^js s]
+  (if (.-toWellFormed s) (.toWellFormed s) s))
+
+(defn rows->json
+  "The $rows parameter of upsert-sql: {:json \"[[id title page] ...]\" :n rows},
+  or nil when no row is left. rows are {:id :title :page} maps.
+  Each row is validated first, then the rows are deduplicated by id, the
+  last valid row of an id winning, at the position of its first. Validating
+  after deduplicating would let a later bad row of an id replace a good one
+  and then be skipped. A bad row (id or page not a uuid string, title not a
+  string) is skipped with one warning per batch, never thrown, so it can't
+  roll back its batch or pin a walk's cursor."
+  [rows]
+  (let [by-id (js/Map.)
+        *bad (volatile! nil)]
+    (doseq [{:keys [id title page]} rows]
+      (if (valid-row? id title page)
+        (.set by-id id #js [id (well-formed title) page])
+        (vswap! *bad (fn [b] (if b (update b :n inc) {:n 1 :id id :page page})))))
+    (when-let [{:keys [n id page]} @*bad]
+      (js/console.warn "search: skipped" n "row(s) with a bad id, page or title; the first:" id page))
+    (when (pos? (.-size by-id))
+      {:json (js/JSON.stringify (js/Array.from (.values by-id)))
+       :n (.-size by-id)})))
+
+(defn- upsert-rows!
+  "upsert-sql for rows ({:id :title :page} maps, see rows->json) on tx. No
+  statement when no row is valid."
+  [^Object tx rows]
+  (when-let [{:keys [json]} (rows->json rows)]
+    (.exec tx #js {:sql upsert-sql :bind #js {:$rows json}})))
+
+(def ^:private upsert-chunk-rows
+  "Rows per statement in upsert-blocks!, whose caller can send a whole graph."
+  512)
 
 (defn upsert-blocks!
+  "thread-api/search-upsert-blocks (the UI-driven path): blocks is a JS array
+  of {id title page} objects. upsert-sql per chunk of upsert-chunk-rows, all
+  in one transaction, so no one JSON parameter holds a whole graph."
   [^Object db blocks]
   (.transaction db (fn [tx]
-                     (doseq [item blocks]
-                       (upsert-row! tx (.-id item) (.-title item) (.-page item))))))
+                     (doseq [chunk (partition-all upsert-chunk-rows blocks)]
+                       (upsert-rows! tx (map (fn [^js item]
+                                               {:id (.-id item) :title (.-title item) :page (.-page item)})
+                                             chunk))))))
 
 (defn delete-blocks!
-  [db ids]
-  (let [sql (str "DELETE from blocks WHERE id IN " (clj-list->sql ids))]
-    (.exec db sql)))
+  "Delete the blocks (and blocks_fts) rows of ids, block uuids or their
+  strings, in one statement (delete-sql). No statement for no ids."
+  [^Object db ids]
+  (when (seq ids)
+    (.exec db #js {:sql delete-sql
+                   :bind #js {:$ids (js/JSON.stringify (into-array (map str ids)))}})))
 
 ;; Index state, one search_meta row per key. v is a TEXT column, so every value
 ;; comes back as a string: rows->meta parses the integer keys on read.
@@ -310,24 +393,98 @@ DROP TRIGGER IF EXISTS blocks_au;
 (defn commit-batch!
   "One walk slice: rows ({:id :title :page} maps) and the walk's progress (a
   state map for set-meta!) in ONE SQLite transaction, so a quit resumes from
-  the committed cursor."
+  the committed cursor. The rows go in one statement (upsert-sql)."
   [^Object db rows meta]
   (.transaction db (fn [tx]
-                     (doseq [{:keys [id title page]} rows]
-                       (upsert-row! tx id title page))
+                     (upsert-rows! tx rows)
                      (set-meta! tx meta))))
 
 (defn sync-rows!
   "Incremental path: delete + upsert of one DataScript tx, plus its watermark,
-  in one SQLite transaction."
+  in one SQLite transaction: one delete statement, one upsert statement, the
+  meta rows. Each is its own exec, because oo1 binds only the first statement
+  of an exec that has parameters."
   [^Object db remove-ids rows meta]
   (.transaction db (fn [tx]
-                     (when (seq remove-ids)
-                       (delete-blocks! tx remove-ids))
-                     (doseq [{:keys [id title page]} rows]
-                       (upsert-row! tx id title page))
+                     (delete-blocks! tx remove-ids)
+                     (upsert-rows! tx rows)
                      (when meta
                        (set-meta! tx meta)))))
+
+;; ---------------------------------------------------------------------------
+;; Maintenance statements, run by search-indexer's maintenance tick between
+;; tasks, never inside a sync or walk commit.
+
+(defn total-changes
+  "sqlite3_total_changes of db: rows written since it opened, FTS5 shadow
+  tables included. The tick reads it to see that writes happened, and how
+  much a merge step did."
+  [^js db]
+  (.changes db true))
+
+(defn merge-step!
+  "One bounded FTS5 merge step: up to n pages of output, into a level that has
+  at least usermerge segments (fts-config). Returns the total_changes delta:
+  below 2 means nothing was left to merge (FTS5's 'merge' contract; an idle
+  step changes 1 row). n must be positive: a negative n merges the whole index
+  down to one segment."
+  [^js db n]
+  (let [c0 (total-changes db)]
+    (.exec db #js {:sql "INSERT INTO blocks_fts(blocks_fts, rank) VALUES ('merge', $n)"
+                   :bind #js {:$n n}})
+    (- (total-changes db) c0)))
+
+(defn checkpoint!
+  "PRAGMA wal_checkpoint(PASSIVE): [busy log checkpointed], log being the
+  frames in the WAL and checkpointed how many of them are in the db file now.
+  Copies every frame; there is no bounded checkpoint, so the tick keeps the
+  WAL small instead."
+  [^js db]
+  (first (query-rows db "PRAGMA wal_checkpoint(PASSIVE)")))
+
+(defn restart-wal!
+  "One small write right after a complete checkpoint. The first write after
+  one restarts the WAL: it syncs the new WAL header (an OPFS flush) and
+  applies journal_size_limit (a truncate). This way the tick pays for both,
+  not the next save or walk slice. The row is not index state: rows->meta
+  ignores its key."
+  [^js db]
+  (.exec db #js {:sql "INSERT INTO search_meta (k, v) VALUES ('wal_restart', $v) ON CONFLICT (k) DO UPDATE SET v = excluded.v"
+                 :bind #js {:$v (str (js/Date.now))}}))
+
+;; repo -> #{block uuid string}: search db rows whose block DataScript does not
+;; have (search-blocks found them). The maintenance tick deletes them.
+(defonce ^:private *orphan-ids (atom {}))
+;; Queue cap per repo, so a repo without a tick (tests, a failed tick) can't
+;; grow it without bound. One search queues at most its SQL limit.
+(def ^:private max-orphan-ids 1000)
+
+(defn queue-orphans!
+  "Queue ids (block uuid strings) for deletion from repo's search db. Rows
+  without an entity appear when the search db keeps commits the main db lost
+  (power loss with both on synchronous=NORMAL). A re-parse does not replace
+  them, since a file-graph block without id:: gets a new uuid. They are hidden
+  at query time, but only after the SQL limit, so they take result slots
+  until deleted."
+  [repo ids]
+  (when (seq ids)
+    (swap! *orphan-ids update repo
+           (fn [s]
+             (let [s (or s #{})]
+               (into s (take (max 0 (- max-orphan-ids (count s)))) ids))))))
+
+(defn take-orphans!
+  "Remove and return repo's queued orphan ids."
+  [repo]
+  (let [[old _] (swap-vals! *orphan-ids dissoc repo)]
+    (get old repo)))
+
+(defn still-orphans
+  "The ids (block uuid strings) db has no entity for. The tick checks again
+  before deleting: a tx since the search may have recreated the block (undo),
+  and its sync wrote the row back."
+  [db ids]
+  (remove (fn [id] (d/entity db [:block/uuid (uuid id)])) ids))
 
 (defonce max-snippet-length 250)
 
@@ -610,6 +767,12 @@ DROP TRIGGER IF EXISTS blocks_au;
                                (->> (search-blocks-aux search-db non-match-sql q non-match-input page limit enable-snippet?)
                                     (map (fn [result]
                                            (assoc result :keyword-score (fuzzy/score q (:title result)))))))
+            ;; SQL rows whose block DataScript does not have are dropped below
+            ;; (no entity), but only after the SQL limit, so they take result
+            ;; slots: queue them for the maintenance tick to delete
+            _ (queue-orphans! repo (still-orphans @conn (->> (concat matched-result non-match-result)
+                                                             (keep :id)
+                                                             (filter string?))))
             ;; fuzzy is too slow for large graphs
             fuzzy-result (when-not (or page large?)
                            (->> (fuzzy-search repo @conn q option)
