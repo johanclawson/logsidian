@@ -214,10 +214,27 @@
     (is (nil? (storage/-restore s 5)) "the deleted row is not served from the cache")
     (is (= (row 6) (storage/-restore s 6)))))
 
+(defn- error-text
+  "An error as failure text: message, ex-data and stack, which says where a
+  foreign error was thrown."
+  [e]
+  (if (instance? js/Error e)
+    (str (ex-message e) " " (pr-str (ex-data e)) "\n" (.-stack e))
+    (pr-str e)))
+
 (deftest clear-around-a-promise
   ;; An import that returns a promise and rejects after a short write.
+  ;; The rejection must be the test's own error object. Under promesa
+  ;; 11.0.678 a promise handler that throws makes every later handler of the
+  ;; same promise in that queue drain fail with its error (promise.js
+  ;; processNextTick never resets rcause). Every p/let and p/do! starts on the
+  ;; shared (p/resolved nil), so a p/let started here can fail with the error
+  ;; of an unawaited chain an earlier synchronous test left (cljs.test runs
+  ;; the tests between two async ones in one tick, so all of them share one
+  ;; drain). Such a leak fails here with the foreign error named.
   (async done
     (let [db #js {}
+          short-write (js/Error. "short write")
           entries #(:entries (node-cache/stats-for db))
           admit! #(node-cache/-admit! (node-cache/cache-for db) 1 (row 1) 1)]
       (admit!)
@@ -227,10 +244,13 @@
              (is (= 0 (entries)) "cleared before")
              (p/let [_ (p/delay 0)]
                (admit!)
-               (throw (js/Error. "short write")))))
+               (throw short-write))))
           (p/then (fn [_] (is false "the rejection is passed on")))
           (p/catch (fn [e]
-                     (is (= "short write" (ex-message e)))
+                     (is (identical? short-write e)
+                         (str "the rejection is f's own error, got a foreign one"
+                              " (an unawaited promise chain of an earlier test?): "
+                              (error-text e)))
                      (is (= 0 (entries)) "cleared after it settled")))
           (p/then (fn [_]
                     (admit!)
@@ -238,7 +258,7 @@
           (p/then (fn [v]
                     (is (= :imported v) "a resolved value is passed on")
                     (is (= 0 (entries)))))
-          (p/catch (fn [e] (is false (str e))))
+          (p/catch (fn [e] (is false (str "unexpected rejection: " (error-text e)))))
           (p/finally (fn [_ _] (done)))))))
 
 (defn- eav-set [db]

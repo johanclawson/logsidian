@@ -20,8 +20,14 @@
         _ (docs-graph-helper/clone-docs-repo-if-not-exists graph-dir "v0.10.12")
         repo-config (edn/read-string (str (fs/readFileSync (node-path/join graph-dir "logseq/config.edn"))))
         files (#'gp-cli/build-graph-files graph-dir repo-config)
+        ;; :refresh? true, as in test-helper/load-test-files: without it
+        ;; after-parse starts create-default-files!, a p/do! nobody awaits
+        ;; whose first fs call throws "failed to get fs backend" (no fs
+        ;; backend under node). Promesa then rejects unrelated promise chains
+        ;; that later tests start before the next tick with that error (see
+        ;; frontend.worker.node-cache-test/clear-around-a-promise).
         _ (with-redefs [worker-state/get-config (constantly repo-config)]
-            (file-repo-handler/parse-files-and-load-to-db! test-helper/test-db files {:re-render? false :verbose false}))
+            (file-repo-handler/parse-files-and-load-to-db! test-helper/test-db files {:re-render? false :verbose false :refresh? true}))
         db (conn/get-db test-helper/test-db)]
 
     (docs-graph-helper/docs-graph-assertions db graph-dir (map :file/path files))
