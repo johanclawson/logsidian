@@ -1054,9 +1054,18 @@
     ;; reset-file! is synchronous, so *perf-store only sees this call's stores.
     (reset! *perf-store {:ms 0 :calls 0})
     (vreset! search-indexer/*sync-perf {:ms 0 :rows 0})
-    (let [t0 (js/performance.now)
+    (let [;; :snapshot-before?: the page bound to the file as a page save
+          ;; would write it right before the reset replaces it, in the same
+          ;; synchronous call, so no edit can land in between
+          ;; (frontend.fs.watcher-handler/<reparse-from-disk!)
+          snapshot (when (:snapshot-before? opts)
+                     (file/page-file-content repo @conn file-path (worker-state/get-context)))
+          t0 (js/performance.now)
           timings (atom {})
-          result (file-reset/reset-file! repo conn file-path content (assoc opts :timings timings))
+          result (file-reset/reset-file! repo conn file-path content
+                                         (-> opts
+                                             (dissoc :snapshot-before?)
+                                             (assoc :timings timings)))
           total-ms (- (js/performance.now) t0)
           {:keys [parse-ms mldoc-ms delete-ms build-tx-ms transact-ms]} @timings
           {store-ms :ms store-calls :calls} @*perf-store
@@ -1078,7 +1087,9 @@
                        :search-ms (round search-ms)
                        :search-rows search-rows
                        :total-ms (round total-ms)}))))
-      result)))
+      (if (:snapshot-before? opts)
+        {:tx result :snapshot snapshot}
+        result))))
 
 (def-thread-api :thread-api/gc-graph
   [repo]

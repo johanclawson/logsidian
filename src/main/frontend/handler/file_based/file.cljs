@@ -158,7 +158,7 @@
 
 (defn alter-file
   "Write any in-DB file, e.g. repo config, page, whiteboard, etc."
-  [repo path content {:keys [reset? re-render-root? from-disk? skip-compare? new-graph? verbose
+  [repo path content {:keys [reset? re-render-root? from-disk? skip-compare? new-graph? verbose snapshot-before?
                              ctime mtime]
                       :fs/keys [event]
                       :or {reset? true
@@ -189,7 +189,9 @@
                               (reset-file!
                                repo path content (merge opts
                                                          ;; To avoid skipping the `:or` bounds for keyword destructuring
-                                                        (when (some? verbose) {:verbose verbose}))))
+                                                        (when (some? verbose) {:verbose verbose})
+                                                        ;; the worker then resolves to {:tx .. :snapshot ..}
+                                                        (when snapshot-before? {:snapshot-before? true}))))
                              (db/set-file-content! repo path content opts))
                     write-result (when-not from-disk?
                                    (write-file-aux! repo path content original-content {:skip-compare? skip-compare?}))]

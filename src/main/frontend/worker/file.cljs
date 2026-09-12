@@ -144,6 +144,31 @@
 
 (defn- remove-transit-ids [block] (dissoc block :db/id :block/file))
 
+(defn- page-tree->content
+  "The file content of page-block (a pull of the page) from its tree, as a
+   page save writes it."
+  [repo db page-block tree context]
+  (if (file-entity-util/whiteboard? page-block)
+    (-> (wfu/ugly-pr-str {:blocks tree
+                          :pages (list (remove-transit-ids page-block))})
+        (string/triml))
+    (common-file/tree->file-content repo db tree {:init-level 1} context)))
+
+(defn page-file-content
+  "The content a page save would write now for the page bound to file-path
+   in db, built as do-write-file! and save-tree-aux! build it, or nil when no
+   page is bound to the file. :thread-api/reset-file takes it right before a
+   reset from disk (:snapshot-before?), so the edits the reset replaces can
+   be kept as a conflict copy."
+  [repo db file-path context]
+  (when-let [page (some-> (d/entity db [:file/path file-path]) :block/_file first)]
+    (let [page-id (:db/id page)
+          tree (if (file-entity-util/whiteboard? page)
+                 (map cleanup-whiteboard-block
+                      (ldb/get-page-blocks db page-id {:pull-keys whiteboard-blocks-pull-keys-with-persisted-ids}))
+                 (otree/blocks->vec-tree repo db (:block/_page page) page-id))]
+      (page-tree->content repo db (d/pull db '[*] page-id) tree context))))
+
 (defn send-proposal!
   "Posts a page's new file content to the renderer (:write-files), which writes
    it through the guarded writeFile against :base, and stamps that base.
@@ -171,16 +196,10 @@
   [repo conn page-block tree blocks-just-deleted? context request-id]
   (let [db @conn
         page-block (d/pull db '[*] (:db/id page-block))
-        init-level 1
         file-db-id (-> page-block :block/file :db/id)
         file-path (-> (d/entity db file-db-id) :file/path)
         result (if (and (string? file-path) (not-empty file-path))
-                 (let [new-content (if (file-entity-util/whiteboard? page-block)
-                                     (->
-                                      (wfu/ugly-pr-str {:blocks tree
-                                                        :pages (list (remove-transit-ids page-block))})
-                                      (string/triml))
-                                     (common-file/tree->file-content repo db tree {:init-level init-level} context))]
+                 (let [new-content (page-tree->content repo db page-block tree context)]
                    (when-not (and (string/blank? new-content) (not blocks-just-deleted?))
                      (send-proposal! repo conn request-id (:db/id page-block) file-path new-content)
                      :sent))

@@ -1,9 +1,27 @@
 (ns frontend.worker.file-test
   (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as string]
             [datascript.core :as d]
             [frontend.common.file.util :as wfu]
+            [frontend.db.conn :as conn]
+            [frontend.test.helper :as test-helper]
             [frontend.worker.file :as worker-file]
+            [frontend.worker.file.reset :as file-reset]
             [logseq.db.file-based.schema :as file-schema]))
+
+(deftest page-file-content-before-a-reset-test
+  (test-helper/start-and-destroy-db
+   (fn []
+     (test-helper/load-test-files [{:file/path "pages/a.md" :file/content "- X\n- Y"}])
+     (let [db-conn (conn/get-db test-helper/test-db false)
+           snapshot (worker-file/page-file-content test-helper/test-db @db-conn "pages/a.md" nil)
+           titles #(set (map :block/title (:block/_page (d/entity @db-conn [:block/name "a"]))))]
+       (is (contains? (titles) "X"))
+       (file-reset/reset-file! test-helper/test-db db-conn "pages/a.md" "- Y" {})
+       (is (string/includes? snapshot "X") "the snapshot taken before the reset has block X")
+       (is (not (contains? (titles) "X")) "the reset removed X from the db")
+       (is (nil? (worker-file/page-file-content test-helper/test-db @db-conn "pages/none.md" nil))
+           "no page bound to the file: no snapshot")))))
 
 (deftest remove-writes-of-deleted-pages-test
   (let [conn (d/create-conn file-schema/schema)

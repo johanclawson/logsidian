@@ -75,3 +75,21 @@
     (is (= "io-error" (gobj/get result "result")))
     (is (nil? (gobj/get result "copy")))
     (is (some #(string/includes? % "failed too") (notices events)))))
+
+(deftest-async refusal-hands-the-copy-to-the-reparse-test
+  (p/let [{:keys [result events]}
+          (<with-ipc (fn [action & _]
+                       (case action
+                         "writeFile" #js {:result "mismatch" :disk "present"}
+                         "backupConflictFile" copy-path
+                         nil))
+                     #(#'fs-node/write-file-impl! "repo" "/g" "pages/a.md" "- proposal\n"
+                                                  {:old-content "- a\n"} nil))
+          [_ repo rpath refusal] (first (filter #(= :file/reparse-from-disk (first %)) events))]
+    (is (= "mismatch" (gobj/get result "result")))
+    (is (= copy-path (gobj/get result "copy")))
+    (is (= ["repo" "pages/a.md"] [repo rpath]))
+    (is (= copy-path (:copy-path refusal)))
+    (is (= "- proposal\n" (:proposal refusal)))
+    (is (string? (:reason refusal)))
+    (is (empty? (notices events)) "the reparse shows the warning, once it knows every copy")))

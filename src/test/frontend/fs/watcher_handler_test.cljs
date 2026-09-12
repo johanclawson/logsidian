@@ -1,7 +1,11 @@
 (ns frontend.fs.watcher-handler-test
   (:require [cljs.test :refer [deftest is testing]]
+            [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.config :as config]
+            [frontend.db.async :as db-async]
             [frontend.fs :as fs]
+            [frontend.handler.file-based.file :as file-handler]
             [frontend.fs.watcher-handler :as watcher-handler]
             [frontend.handler.notification :as notification]
             [frontend.handler.page :as page-handler]
@@ -99,3 +103,67 @@
     (is (= 1 (watcher-handler/reconcile-file-bound 0 true))))
   (testing "the flag is off unless set (the node test build sets no localStorage flag)"
     (is (= 555 (watcher-handler/reconcile-file-bound 555)))))
+
+(deftest-async reparse-after-refusal-keeps-edits-the-reset-replaces-test
+  (let [originals [config/get-repo-dir fs/<path-state fs/stat fs/read-file db-async/<get-file
+                   file-handler/alter-file ipc/ipc notification/show!]
+        restore! (fn [& _]
+                   (let [[get-repo-dir path-state stat read-file get-file alter-file ipc-f show] originals]
+                     (set! config/get-repo-dir get-repo-dir)
+                     (set! fs/<path-state path-state)
+                     (set! fs/stat stat)
+                     (set! fs/read-file read-file)
+                     (set! db-async/<get-file get-file)
+                     (set! file-handler/alter-file alter-file)
+                     (set! ipc/ipc ipc-f)
+                     (set! notification/show! show)))
+        snapshot-copy "/tmp/graph/logseq/bak/conflicts/pages/a/snapshot.Desktop.md"
+        refusal {:reason "pages/a.md was changed on disk since the app last read it"
+                 :copy-path "/tmp/graph/logseq/bak/conflicts/pages/a/proposal.Desktop.md"
+                 :proposal "- proposal\n"}
+        *snapshot (atom nil)
+        *alter-opts (atom nil)
+        *copies (atom [])
+        *notices (atom [])
+        reparse! #(watcher-handler/<reparse-from-disk! "logseq_local_/tmp/graph" "pages/a.md"
+                                                       :waits-ms [] :refusal refusal)]
+    (set! config/get-repo-dir (constantly "/tmp/graph"))
+    (set! fs/<path-state (fn [_ _] (p/resolved :present)))
+    (set! fs/stat (fn [& _] (p/resolved {:mtime 1 :ctime 1})))
+    (set! fs/read-file (fn [& _] (p/resolved "- external\n")))
+    (set! db-async/<get-file (fn [& _] (p/resolved "- proposal\n")))
+    (set! file-handler/alter-file (fn [_repo _path _content opts]
+                                    (reset! *alter-opts opts)
+                                    (p/resolved {:tx [] :snapshot @*snapshot})))
+    (set! ipc/ipc (fn [& args] (swap! *copies conj (vec args)) (p/resolved snapshot-copy)))
+    (set! notification/show! (fn [& args] (swap! *notices conj args) nil))
+    (-> (p/do!
+         (reset! *snapshot "- proposal\n- typed meanwhile\n")
+         (reparse!)
+         (is (true? (:snapshot-before? @*alter-opts)) "the reset snapshots the page first")
+         (is (true? (:from-disk? @*alter-opts)))
+         (is (= [["backupConflictFile" "/tmp/graph" "pages/a.md" "- proposal\n- typed meanwhile\n"]] @*copies)
+             "edits the reset replaces become a second conflict copy")
+         (is (= 1 (count @*notices)) "one warning")
+         (is (string/includes? (ffirst @*notices) (:copy-path refusal)))
+         (is (string/includes? (ffirst @*notices) snapshot-copy) "naming both copies")
+
+         (reset! *copies [])
+         (reset! *notices [])
+         (reset! *snapshot "- proposal\n")
+         (reparse!)
+         (is (= [] @*copies) "a snapshot equal to the refused proposal is not copied again")
+         (is (not (string/includes? (ffirst @*notices) snapshot-copy)))
+
+         (reset! *notices [])
+         (reset! *snapshot "- external\n")
+         (reparse!)
+         (is (= [] @*copies) "nor one equal to the disk"))
+        (p/finally restore!))))
+
+(deftest refusal-notice-test
+  (let [refusal {:reason "r" :copy-path "/c1.md" :proposal "p"}]
+    (is (= "Your change was not saved: r. Your version was saved to /c1.md. The app now shows the file as it is on disk."
+           (watcher-handler/refusal-notice refusal nil nil)))
+    (is (string/includes? (watcher-handler/refusal-notice refusal "/c2.md" nil) "/c2.md"))
+    (is (string/includes? (watcher-handler/refusal-notice refusal nil "gone") "nothing was deleted"))))

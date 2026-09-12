@@ -214,9 +214,10 @@
          (export/auto-db-backup! repo {:backup-now? true})
          (fs-watcher/load-graph-files! repo))))))
 
-(defmethod handle :file/reparse-from-disk [[_ repo rpath]]
-  ;; published by frontend.fs.node after a guarded writeFile was refused
-  (fs-watcher/<reparse-from-disk! repo rpath)
+(defmethod handle :file/reparse-from-disk [[_ repo rpath refusal]]
+  ;; published by frontend.fs.node after a guarded writeFile was refused;
+  ;; refusal is {:reason .. :copy-path .. :proposal ..}
+  (fs-watcher/<reparse-from-disk! repo rpath :refusal refusal)
   nil)
 
 (defmethod handle :instrument [[_ {:keys [type payload] :as opts}]]

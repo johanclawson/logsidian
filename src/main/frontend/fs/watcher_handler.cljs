@@ -2,6 +2,7 @@
   "Main ns that handles file watching events from electron's main process"
   (:require [clojure.set :as set]
             [clojure.string :as string]
+            [electron.ipc :as ipc]
             [frontend.common.async-util :as async-util]
             [frontend.config :as config]
             [frontend.db :as db]
@@ -60,8 +61,10 @@
    on-id-repair, when given, receives the content instead of
    set-missing-block-ids! running on it: the reopen reconcile collects the
    repairs and runs them after its last file. Live watcher events pass nil and
-   repair at once, as before."
-  [repo path content db-content ctime mtime backup? on-id-repair]
+   repair at once, as before.
+   alter-opts are merged into alter-file's options; on-altered, when given,
+   receives what alter-file resolved to (<reparse-from-disk!)."
+  [repo path content db-content ctime mtime backup? on-id-repair & {:keys [alter-opts on-altered]}]
   (let [config (state/get-config repo)
         path-hidden-patterns (:hidden config)]
     (when-not (or (and (seq path-hidden-patterns)
@@ -74,11 +77,14 @@
                         (file-handler/backup-file! repo-dir path db-content content))
                       (p/catch #(js/console.error "❌ Bak Error: " path %))))
 
-              _ (file-handler/alter-file repo path content {:re-render-root? true
-                                                            :from-disk? true
-                                                            :fs/event :fs/local-file-change
-                                                            :ctime ctime
-                                                            :mtime mtime})
+              altered (file-handler/alter-file repo path content
+                                               (merge {:re-render-root? true
+                                                       :from-disk? true
+                                                       :fs/event :fs/local-file-change
+                                                       :ctime ctime
+                                                       :mtime mtime}
+                                                      alter-opts))
+              _ (when on-altered (on-altered altered))
               _ (if on-id-repair
                   (on-id-repair content)
                   (set-missing-block-ids! content))]
@@ -186,6 +192,22 @@
       (p/let [_ (p/delay (first waits-ms))]
         (<await-presence probe-f (rest waits-ms))))))
 
+(defn refusal-notice
+  "The warning after a refused write (<reparse-from-disk!): why, where the
+   refused version and the snapshot copy (or nil) are, and what the app
+   shows now; kept, when not nil, is why the db was kept as it was."
+  [{:keys [reason copy-path]} snapshot-copy kept]
+  (str "Your change was not saved: " reason
+       ". Your version was saved to " copy-path
+       (when snapshot-copy
+         (str ", and the page as it was in the app before reloading, with the edits made meanwhile, to "
+              snapshot-copy))
+       "."
+       (if kept
+         (str " The app could not reload the file from disk (" kept
+              ") and keeps showing the page as it was; nothing was deleted.")
+         " The app now shows the file as it is on disk.")))
+
 (defn <reparse-from-disk!
   "Makes the db of repo follow the disk for rpath after a guarded writeFile
    refused to replace it (fs.node): reparses the file's disk content like a
@@ -199,28 +221,62 @@
    page deletion ends in after-page-deleted!, which unlinks the path when it
    exists again, e.g. restored by a sync client meanwhile. A file that is
    really gone reaches that path through the watcher's own unlink event.
+   refusal, from fs.node, is {:reason .. :copy-path .. :proposal ..}: why
+   the write was refused, its conflict copy and its content. The reset then
+   snapshots the page right before replacing it (:snapshot-before?, in the
+   worker's same call). A snapshot that differs from the proposal and from
+   the disk holds edits committed after the proposal, which the reset
+   replaces: it is saved as a second conflict copy. One warning names the
+   copies once all is done (refusal-notice).
    Resolves once done; failures are logged."
-  [repo rpath & {:keys [waits-ms] :or {waits-ms reparse-missing-waits-ms}}]
+  [repo rpath & {:keys [waits-ms refusal] :or {waits-ms reparse-missing-waits-ms}}]
   (let [repo-dir (config/get-repo-dir repo)
-        keep-db! (fn [reason]
-                   (log/warn :reparse-from-disk/db-kept {:path rpath :reason reason})
-                   (notification/show!
-                    (str "The app could not reload " rpath " from disk: " reason
-                         ". It keeps showing the page as it was and deleted nothing.")
-                    :warning
-                    false))]
+        *snapshot (atom nil)
+        *disk (atom nil)
+        finish! (fn [kept]
+                  (when kept
+                    (log/warn :reparse-from-disk/db-kept {:path rpath :reason kept}))
+                  (p/let [snapshot @*snapshot
+                          snapshot-copy (when (and refusal
+                                                   (string? snapshot)
+                                                   (not= snapshot (:proposal refusal))
+                                                   (not= snapshot @*disk))
+                                          (-> (ipc/ipc "backupConflictFile" repo-dir rpath snapshot)
+                                              (p/catch (fn [e]
+                                                         (log/error :reparse-from-disk/snapshot-copy-failed
+                                                                    {:path rpath :error e})
+                                                         nil))))]
+                    (cond
+                      refusal
+                      (notification/show!
+                       (refusal-notice refusal (when (string? snapshot-copy) snapshot-copy) kept)
+                       :warning
+                       false)
+
+                      kept
+                      (notification/show!
+                       (str "The app could not reload " rpath " from disk: " kept
+                            ". It keeps showing the page as it was and deleted nothing.")
+                       :warning
+                       false))))]
     (-> (p/let [presence (<await-presence #(fs/<path-state repo-dir rpath) waits-ms)]
           (if (= :present presence)
             (p/let [stat (-> (fs/stat repo-dir rpath) (p/catch (constantly nil)))
                     content (fs/read-file repo-dir rpath)
-                    db-content (db-async/<get-file repo rpath)]
-              (when (string? content)
-                (handle-add-and-change! repo rpath content db-content
-                                        (:ctime stat) (:mtime stat) false nil)))
-            (keep-db! "the file is not on disk (deleted or moved?)")))
+                    _ (reset! *disk content)
+                    db-content (db-async/<get-file repo rpath)
+                    _ (when (string? content)
+                        (handle-add-and-change! repo rpath content db-content
+                                                (:ctime stat) (:mtime stat) false nil
+                                                :alter-opts (when refusal {:snapshot-before? true})
+                                                :on-altered (fn [altered]
+                                                              (when (map? altered)
+                                                                (reset! *snapshot (:snapshot altered))))))]
+              (finish! nil))
+            (finish! "the file is not on disk (deleted or moved?)")))
         (p/catch (fn [e]
                    (js/console.error "Reparsing" rpath "from disk after a refused write failed:" e)
-                   (keep-db! (str e)))))))
+                   (finish! (str e)))))))
 
 (def ^:private reconcile-experiment-cap
   "File-phase cap of the ADR-003 H2 experiment: at most this many graph files

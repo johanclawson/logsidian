@@ -49,8 +49,10 @@
    app last saw (\"mismatch\"), or a new file's path is taken (\"exists\"). The
    disk wins. The proposed content is saved as a conflict copy under
    logseq/bak/conflicts/ (never pruned, electron.backup-file/create-conflict-copy!),
-   a warning that stays until dismissed names the copy, and the file is
-   reparsed from disk (:file/reparse-from-disk) so the db follows the disk.
+   and the file is reparsed from disk (:file/reparse-from-disk, given the
+   reason, the copy and the proposal) so the db follows the disk; the
+   reparse also keeps edits the reset replaces as a second copy and then
+   shows the warning, which stays until dismissed and names the copies.
    When the copy cannot be saved there is no reparse, which would drop the
    proposed content from the db as well, and the notice is an error. Resolves
    to the writeFile result."
@@ -75,14 +77,9 @@
       ;; (frontend.handler.file-based.file/alter-files-outcome)
       (gobj/set result "copy" (when (string? copy-path) copy-path))
       (if (string? copy-path)
-        (do
-          (state/pub-event! [:notification/show
-                             {:content (str "Your change was not saved: " reason
-                                            ". Your version was saved to " copy-path
-                                            ". The app now shows the file as it is on disk.")
-                              :status :warning
-                              :clear? false}])
-          (state/pub-event! [:file/reparse-from-disk repo rpath]))
+        (state/pub-event! [:file/reparse-from-disk repo rpath {:reason reason
+                                                               :copy-path copy-path
+                                                               :proposal content}])
         (state/pub-event! [:notification/show
                            {:content (str "Your change was not saved: " reason
                                           ", and saving your version to logseq/bak/conflicts/ failed."
