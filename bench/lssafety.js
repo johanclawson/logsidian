@@ -48,6 +48,30 @@
 //   6 typing-roundtrip      Typing into a journal, close, reopen: the typed text
 //     is in the file exactly once, the reopen does not rewrite the file, and no
 //     other file changed.
+//   7 two-ops-one-flush     Type into block one, Enter, type into the new block,
+//     Escape, all within ~1 s (one worker flush carries :save-block and
+//     :insert-blocks). Both tokens on disk exactly once, no LSGUARD refusal, no
+//     new bak file, no "not saved"/conflict notification (fail on each).
+//   8 typing-through-external-rewrite  ~3 s of continuous typing with Enter
+//     presses into a page while the harness rewrites that page's file from
+//     outside mid-way (write-temp-and-rename). FAIL if the external tokens are
+//     not on disk at the end (a stale proposal overwrote them). WARN if a typed
+//     token is neither in the final file nor in any bak/conflict copy.
+//   9 bak-unwritable        (optional, only with --only) logseq/bak is chmod 000,
+//     then a same-page refusal is staged. Expects an error notification and the
+//     typed text still visible in the UI; permissions are restored in finally.
+//
+// Write guard (LSGUARD): guarded builds print one console line per guarded
+// outcome, LSGUARD {"path","result":"written"|"mismatch"|"exists"|"io-error",
+// "copy"}. Every launch captures them (renderer and main-process console). A
+// scenario that does not stage a conflict fails on any mismatch/exists/io-error
+// record; scenarios that do (3, 8, 9) report them. Each record's conflict copy
+// (logseq/bak/conflicts/... on guarded builds) is listed with whether it exists
+// and holds the text the scenario expects it to. Older builds print nothing:
+// the result then says "guard: absent" when the app wrote something, "guard:
+// no-writes" when it did not. Notifications are captured as they appear
+// (LSNOTE, a MutationObserver on .ui__notifications-content), so short-lived
+// ones count too.
 //
 // Statuses: pass / fail / error (harness trouble: the app could not be driven).
 // Checks carry a severity: fail (gates), warn (reported), policy, info.
@@ -57,7 +81,8 @@
 //   --out       run directory, must be under ~/.cache/lsbench
 //               (default ~/.cache/lsbench/safety/<timestamp>)
 //   --timeout   per scenario, default 900 s
-//   --selftest  checks the pure helpers (template, edits, verify) in DIR; no app
+//   --only      also the way to run optional scenarios (bak-unwritable)
+//   --selftest  checks the pure helpers (template, edits, verify, guard) in DIR; no app
 // env: LSSAFETY_APP or LSBENCH_APP = app binary (default: the perf worktree's
 //      build), LSSAFETY_PLAYWRIGHT = playwright module path.
 // Exit code: 0 all pass, 1 any fail/error, 2 usage or refused path.
@@ -78,7 +103,11 @@ const BASE = path.join(HOME, '.cache', 'lsbench');
 const DEFAULT_APP = path.join(HOME, 'dev/logsidian-perf/static/out/Logseq-linux-x64/Logseq');
 const APP = process.env.LSSAFETY_APP || process.env.LSBENCH_APP || DEFAULT_APP;
 const SCENARIOS = ['offline-edit-reopen', 'idrepair-race', 'live-external-edit',
-  'config-offline-then-delete-home', 'burst-writes', 'typing-roundtrip'];
+  'config-offline-then-delete-home', 'burst-writes', 'typing-roundtrip',
+  'two-ops-one-flush', 'typing-through-external-rewrite'];
+// run only when named in --only
+const OPTIONAL_SCENARIOS = ['bak-unwritable'];
+const REFUSALS = ['mismatch', 'exists', 'io-error'];
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const errText = (e) => String((e && e.message) || e);
@@ -333,12 +362,14 @@ function checkExpectation(e, after, bakNew) {
     const baseLines = norm(e.base);
     const idx = baseLines.findIndex((l) => l.replace(/^-\s*/, '').startsWith(e.target));
     const want = baseLines.slice();
-    if (idx >= 0) want[idx] = baseLines[idx] + e.typed.join('');
+    // inserted: whole lines expected right after the target block (Enter makes a sibling)
+    const ins = e.inserted || [];
+    if (idx >= 0) { want[idx] = baseLines[idx] + e.typed.join(''); want.splice(idx + 1, 0, ...ins.map((l) => l.trim())); }
     const got = norm(a.text);
     const semantic = idx >= 0 && JSON.stringify(want) === JSON.stringify(got);
     const raw = e.base.split('\n');
     const ri = raw.findIndex((l) => l.replace(/^\s*-\s*/, '').startsWith(e.target));
-    if (ri >= 0) raw[ri] += e.typed.join('');
+    if (ri >= 0) { raw[ri] += e.typed.join(''); raw.splice(ri + 1, 0, ...ins); }
     const once = Object.values(counts).every((c) => c === 1);
     return { name, severity: sev, ok: once && semantic, token_counts: counts,
       detail: !once ? 'typed text missing or duplicated' : (semantic ? 'typed once, other lines kept' : 'other lines changed'),
@@ -385,6 +416,43 @@ function samePageOutcome({ finalText, extTokens, revertedText, typedToken, bakTe
     : !ext && typed ? (extInBak ? 'backup+overwrite' : 'overwrite-without-backup')
       : ext && !typed ? 'typed-dropped (refused or superseded)' : 'both-lost';
   return { outcome, external_survived: ext, typed_survived: typed, external_in_bak: extInBak };
+}
+
+// ---- write guard (LSGUARD) -----------------------------------------------------
+function parseGuardLine(t) {
+  if (!t.startsWith('LSGUARD ')) return null;
+  try { const o = JSON.parse(t.slice(8)); return o && typeof o === 'object' ? o : { raw: t.slice(0, 300) }; } catch (_) { return { raw: t.slice(0, 300) }; }
+}
+// a path the guard printed (absolute or graph-relative) -> graph-relative, or null if outside
+function graphRel(p, graph) {
+  if (!p || typeof p !== 'string') return null;
+  if (!path.isAbsolute(p)) return p.replace(/^\.\//, '');
+  const abs = path.resolve(p);
+  return abs.startsWith(graph + path.sep) ? abs.slice(graph.length + 1) : null;
+}
+// status: present (any LSGUARD line) / absent (the app wrote, no line) / no-writes
+function guardReport(records, { appWrote = false } = {}) {
+  const counts = {};
+  for (const r of records) { const k = r.result || 'unparsed'; counts[k] = (counts[k] || 0) + 1; }
+  const refusals = records.filter((r) => REFUSALS.includes(r.result));
+  const status = records.length ? 'present' : (appWrote ? 'absent' : 'no-writes');
+  return { status, counts, refusals };
+}
+// every record naming a copy: does it exist in `after`, which tokens it holds,
+// and whether it holds the tokens expected for that page (expectByRel[rel])
+function conflictCopies(records, after, graph, tokens = [], expectByRel = {}) {
+  const out = [];
+  for (const r of records) {
+    if (!r.copy) continue;
+    const rel = graphRel(r.copy, graph);
+    const page = graphRel(r.path, graph);
+    const a = rel ? after.get(rel) : null;
+    const expected = (page && expectByRel[page]) || null;
+    out.push({ launch: r.launch, result: r.result, page, copy: r.copy, rel, exists: !!a,
+      tokens: a ? tokens.filter((t) => a.text.includes(t)) : [],
+      expected, holds_expected: expected ? !!a && expected.every((t) => a.text.includes(t)) : null });
+  }
+  return out;
 }
 
 // ---- disk activity -------------------------------------------------------------
@@ -453,6 +521,8 @@ class App {
     this.t0 = Date.now();
     this.records = [];
     this.lserr = [];
+    this.guard = [];
+    this.notes = [];
     this.consoleErrors = [];
     this.markers = {};
     this.lastActivity = Date.now();
@@ -479,6 +549,13 @@ class App {
     this.pid = this.app.process().pid;
     this.app.on('window', (w) => this.attach(w));
     for (const w of this.app.windows()) this.attach(w);
+    // main-process console (Playwright >= 1.42): LSGUARD only, should a build log it there
+    try {
+      this.app.on('console', (m) => {
+        const g = parseGuardLine(m.text());
+        if (g) { this.guard.push({ wall: this.wall(), src: 'main', ...g }); this.lastActivity = Date.now(); }
+      });
+    } catch (_) {}
     if (openDialogWith) {
       await within(this.app.evaluate(({ dialog }, g) => {
         dialog.showOpenDialog = async () => ({ canceled: false, filePaths: [g] });
@@ -513,6 +590,11 @@ class App {
         this.lastActivity = Date.now();
       } else if (t.startsWith('LSSEARCH ')) {
         try { this.records.push({ wall: this.wall(), event: 'search', ...JSON.parse(t.slice(9)) }); } catch (_) {}
+      } else if (t.startsWith('LSGUARD ')) {
+        this.guard.push({ wall: this.wall(), ...parseGuardLine(t) });
+        this.lastActivity = Date.now();
+      } else if (t.startsWith('LSNOTE ')) {
+        try { this.notes.push({ wall: this.wall(), ...JSON.parse(t.slice(7)) }); } catch (_) {}
       } else if (t.startsWith('LSERR ')) {
         try { this.lserr.push({ wall: this.wall(), ...JSON.parse(t.slice(6)) }); } catch (_) { this.lserr.push({ wall: this.wall(), msg: t.slice(0, 1500) }); }
       } else if (m.type() === 'error') {
@@ -537,6 +619,20 @@ class App {
       };
       window.addEventListener('unhandledrejection', (e) => show('unhandledrejection', e.reason));
       window.addEventListener('error', (e) => show('error', e.error || e.message));
+      // notifications (ui.cljs: .ui__notifications-content.notification-<status>),
+      // logged once each as they appear, so short-lived ones are seen too
+      const seen = new WeakSet();
+      const scan = () => {
+        for (const el of document.querySelectorAll('.ui__notifications-content[class*="notification-"]')) {
+          const text = (el.innerText || '').trim();
+          if (seen.has(el) || !text) continue;
+          seen.add(el);
+          const m = /notification-(\w+)/.exec(el.className);
+          console.log('LSNOTE ' + JSON.stringify({ status: m ? m[1] : 'info', text: text.slice(0, 600) }));
+        }
+      };
+      new MutationObserver(scan).observe(document.body, { childList: true, subtree: true, characterData: true });
+      scan();
       new PerformanceObserver((list) => {
         for (const e of list.getEntries()) {
           if (e.duration >= 100) console.log('LSUI ' + JSON.stringify({ dur: Math.round(e.duration), start: Math.round(e.startTime) }));
@@ -692,8 +788,18 @@ class App {
   // click the block's .block-content (block.cljs) to open the editor (a TEXTAREA
   // inside the same .ls-block), append text at the end, Escape saves
   async typeInto(blockId, text, { fast = false } = {}) {
-    const page = this.page;
     const t0 = Date.now();
+    if (!(await this.openEditor(blockId, { fast }))) return { ok: false, why: 'editor did not open', ms: Date.now() - t0 };
+    await within(this.page.keyboard.type(text, { delay: fast ? 0 : 15 }), 20000, 'type');
+    await sleep(fast ? 40 : 300);
+    await within(this.page.keyboard.press('Escape'), 5000, 'Escape');
+    this.ctx.appWrote = true;
+    return { ok: true, ms: Date.now() - t0 };
+  }
+
+  // click .block-content until its TEXTAREA has focus, caret to the end
+  async openEditor(blockId, { fast = false } = {}) {
+    const page = this.page;
     const loc = () => page.locator(`#main-content-container .ls-block[blockid="${blockId}"] .block-content`).first();
     const editing = () => within(page.waitForFunction((id) => {
       const a = document.activeElement;
@@ -705,13 +811,19 @@ class App {
       await loc().click({ timeout: 5000 }).catch(() => {});
       ok = await editing();
     }
-    if (!ok) return { ok: false, why: 'editor did not open', ms: Date.now() - t0 };
-    await within(page.keyboard.press('Control+End'), 5000, 'Control+End');
-    await within(page.keyboard.type(text, { delay: fast ? 0 : 15 }), 20000, 'type');
-    await sleep(fast ? 40 : 300);
-    await within(page.keyboard.press('Escape'), 5000, 'Escape');
-    return { ok: true, ms: Date.now() - t0 };
+    if (ok) await within(page.keyboard.press('Control+End'), 5000, 'Control+End');
+    return ok;
   }
+
+  // is any block editor (a TEXTAREA inside an .ls-block) focused?
+  async editingAny() {
+    return within(this.page.evaluate(() => {
+      const a = document.activeElement;
+      return !!(a && a.tagName === 'TEXTAREA' && a.closest('.ls-block'));
+    }), 5000, 'editingAny').catch(() => false);
+  }
+
+  notesSince(wall) { return this.notes.filter((n) => n.wall >= wall); }
 
   // Ctrl+K search (cmdk/core.cljs input.cp__cmdk-search-input). A hit is the
   // token inside a result group that has a header, i.e. not the "Create" group.
@@ -773,7 +885,7 @@ class App {
 
   summary() {
     return { ...this.info, launched_wall_ms: this.info.window_ms, records: this.records.length,
-      lserr: this.lserr, console_errors: this.consoleErrors.slice(0, 30) };
+      lserr: this.lserr, guard: this.guard, notes: this.notes, console_errors: this.consoleErrors.slice(0, 30) };
   }
 }
 
@@ -782,7 +894,10 @@ function makeCtx(name, root, opts, templateOpts = {}) {
   const dir = assertSafePath(path.join(root, name));
   if (fs.existsSync(dir)) throw new Error(`scenario dir exists already: ${dir}`);
   const ctx = { name, dir, graph: path.join(dir, 'graph'), profile: path.join(dir, 'profile'), out: path.join(dir, 'out'),
-    opts, apps: [], aborted: false, timeline: [], t0: Date.now(), tokens: [] };
+    opts, apps: [], aborted: false, timeline: [], t0: Date.now(), tokens: [],
+    // stagesConflict: guard refusals are expected; copyExpect[rel]: tokens a
+    // conflict copy of rel should hold; cleanup: run in runScenario's finally
+    stagesConflict: false, copyExpect: {}, cleanup: [], appWrote: false };
   for (const d of [ctx.graph, path.join(ctx.profile, 'home'), ctx.out]) fs.mkdirSync(assertSafePath(d), { recursive: true });
   ctx.tpl = makeTemplate(templateOpts);
   writeFiles(ctx.graph, ctx.tpl.files);
@@ -961,6 +1076,8 @@ scenarios['live-external-edit'] = {
       // block one stays identical so the click still finds it
       const ext = appendBlock(replaceBlockLine(base, `${N} block to change`, `${N} changed externally ${tG}`), `${N} appended externally ${tH}`);
       const disk0 = snapshotDir(ctx.graph);
+      ctx.stagesConflict = true;
+      ctx.copyExpect[rel] = [tI];
       ctx.writeExternal(rel, ext);
       const o = { page: rel, settled, external_tokens: [tG, tH], typed_token: tI };
       if (settled) {
@@ -984,8 +1101,11 @@ scenarios['live-external-edit'] = {
       o.bak_files = baks.map(({ text, ...x }) => x);
       o.final_diff_vs_external = finalText === ext ? [] : lineDiff(ext, finalText || '');
       res.policy[key] = o;
-      check(res, `same page (${settled ? 'settled' : `race, ${ctx.opts.samePageDelayMs} ms`}): ${o.outcome}`,
-        o.external_survived && o.typed_survived, JSON.stringify({ external_survived: o.external_survived, typed_survived: o.typed_survived, external_in_bak: o.external_in_bak }), 'policy');
+      const label = `same page (${settled ? 'settled' : `race, ${ctx.opts.samePageDelayMs} ms`})`;
+      const facts = JSON.stringify({ outcome: o.outcome, external_survived: o.external_survived, typed_survived: o.typed_survived, external_in_bak: o.external_in_bak });
+      // the external edit must survive (gate); what happens to the typed text is policy
+      check(res, `${label}: external edit survived`, o.external_survived, facts, 'fail');
+      check(res, `${label}: typed text survived (${o.outcome})`, o.typed_survived, facts, 'policy');
       exp.push({ path: rel, kind: 'policy' });
       return o;
     };
@@ -1104,6 +1224,174 @@ scenarios['typing-roundtrip'] = {
   },
 };
 
+// Type, Enter, type, Escape inside one worker flush (1 s): :save-block and
+// :insert-blocks travel together; the second must not be refused by the guard.
+scenarios['two-ops-one-flush'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const N = pageName(4); const P = pageRel(N);
+    const b = await reopen(ctx);
+    const id = await b.gotoPage(N.toLowerCase(), `${N} block one`);
+    if (!id) throw new Error(`${N} did not render`);
+    const t1 = ctx.tok('s'); const t2 = ctx.tok('t');
+    const disk0 = snapshotDir(ctx.graph);
+    const w0 = b.wall();
+    if (!(await b.openEditor(id, { fast: true }))) throw new Error('editor did not open');
+    const t0 = Date.now();
+    await within(b.page.keyboard.type(` one ${t1}`, { delay: 0 }), 10000, 'type 1');
+    await within(b.page.keyboard.press('Enter'), 5000, 'Enter'); // :editor/new-block (shortcut/config.cljs)
+    await within(b.page.keyboard.type(`two ${t2}`, { delay: 0 }), 10000, 'type 2');
+    await sleep(40);
+    await within(b.page.keyboard.press('Escape'), 5000, 'Escape');
+    ctx.appWrote = true;
+    res.two_ops = { ops_ms: Date.now() - t0 };
+    check(res, 'both ops inside ~1 s', res.two_ops.ops_ms <= 1100, `${res.two_ops.ops_ms} ms`, 'warn');
+    res.typed_written = await waitFileContains(ctx.abs(P), [t1, t2], 20000);
+    await sleep(3000);
+    await b.settle();
+    const disk1 = snapshotDir(ctx.graph);
+    const baks = newBaks(disk0, disk1, ctx.tokens);
+    check(res, 'no new bak file', !baks.length, baks.length ? baks.map((x) => x.path).join(', ') : 'none', 'fail');
+    const shown = [...b.notesSince(w0).map((n) => `${n.status}: ${n.text}`), ...(await b.notifications())];
+    const bad = shown.filter((t) => /not saved|conflict/i.test(t));
+    res.two_ops.notifications = shown;
+    check(res, 'no "not saved"/conflict notification', !bad.length, bad.length ? JSON.stringify(bad).slice(0, 400) : 'none', 'fail');
+    await b.close();
+    return { before, exp: [
+      { path: P, kind: 'typed', base: before.get(P).text, target: `${N} block one`, typed: [` one ${t1}`], inserted: [`- two ${t2}`],
+        tokens: [t1, t2], why: 'type, Enter, type in one flush' },
+    ] };
+  },
+};
+
+// ~3 s of typing with Enter presses while the page's file is rewritten from outside.
+scenarios['typing-through-external-rewrite'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const N = pageName(9); const P = pageRel(N);
+    const b = await reopen(ctx);
+    const id = await b.gotoPage(N.toLowerCase(), `${N} block one`);
+    if (!id) throw new Error(`${N} did not render`);
+    ctx.stagesConflict = true;
+    const tW = ctx.tok('w'); const tG = ctx.tok('g'); const tH = ctx.tok('h');
+    const extTokens = [tG, tH];
+    const rw = { typed: [], skipped: 0, reopened: 0, ext_at_ms: null };
+    res.rewrite = rw;
+    const external = () => {
+      const cur = ctx.read(P);
+      let ext;
+      try { ext = appendBlock(replaceBlockLine(cur, `${N} block to change`, `${N} changed externally ${tG}`), `${N} appended externally ${tH}`); }
+      catch (_) { ext = appendBlock(appendBlock(cur, `${N} changed externally ${tG}`), `${N} appended externally ${tH}`); }
+      ctx.writeExternal(P, ext);
+      rw.ext_at_ms = Date.now() - t0;
+      rw.external_content = ext;
+      ctx.step(`external rewrite of ${P} after ${rw.ext_at_ms} ms of typing`);
+    };
+    if (!(await b.openEditor(id))) throw new Error('editor did not open');
+    ctx.appWrote = true;
+    const t0 = Date.now();
+    for (let k = 1; Date.now() - t0 < 3000 && k <= 80; k++) {
+      if (rw.ext_at_ms == null && Date.now() - t0 >= 1500) external();
+      // an external change can reset the editor; keys sent to a non-editing
+      // page would fire shortcuts, so reopen block one first
+      if (!(await b.editingAny())) {
+        const id2 = (await b.blockIdByText(`${N} block one`)) || id;
+        if (!(await b.openEditor(id2, { fast: true }))) { rw.skipped++; await sleep(100); continue; }
+        rw.reopened++;
+      }
+      const tok = `${tW}n${k}z`;
+      await within(b.page.keyboard.type(` ${tok}`, { delay: 10 }), 10000, 'type');
+      rw.typed.push(tok);
+      if (k % 3 === 0) await within(b.page.keyboard.press('Enter'), 5000, 'Enter');
+    }
+    if (rw.ext_at_ms == null) external();
+    rw.span_ms = Date.now() - t0;
+    await within(b.page.keyboard.press('Escape'), 5000, 'Escape').catch(() => {});
+    check(res, 'typing kept going across the rewrite', rw.typed.length >= 4 && rw.skipped < 5, JSON.stringify({ typed: rw.typed.length, skipped: rw.skipped, reopened: rw.reopened }), 'warn');
+    await sleep(6000);
+    await b.settle();
+    rw.notifications = b.notes.map((n) => `${n.status}: ${n.text}`);
+    await b.close();
+    res.after_hook = (after) => {
+      const a = after.get(P);
+      const text = a ? a.text : '';
+      const baks = newBaks(before, after, ctx.tokens);
+      const missingExt = extTokens.filter((t) => !text.includes(t));
+      check(res, 'external rewrite on disk at the end', !missingExt.length,
+        missingExt.length ? `missing ${missingExt.join(', ')} (overwritten by a stale proposal?)` : 'both external tokens present', 'fail',
+        { in_bak: missingExt.length ? (baks.some((x) => missingExt.every((t) => x.text.includes(t))) ? 'yes' : 'no') : undefined });
+      const inFile = rw.typed.filter((t) => text.includes(t));
+      const inCopy = rw.typed.filter((t) => !text.includes(t) && baks.some((x) => x.text.includes(t)));
+      const lost = rw.typed.filter((t) => !text.includes(t) && !baks.some((x) => x.text.includes(t)));
+      const dup = rw.typed.filter((t) => countOf(text, t) > 1);
+      rw.final = { typed_in_file: inFile.length, typed_in_copy_only: inCopy, typed_lost: lost, typed_duplicated: dup,
+        bak_files: baks.map((x) => x.path) };
+      check(res, 'every typed token in the final file or a bak/conflict copy', !lost.length,
+        lost.length ? `lost ${lost.length}/${rw.typed.length}: ${lost.join(', ')}` : `${inFile.length} in file, ${inCopy.length} only in a copy`, 'warn');
+      if (dup.length) check(res, 'typed tokens once in the final file', false, `duplicated: ${dup.join(', ')}`, 'warn');
+    };
+    return { before, exp: [{ path: P, kind: 'policy' }] };
+  },
+};
+
+// Optional: logseq/bak unwritable while a same-page refusal is staged.
+scenarios['bak-unwritable'] = {
+  async run(ctx, res) {
+    await prime(ctx);
+    const before = ctx.snapshot();
+    const N = pageName(7); const P = pageRel(N);
+    const bakDir = ctx.abs('logseq/bak');
+    fs.mkdirSync(bakDir, { recursive: true });
+    const mode0 = fs.statSync(bakDir).mode & 0o777;
+    const restore = () => { try { fs.chmodSync(bakDir, mode0 || 0o755); } catch (_) {} };
+    ctx.cleanup.push(restore);
+    const tG = ctx.tok('g'); const tH = ctx.tok('h'); const tI = ctx.tok('i');
+    const o = {};
+    res.bak_unwritable = o;
+    const b = await reopen(ctx);
+    try {
+      const id = await b.gotoPage(N.toLowerCase(), `${N} block one`);
+      if (!id) throw new Error(`${N} did not render`);
+      ctx.stagesConflict = true;
+      const base = ctx.read(P);
+      const ext = appendBlock(replaceBlockLine(base, `${N} block to change`, `${N} changed externally ${tG}`), `${N} appended externally ${tH}`);
+      fs.chmodSync(bakDir, 0o000);
+      ctx.step('logseq/bak is mode 000');
+      const w0 = b.wall();
+      ctx.writeExternal(P, ext);
+      await sleep(ctx.opts.samePageDelayMs); // before the watcher's awaitWriteFinish: the save is refused
+      const id2 = (await b.blockIdByText(`${N} block one`)) || id;
+      o.typing = await b.typeInto(id2, ` typed ${tI}`);
+      if (!o.typing.ok) throw new Error(`typing failed: ${o.typing.why}`);
+      const end = Date.now() + 15000;
+      let errs = [];
+      while (Date.now() < end) {
+        errs = b.notesSince(w0).filter((n) => n.status === 'error');
+        if (errs.length) break;
+        await sleep(300);
+      }
+      await sleep(3000);
+      o.notifications = b.notesSince(w0);
+      o.dom_notifications = await b.notifications();
+      o.guard = b.guard.filter((g) => g.wall >= w0);
+      o.ui_has_typed = await b.uiHasText(tI);
+      await b.shot('bak-unwritable');
+      check(res, 'error notification shown', errs.length > 0, errs.length ? errs[0].text.slice(0, 200) : JSON.stringify(o.dom_notifications).slice(0, 200), 'fail');
+      check(res, 'typed text still visible in the UI', o.ui_has_typed, o.ui_has_typed ? 'visible' : 'gone (reparsed?)', 'fail');
+      check(res, 'guard logged a refusal', o.guard.some((g) => REFUSALS.includes(g.result)), JSON.stringify(o.guard.map((g) => g.result)), 'info');
+    } finally {
+      restore();
+    }
+    await b.settle();
+    await b.close();
+    return { before, exp: [
+      { path: P, kind: 'contains', fragments: [tG, tH], why: 'external rewrite survives the refused save' },
+    ] };
+  },
+};
+
 // ---- runner --------------------------------------------------------------------
 async function runScenario(name, root, opts) {
   const def = scenarios[name];
@@ -1133,6 +1421,23 @@ async function runScenario(name, root, opts) {
     const bakNew = newBaks(before, after, ctx.tokens);
     res.checks.push(...verify(before, after, exp, { bakNew }));
     if (res.after_hook) { res.after_hook(after); delete res.after_hook; }
+    // write guard: refusals gate unless the scenario staged a conflict; copies are reported
+    const guardRecs = [].concat(...ctx.apps.map((a) => a.guard.map((g) => ({ launch: a.label, ...g }))));
+    const gr = guardReport(guardRecs, { appWrote: ctx.appWrote || primeChanged.length > 0 });
+    res.guard = { status: gr.status, counts: gr.counts, staged_conflict: ctx.stagesConflict, refusals: gr.refusals,
+      copies: conflictCopies(guardRecs, after, ctx.graph, ctx.tokens, ctx.copyExpect) };
+    const refusalText = gr.refusals.map((r) => `${r.result} ${r.path}${r.copy ? ` -> ${r.copy}` : ''}`).join('; ');
+    if (ctx.stagesConflict) {
+      check(res, `guard: ${gr.status} (conflict staged, refusals allowed)`, true, refusalText || JSON.stringify(gr.counts), 'info');
+    } else {
+      check(res, 'no LSGUARD refusal (mismatch/exists/io-error)', !gr.refusals.length,
+        gr.refusals.length ? refusalText : `guard: ${gr.status} ${JSON.stringify(gr.counts)}`, 'fail');
+    }
+    for (const c of res.guard.copies) {
+      check(res, `conflict copy ${c.rel || c.copy} (${c.result} ${c.page})`, c.exists && c.holds_expected !== false,
+        !c.exists ? (c.rel ? 'named by LSGUARD but not on disk' : 'outside the graph')
+          : `holds ${JSON.stringify(c.tokens)}${c.expected ? `; expected ${JSON.stringify(c.expected)}` : ''}`, 'warn');
+    }
     const d = diffSnapshots(before, after);
     res.changed_files = d;
     res.bak_new = bakNew.map(({ text, ...x }) => x);
@@ -1153,6 +1458,7 @@ async function runScenario(name, root, opts) {
   } finally {
     if (ctx) {
       ctx.aborted = true;
+      for (const f of ctx.cleanup) { try { f(); } catch (_) {} }
       for (const a of ctx.apps) await a.close().catch(() => {});
       // a timed-out run may still be awaiting; let it fail against the closed app
       if (runP) await within(runP.catch(() => {}), 60000, 'abandoned run').catch(() => {});
@@ -1162,6 +1468,12 @@ async function runScenario(name, root, opts) {
       if (res.lserr_count) res.warnings.push(`app errors (LSERR/pageerror): ${res.lserr_count}`);
       res.timeline = ctx.timeline;
       res.tokens = ctx.tokens;
+      // after a harness error the verification block never ran: still say whether the guard spoke
+      if (!res.guard) {
+        const recs = [].concat(...ctx.apps.map((a) => a.guard.map((g) => ({ launch: a.label, ...g }))));
+        const gr = guardReport(recs, { appWrote: ctx.appWrote });
+        res.guard = { status: gr.status, counts: gr.counts, staged_conflict: ctx.stagesConflict, refusals: gr.refusals };
+      }
     }
     res.duration_ms = Date.now() - started;
     if (ctx) fs.writeFileSync(path.join(ctx.dir, 'result.json'), JSON.stringify(res, null, 1));
@@ -1173,8 +1485,8 @@ function summaryTable(results) {
   const rows = results.map((r) => [r.scenario, r.status.toUpperCase(),
     `${r.checks.filter((c) => c.ok && c.severity === 'fail').length}/${r.checks.filter((c) => c.severity === 'fail').length}`,
     String(r.warnings.length), String(r.policy_checks ? r.policy_checks.length : 0), String(r.bak_new ? r.bak_new.length : 0),
-    String(r.lserr_count || 0), `${Math.round(r.duration_ms / 1000)}s`, (r.reasons[0] || '').slice(0, 110)]);
-  const head = ['scenario', 'status', 'gates', 'warn', 'policy', 'bak', 'lserr', 'time', 'first reason'];
+    String(r.lserr_count || 0), r.guard ? r.guard.status : '-', `${Math.round(r.duration_ms / 1000)}s`, (r.reasons[0] || '').slice(0, 110)]);
+  const head = ['scenario', 'status', 'gates', 'warn', 'policy', 'bak', 'lserr', 'guard', 'time', 'first reason'];
   const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
   const fmt = (r) => r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(w[i]))).join('  ');
   return [fmt(head), fmt(w.map((n) => '-'.repeat(n))), ...rows.map(fmt)].join('\n');
@@ -1192,11 +1504,11 @@ async function main(argv) {
     else if ((m = a.match(/^--selftest=(.+)$/))) o.selftest = m[1];
     else { console.error(`unknown argument ${a}\n(see the header of lssafety.js)`); return 2; }
   }
-  if (o.list) { console.log(SCENARIOS.join('\n')); return 0; }
+  if (o.list) { console.log([...SCENARIOS, ...OPTIONAL_SCENARIOS.map((s) => `${s} (optional: --only)`)].join('\n')); return 0; }
   if (o.selftest) return selftest(o.selftest);
   const names = o.only || SCENARIOS;
   const unknown = names.filter((n) => !scenarios[n]);
-  if (unknown.length) { console.error(`unknown scenario(s): ${unknown.join(', ')}; known: ${SCENARIOS.join(', ')}`); return 2; }
+  if (unknown.length) { console.error(`unknown scenario(s): ${unknown.join(', ')}; known: ${[...SCENARIOS, ...OPTIONAL_SCENARIOS].join(', ')}`); return 2; }
   if (!fs.existsSync(APP)) { console.error(`no app binary at ${APP} (set LSSAFETY_APP)`); return 2; }
   let root;
   try {
@@ -1209,11 +1521,13 @@ async function main(argv) {
     log(`== ${n}`);
     const r = await runScenario(n, root, o);
     results.push(r);
-    console.log(`LSSAFETY_RESULT ${JSON.stringify({ scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [], result: path.join(r.dir || root, 'result.json') })}`);
+    console.log(`LSSAFETY_RESULT ${JSON.stringify({ scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [],
+      guard: r.guard ? r.guard.status : null, guard_counts: r.guard ? r.guard.counts : null, result: path.join(r.dir || root, 'result.json') })}`);
   }
   const table = summaryTable(results);
   fs.writeFileSync(path.join(root, 'summary.json'), JSON.stringify({ app: APP, root, results: results.map((r) => ({
-    scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [], duration_ms: r.duration_ms })) }, null, 1));
+    scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [],
+    guard: r.guard ? r.guard.status : null, duration_ms: r.duration_ms })) }, null, 1));
   fs.writeFileSync(path.join(root, 'summary.txt'), `${table}\n`);
   console.log(`\n${table}\n\nresults: ${root}`);
   return results.every((r) => r.status === 'pass') ? 0 : 1;
@@ -1310,12 +1624,40 @@ function selftest(dir) {
   assert.strictEqual(classify('logseq/bak/pages/a/1.md'), 'bak');
   assert.strictEqual(classify('journals/.x.md.lssafety~'), 'hidden');
   assert.strictEqual(countOf('ab ab', 'ab'), 2);
+  // typed with an inserted sibling (scenario 7)
+  const T4 = pageRel(pageName(4));
+  const b4 = s0.get(T4).text;
+  fs.writeFileSync(path.join(g, T4), b4.replace('- Page 04 block one plain text', '- Page 04 block one plain text one s1tok\n- two t2tok'));
+  c = checkExpectation({ path: T4, kind: 'typed', base: b4, target: 'Page 04 block one', typed: [' one s1tok'], inserted: ['- two t2tok'], tokens: ['s1tok', 't2tok'] }, snapshotDir(g), []);
+  assert.ok(c.ok && c.byte_exact, JSON.stringify(c));
+  // write guard records
+  assert.deepStrictEqual(parseGuardLine('LSGUARD {"path":"pages/a.md","result":"mismatch","copy":"logseq/bak/conflicts/a.md"}'),
+    { path: 'pages/a.md', result: 'mismatch', copy: 'logseq/bak/conflicts/a.md' });
+  assert.strictEqual(parseGuardLine('LSPERF {}'), null);
+  assert.ok(parseGuardLine('LSGUARD {bad').raw);
+  assert.strictEqual(graphRel(path.join(g, 'logseq/bak/conflicts/x.md'), g), 'logseq/bak/conflicts/x.md');
+  assert.strictEqual(graphRel('/elsewhere/x.md', g), null);
+  assert.strictEqual(guardReport([], { appWrote: true }).status, 'absent');
+  assert.strictEqual(guardReport([], {}).status, 'no-writes');
+  const gr = guardReport([{ result: 'written' }, { result: 'mismatch', path: 'p' }, { result: 'io-error' }]);
+  assert.ok(gr.status === 'present' && gr.refusals.length === 2 && gr.counts.written === 1, JSON.stringify(gr));
+  fs.mkdirSync(path.join(g, 'logseq/bak/conflicts/pages'), { recursive: true });
+  fs.writeFileSync(path.join(g, 'logseq/bak/conflicts/pages/Page 09.md'), '- proposal w1tok');
+  const cc = conflictCopies([{ path: path.join(g, 'pages/Page 09.md'), result: 'mismatch', copy: path.join(g, 'logseq/bak/conflicts/pages/Page 09.md') },
+    { path: 'pages/Page 09.md', result: 'mismatch', copy: 'logseq/bak/conflicts/gone.md' }, { path: 'x', result: 'written' }],
+  snapshotDir(g), g, ['w1tok', 'w2tok'], { 'pages/Page 09.md': ['w1tok'] });
+  assert.strictEqual(cc.length, 2);
+  assert.ok(cc[0].exists && cc[0].holds_expected === true && cc[0].tokens.join() === 'w1tok', JSON.stringify(cc[0]));
+  assert.ok(!cc[1].exists && cc[1].holds_expected === false, JSON.stringify(cc[1]));
+  assert.strictEqual(classify('logseq/bak/conflicts/pages/Page 09.md'), 'bak');
+  for (const n of [...SCENARIOS, ...OPTIONAL_SCENARIOS]) assert.ok(scenarios[n] && typeof scenarios[n].run === 'function', `scenario ${n} defined`);
   console.log(`selftest ok (${g})`);
   return 0;
 }
 
 module.exports = { makeTemplate, appendBlock, replaceBlockLine, deleteBlock, snapshotDir, verify, checkExpectation,
-  lineDiff, stripAddedIdLines, samePageOutcome, assertSafePath, classify, newBaks };
+  lineDiff, stripAddedIdLines, samePageOutcome, assertSafePath, classify, newBaks,
+  parseGuardLine, graphRel, guardReport, conflictCopies };
 
 if (require.main === module) {
   const stop = async (sig) => {
