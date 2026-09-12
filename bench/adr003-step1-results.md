@@ -617,7 +617,17 @@ The full suite gated RC2 once. One test got a foreign rejection that another
 test leaked. The cause is a promesa 11.0.678 bug in the drain loop, shared
 by unrelated promise chains: one thrown handler rejected later ones. It is
 now patched with a local override of `promesa/impl/promise.js` (32f102e),
-and the leaking test is fixed (995fe78).
+and the leaking test is fixed (995fe78). The regression test
+`frontend.promesa-drain-test` has two cases.
+
+- Without the override: both fail. The chain after a throwing one was
+  rejected with the other chain's error (`{:error "only b fails"}` where
+  `{:ok :c}` was expected). A neighbour of a `p/do` that threw
+  synchronously received that error too, which explains the earlier
+  "p/catch did not catch" observation.
+- With the override: both pass (2 tests, 5 assertions), and so does the
+  repo-test + node-cache-test pair that exposed the leak (18 tests, 80
+  assertions).
 
 ### Data safety: step-4 build vs master (`bench/lssafety.js`, 2026-09-12)
 
