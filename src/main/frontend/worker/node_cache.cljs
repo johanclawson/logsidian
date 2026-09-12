@@ -15,9 +15,22 @@
   - `cached-storage` drops every written or deleted address before handing
     the batch to the writer, in the same synchronous step. Whether the write
     succeeds or throws, no cached row for those addresses survives it.
-  - Code that changes kvs rows outside the storage (GC, rebuild, import) or
-    closes the handle calls `clear-for!`.
+  - Code that changes kvs rows outside the storage (GC, import) runs the
+    change inside `clear-around!`, which clears the handle's cache before the
+    change and again after it, even when it throws halfway. Rebuild and close
+    call `clear-for!`.
   So a restore returns exactly what an uncached restore would read.
+
+  Shared values: a hit hands out the same decoded row every time (only
+  :addresses is copied), so every node restored from it shares its datom
+  vectors and values, including transit-decoded dates, which are mutable
+  js/Date objects. That sharing is not new. Within one live db, every reader
+  of a restored node already shares its datom values, so code that mutated a
+  datom value would already be a bug without this cache, which only extends
+  the sharing across restores of the same row. So rows are not cloned. No
+  worker code mutates datom values. The only Date setter in the worker's
+  sources and deps (db, outliner, common, graph-parser) is the `.setHours` in
+  logseq.db.frontend.inputs, and it runs on a fresh `(js/Date. date)` copy.
 
   There is one cache per SQLite handle (`cache-for`), shared by every storage
   over that handle, so graphs never see each other's rows even though
@@ -51,7 +64,9 @@
 (defprotocol INodeCache
   (-hit [cache addr] "The row cached for addr, made most recent, or nil.")
   (-admit! [cache addr row cost]
-    "Keep row under addr, then evict the least recent rows past the bounds.")
+    "Keep row under addr, then evict the least recent rows past the bounds. A
+    row costing more than the whole byte budget is not kept and evicts
+    nothing, but still replaces any older row under addr.")
   (-invalidate! [cache addr] "Drop the row cached for addr, if any.")
   (-clear! [cache] "Drop every row.")
   (-stats [cache] "Counters and current size, as a map."))
@@ -78,19 +93,24 @@
       (when-some [old (.get entries addr)]
         (.delete entries addr)
         (set! total-cost (- total-cost (aget old 1))))
-      (.set entries addr #js [row cost])
-      (set! total-cost (+ total-cost cost))
-      ;; Never evicts the row just admitted, even when it alone is over budget.
-      (loop []
-        (when (and (> (.-size entries) 1)
-                   (or (> (.-size entries) entry-limit)
-                       (> total-cost byte-limit)))
-          (let [k (.-value (.next (.keys entries)))
-                e (.get entries k)]
-            (.delete entries k)
-            (set! total-cost (- total-cost (aget e 1)))
-            (set! evictions (inc evictions))
-            (recur))))))
+      ;; A row over the whole byte budget would evict every other row just to
+      ;; hold one entry, so it is not kept. Any older row under addr is gone
+      ;; already (above), so no stale row survives either way.
+      (when (<= cost byte-limit)
+        (.set entries addr #js [row cost])
+        (set! total-cost (+ total-cost cost))
+        ;; The new row fits the byte budget on its own, so eviction stops
+        ;; before it (the size guard only matters for an entry-limit below 1).
+        (loop []
+          (when (and (> (.-size entries) 1)
+                     (or (> (.-size entries) entry-limit)
+                         (> total-cost byte-limit)))
+            (let [k (.-value (.next (.keys entries)))
+                  e (.get entries k)]
+              (.delete entries k)
+              (set! total-cost (- total-cost (aget e 1)))
+              (set! evictions (inc evictions))
+              (recur)))))))
 
   (-invalidate! [this addr]
     (if (number? addr)
@@ -139,6 +159,28 @@
   (when-some [cache (when (some? db) (.get caches db))]
     (-clear! cache)))
 
+(defn clear-around!
+  "Calls (f), which changes kvs rows of the SQLite handles `dbs` other than
+  through their storage (nil handles are skipped). Their caches are cleared
+  before the call and again after it, whether f returns, throws, or returns a
+  promise that later resolves or rejects. So a change that fails halfway
+  leaves no cached row behind: a GC pass that throws after earlier passes
+  committed, or an import that throws after a short write. Returns what f
+  returns; a promise it returns settles after the second clear, with the
+  same value or error."
+  [dbs f]
+  (let [clear! #(run! clear-for! dbs)]
+    (clear!)
+    (let [r (try (f)
+                 (catch :default e
+                   (clear!)
+                   (throw e)))]
+      (if (and (some? r) (fn? (.-then ^js r)))
+        (.then ^js r
+               (fn [v] (clear!) v)
+               (fn [e] (clear!) (throw e)))
+        (do (clear!) r)))))
+
 (defn stats-for
   "Counters of the cache of SQLite handle `db`, nil when it has none."
   [db]
@@ -156,7 +198,8 @@
 
 (defn- owned-row
   "A row the caller may keep. DataScript hands :addresses to the restored node
-  as its mutable _addresses array, so a cached array is never handed out."
+  as its mutable _addresses array, so a cached array is never handed out. The
+  datoms and their values are shared on purpose (see the ns docstring)."
   [row]
   (let [addresses (:addresses row)]
     (if (array? addresses)
@@ -169,8 +212,10 @@
   - `read-row`: (fn [addr]) -> [data chars] or nil when there is no row;
     `chars` is the length of the stored text and sizes the entry.
   - `write-rows!`: (fn [addr+data-seq delete-addrs]), the uncached -store.
-  - `on-hit`: optional (fn []) called per cache hit, for perf counters."
-  [cache {:keys [read-row write-rows! on-hit]}]
+
+  A hit only bumps the cache's own counter (see `-stats`). Perf code reads
+  hits from there, so the hit path does no other work."
+  [cache {:keys [read-row write-rows!]}]
   (reify
     storage/IStorage
     (-store [_ addr+data-seq delete-addrs]
@@ -182,8 +227,7 @@
 
     (-restore [_ addr]
       (if-some [row (-hit cache addr)]
-        (do (when on-hit (on-hit))
-            (owned-row row))
+        (owned-row row)
         (when-some [[data chars] (read-row addr)]
           (when (node-row? data)
             (-admit! cache addr data (row-cost chars)))

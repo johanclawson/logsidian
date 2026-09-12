@@ -168,11 +168,14 @@
 ;; prefixed "LSPERF " carrying one JSON object each. Not for merging as-is.
 (def ^:private perf-tick-ms 20)
 (defonce ^:private *perf-last-tick (atom (js/performance.now)))
-;; :restores / :restore-ms count SQLite reads (node cache misses) and their
-;; time; :cache-hits counts restores served by frontend.worker.node-cache.
-;; DataScript restore calls = restores + cache-hits.
+;; Miss metrics: :restores / :restore-ms count SQLite reads only, i.e. node
+;; cache misses, and their time. Restores served by frontend.worker.node-cache
+;; are the :cache-hits of the LSPERF lines, taken as deltas of
+;; `perf-cache-hits` (the caches' own counters; the hit path bumps nothing
+;; here). Total DataScript restore calls = restores + cache-hits.
+;; :cache-hits0 is the hit total at the start of the current phase.
 (defonce ^:private *perf
-  (atom {:restores 0 :restore-ms 0 :cache-hits 0 :max-lag 0 :phase-start (js/performance.now)}))
+  (atom {:restores 0 :restore-ms 0 :cache-hits0 0 :max-lag 0 :phase-start (js/performance.now)}))
 
 (defn- perf-log! [event m]
   (js/console.log
@@ -188,12 +191,31 @@
 (defonce ^:private perf-heartbeat
   (js/setInterval (fn [] (perf-note-lag! (js/performance.now))) perf-tick-ms))
 
+(defn- open-cache-stats
+  "Node cache stats of the open SQLite handles that have a cache."
+  []
+  (keep node-cache/stats-for
+        (mapcat (fn [{:keys [db client-ops]}] [db client-ops])
+                (vals @*sqlite-conns))))
+
+;; Hits of handles closed so far (close-db-aux!), so that `perf-cache-hits`
+;; never goes backwards when a graph closes.
+(defonce ^:private *closed-cache-hits (atom 0))
+
+(defn- perf-cache-hits
+  "Node cache hits so far, over every SQLite handle this worker has opened."
+  []
+  (reduce + @*closed-cache-hits (map :hits (open-cache-stats))))
+
+(defn- perf-retire-cache-hits!
+  "Fold the hits of handles about to close into *closed-cache-hits."
+  [& dbs]
+  (swap! *closed-cache-hits + (reduce + 0 (keep #(:hits (node-cache/stats-for %)) dbs))))
+
 (defn- perf-node-cache
   "Node cache gauges, summed over the open SQLite handles."
   []
-  (let [stats (keep node-cache/stats-for
-                    (mapcat (fn [{:keys [db client-ops]}] [db client-ops])
-                            (vals @*sqlite-conns)))]
+  (let [stats (open-cache-stats)]
     {:cache-entries (reduce + 0 (map :entries stats))
      :cache-mb (/ (js/Math.round (/ (reduce + 0 (map :bytes stats)) 104857.6)) 10)
      :cache-evictions (reduce + 0 (map :evictions stats))}))
@@ -206,16 +228,17 @@
   ([phase extra]
    (let [now (js/performance.now)
          _ (perf-note-lag! now)
-         {:keys [restores restore-ms cache-hits max-lag phase-start]} @*perf]
+         {:keys [restores restore-ms cache-hits0 max-lag phase-start]} @*perf
+         cache-hits (perf-cache-hits)]
      (perf-log! "phase" (merge {:phase phase
                                 :elapsed-ms (js/Math.round (- now phase-start))
                                 :max-lag-ms (js/Math.round (max 0 max-lag))
                                 :restores restores
                                 :restore-ms (js/Math.round restore-ms)
-                                :cache-hits (or cache-hits 0)}
+                                :cache-hits (- cache-hits cache-hits0)}
                                (perf-node-cache)
                                extra))
-     (swap! *perf assoc :restores 0 :restore-ms 0 :cache-hits 0 :max-lag 0 :phase-start now))))
+     (swap! *perf assoc :restores 0 :restore-ms 0 :cache-hits0 cache-hits :max-lag 0 :phase-start now))))
 
 (defonce ^:private perf-activity
   ;; Once a second, report any window with restores (from SQLite or the node
@@ -223,8 +246,8 @@
   ;; is visible too.
   (js/setInterval
    (fn []
-     (let [{:keys [restores cache-hits max-lag]} @*perf]
-       (when (or (pos? restores) (pos? cache-hits) (> max-lag 50))
+     (let [{:keys [restores cache-hits0 max-lag]} @*perf]
+       (when (or (pos? restores) (> (perf-cache-hits) cache-hits0) (> max-lag 50))
          (perf-phase! "activity"))))
    1000))
 
@@ -263,9 +286,6 @@
                              (update :restore-ms + (- (js/performance.now) t0)))))
     r))
 
-(defn- perf-note-cache-hit! []
-  (swap! *perf update :cache-hits (fnil inc 0)))
-
 (defn new-sqlite-storage
   "Update sqlite-cli/new-sqlite-storage when making changes. The node cache in
    front (frontend.worker.node-cache) is worker-only and changes no results:
@@ -274,7 +294,6 @@
   (node-cache/cached-storage
    (node-cache/cache-for db)
    {:read-row (fn [addr] (restore-data-from-addr db addr))
-    :on-hit perf-note-cache-hit!
     :write-rows!
     (fn [addr+data-seq _delete-addrs]
       (let [t0 (js/performance.now)
@@ -302,6 +321,7 @@
   (file-paths/forget! repo)
   (search-indexer/close! repo)
   ;; Old db values may outlive the conn; their caches should not.
+  (perf-retire-cache-hits! db client-ops)
   (node-cache/clear-for! db)
   (node-cache/clear-for! client-ops)
   (when db (.close db))
@@ -363,9 +383,11 @@
               (> (- (common-util/time-ms) last-gc-at) (* 3 24 3600 1000))) ; 3 days ago
       (println :debug "gc current graph")
       (doseq [db (if @*publishing? [sqlite-db] [sqlite-db client-ops-db])]
-        (sqlite-gc/gc-kvs-table! db {:full-gc? full-gc?})
-        ;; gc deletes kvs rows behind the storage's back
-        (node-cache/clear-for! db)
+        ;; gc deletes kvs rows behind the storage's back, in one committed
+        ;; transaction per pass (full-gc? recurses), so a later pass that
+        ;; throws still leaves earlier deletions behind: clear the cache
+        ;; before gc and again after it, however it ends.
+        (node-cache/clear-around! [db] #(sqlite-gc/gc-kvs-table! db {:full-gc? full-gc?}))
         (.exec db "VACUUM"))
       (ldb/transact! datascript-conn [{:db/ident :logseq.kv/graph-last-gc-at
                                        :kv/value (common-util/time-ms)}]))))
@@ -600,7 +622,7 @@
     (try
       (let [t0 (js/performance.now)
             restores0 (:restores @*perf)
-            cache-hits0 (:cache-hits @*perf)
+            cache-hits0 (perf-cache-hits)
             plan (journal-window/plan (first inputs) (rest inputs))
             stats (if (= ::journal-window/no-match plan)
                     ::journal-window/no-match
@@ -617,7 +639,7 @@
                            :hits (:hits stats)
                            :ms (/ (js/Math.round (* 10 (- (js/performance.now) t0))) 10)
                            :restores (- (:restores @*perf) restores0)
-                           :cache-hits (- (or (:cache-hits @*perf) 0) (or cache-hits0 0))}))))
+                           :cache-hits (- (perf-cache-hits) cache-hits0)}))))
           stats))
       (catch :default e
         (js/console.error "q-fastpath failed, running d/q instead" e)
@@ -812,10 +834,24 @@
   [repo data]
   (when-not (string/blank? repo)
     (p/let [pool (<get-opfs-pool repo)]
-      ;; Still not awaited. The import replaces the file under any open handle
-      ;; of this repo, so drop that handle's cached rows once it has landed.
-      (p/then (<import-db pool data)
-              (fn [_] (node-cache/clear-for! (worker-state/get-sqlite-conn repo :db))))
+      ;; The import rewrites the file under any open :db handle of this repo.
+      ;; With sqlite-wasm 3.50.3 a byte-array importDb writes straight to the
+      ;; file's existing access handle, and a short write disassociates the
+      ;; file and throws, so the rows can change even when the import fails.
+      ;; The handle is captured before the import, and its cache is cleared
+      ;; before the import and again after it, however it ends: no cached
+      ;; row of the old file survives for it. (Still not awaited, as before.)
+      ;;
+      ;; An open repo's DataScript conn would also have to be reopened after
+      ;; an import, cache or not: its index nodes and addresses describe the
+      ;; old file. import-db does not reopen it, and create-or-open-db is a
+      ;; no-op while the repo's handle is open. That is fine today because no
+      ;; caller imports over an open graph. <fetch-initial-data imports only
+      ;; when the db does not exist, and import-from-sqlite-db! only into a
+      ;; new graph (the import UI rejects an existing name). So the captured
+      ;; handle is normally nil.
+      (node-cache/clear-around! [(worker-state/get-sqlite-conn repo :db)]
+                                #(<import-db pool data))
       nil)))
 
 (def-thread-api :thread-api/search-blocks
@@ -861,7 +897,8 @@
     (reset! *perf-store {:ms 0 :calls 0})
     (vreset! search-indexer/*sync-perf {:ms 0 :rows 0})
     (let [t0 (js/performance.now)
-          {restores0 :restores restore-ms0 :restore-ms cache-hits0 :cache-hits} @*perf]
+          {restores0 :restores restore-ms0 :restore-ms} @*perf
+          cache-hits0 (perf-cache-hits)]
       (try
         (worker-util/profile
          "apply outliner ops"
@@ -878,7 +915,7 @@
         (finally
           (let [{store-ms :ms store-calls :calls} @*perf-store
                 {search-ms :ms search-rows :rows} @search-indexer/*sync-perf
-                {:keys [restores restore-ms cache-hits]} @*perf
+                {:keys [restores restore-ms]} @*perf
                 round #(js/Math.round (or % 0))]
             (js/console.log
              (str "LSPERF "
@@ -893,7 +930,7 @@
                              :search-rows search-rows
                              :restores (- (or restores 0) (or restores0 0))
                              :restore-ms (round (- (or restore-ms 0) (or restore-ms0 0)))
-                             :cache-hits (- (or cache-hits 0) (or cache-hits0 0))}))))))))))
+                             :cache-hits (- (perf-cache-hits) cache-hits0)}))))))))))
 
 (def-thread-api :thread-api/file-writes-finished?
   [repo]

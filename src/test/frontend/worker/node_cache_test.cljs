@@ -1,8 +1,9 @@
 (ns frontend.worker.node-cache-test
-  (:require [cljs.test :refer [deftest is testing]]
+  (:require [cljs.test :refer [async deftest is testing]]
             [datascript.core :as d]
             [datascript.storage :as storage]
-            [frontend.worker.node-cache :as node-cache]))
+            [frontend.worker.node-cache :as node-cache]
+            [promesa.core :as p]))
 
 (defn- row [v] {:keys [[1 :a v 1]]})
 
@@ -35,10 +36,21 @@
       (node-cache/-admit! cache a (row a) 4))
     (is (= 8 (:bytes (node-cache/-stats cache))))
     (is (= [2 3] (cached-addrs cache [1 2 3])))
-    (testing "an over-budget row is still kept, alone"
-      (node-cache/-admit! cache 9 (row 9) 50)
-      (is (= {:entries 1 :bytes 50}
-             (select-keys (node-cache/-stats cache) [:entries :bytes]))))))
+    (testing "a row over the whole budget is not kept and evicts nothing"
+      (node-cache/-admit! cache 9 (row 9) 11)
+      (is (= {:entries 2 :bytes 8 :evictions 1}
+             (select-keys (node-cache/-stats cache) [:entries :bytes :evictions])))
+      (is (= [2 3] (cached-addrs cache [2 3 9]))))
+    (testing "it still replaces an older row under its address"
+      (node-cache/-admit! cache 3 (row :huge) 11)
+      (is (= {:entries 1 :bytes 4}
+             (select-keys (node-cache/-stats cache) [:entries :bytes])))
+      (is (nil? (node-cache/-hit cache 3))))
+    (testing "a row of exactly the budget is kept, alone"
+      (node-cache/-admit! cache 4 (row 4) 10)
+      (is (= {:entries 1 :bytes 10}
+             (select-keys (node-cache/-stats cache) [:entries :bytes])))
+      (is (= (row 4) (node-cache/-hit cache 4))))))
 
 (deftest readmit-replaces
   (let [cache (node-cache/new-cache 10 1e9)]
@@ -94,7 +106,6 @@
   ([cache]
    (let [rows (atom {})
          reads (atom 0)
-         hits (atom 0)
          fail? (atom false)
          s (node-cache/cached-storage
             cache
@@ -105,17 +116,16 @@
              :write-rows! (fn [addr+data-seq _delete-addrs]
                             (when @fail? (throw (js/Error. "disk full")))
                             (swap! rows into (map (fn [[a data]] [a (serialized data)]))
-                                   addr+data-seq))
-             :on-hit #(swap! hits inc)})]
-     {:storage s :cache cache :rows rows :reads reads :hits hits :fail? fail?})))
+                                   addr+data-seq))})]
+     {:storage s :cache cache :rows rows :reads reads :fail? fail?})))
 
 (deftest restore-after-store-returns-the-new-row
-  (let [{s :storage :keys [reads hits]} (fake-kvs)]
+  (let [{s :storage :keys [reads cache]} (fake-kvs)]
     (storage/-store s [[5 (row "old")]] nil)
     (is (= (row "old") (storage/-restore s 5)))
     (is (= (row "old") (storage/-restore s 5)))
     (is (= 1 @reads) "second restore is a hit")
-    (is (= 1 @hits))
+    (is (= 1 (:hits (node-cache/-stats cache))) "counted by the cache itself")
     (testing "the address is rewritten in place"
       (storage/-store s [[5 (row "new")]] nil)
       (is (= (row "new") (storage/-restore s 5)))
@@ -155,6 +165,81 @@
     (is (= [7 8] (vec (:addresses (storage/-restore s 5)))) "hit")
     (aset (:addresses (storage/-restore s 5)) 1 99)
     (is (= [7 8] (vec (:addresses (storage/-restore s 5)))))))
+
+;; ---------------------------------------------------------------------------
+;; clear-around!: how db_worker wraps gc-kvs-table! and import-db. db_worker
+;; cannot load under node (it imports worker.js), so stand-in handles here.
+
+(deftest clear-around-clears-before-and-after
+  (let [db1 #js {}
+        db2 #js {}
+        entries (fn [db] (:entries (node-cache/stats-for db)))
+        admit! (fn [db] (node-cache/-admit! (node-cache/cache-for db) 1 (row 1) 1))]
+    (testing "when the change returns"
+      (admit! db1)
+      (admit! db2)
+      (is (= :done (node-cache/clear-around!
+                    [db1 db2]
+                    (fn []
+                      (is (= [0 0] [(entries db1) (entries db2)]) "cleared before")
+                      (admit! db1) ; a restore while the rows are changing
+                      :done))))
+      (is (= [0 0] [(entries db1) (entries db2)]) "cleared after"))
+    (testing "when the change throws halfway"
+      (admit! db1)
+      (is (thrown-with-msg? js/Error #"pass 2"
+                            (node-cache/clear-around!
+                             [db1]
+                             (fn []
+                               (admit! db1)
+                               (throw (js/Error. "pass 2"))))))
+      (is (= 0 (entries db1))))
+    (testing "no open handle"
+      (is (= 1 (node-cache/clear-around! [nil] (constantly 1)))))))
+
+(deftest failed-direct-change-leaves-no-stale-row
+  ;; gc-kvs-table! commits one deletion pass at a time and recurses, so a
+  ;; later pass can throw after earlier deletions landed.
+  (let [db #js {}
+        {s :storage rows :rows} (fake-kvs (node-cache/cache-for db))]
+    (storage/-store s [[5 (row 5)] [6 (row 6)]] nil)
+    (storage/-restore s 5)
+    (storage/-restore s 6)
+    (is (thrown? js/Error
+                 (node-cache/clear-around!
+                  [db]
+                  (fn []
+                    (swap! rows dissoc 5) ; pass 1, committed
+                    (throw (js/Error. "pass 2 failed"))))))
+    (is (nil? (storage/-restore s 5)) "the deleted row is not served from the cache")
+    (is (= (row 6) (storage/-restore s 6)))))
+
+(deftest clear-around-a-promise
+  ;; An import that returns a promise and rejects after a short write.
+  (async done
+    (let [db #js {}
+          entries #(:entries (node-cache/stats-for db))
+          admit! #(node-cache/-admit! (node-cache/cache-for db) 1 (row 1) 1)]
+      (admit!)
+      (-> (node-cache/clear-around!
+           [db]
+           (fn []
+             (is (= 0 (entries)) "cleared before")
+             (p/let [_ (p/delay 0)]
+               (admit!)
+               (throw (js/Error. "short write")))))
+          (p/then (fn [_] (is false "the rejection is passed on")))
+          (p/catch (fn [e]
+                     (is (= "short write" (ex-message e)))
+                     (is (= 0 (entries)) "cleared after it settled")))
+          (p/then (fn [_]
+                    (admit!)
+                    (node-cache/clear-around! [db] #(p/delay 0 :imported))))
+          (p/then (fn [v]
+                    (is (= :imported v) "a resolved value is passed on")
+                    (is (= 0 (entries)))))
+          (p/catch (fn [e] (is false (str e))))
+          (p/finally (fn [_ _] (done)))))))
 
 (defn- eav-set [db]
   (set (map (juxt :e :a :v) (d/datoms db :eavt))))
