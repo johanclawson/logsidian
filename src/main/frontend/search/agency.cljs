@@ -25,11 +25,14 @@
         (protocol/query e q opts))
       (protocol/query e1 q opts)))
 
-  (rebuild-blocks-indice! [_this]
+  (rebuild-blocks-indice! [this]
+    (protocol/rebuild-blocks-indice! this {:force? true}))
+
+  (rebuild-blocks-indice! [_this opts]
     (let [[e1 e2] (get-registered-engines repo)]
       (doseq [e e2]
-        (protocol/rebuild-blocks-indice! e))
-      (protocol/rebuild-blocks-indice! e1)))
+        (protocol/rebuild-blocks-indice! e opts))
+      (protocol/rebuild-blocks-indice! e1 opts)))
 
   (rebuild-pages-indice! [_this]
     (let [[e1 e2] (get-registered-engines repo)]

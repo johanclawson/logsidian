@@ -33,6 +33,7 @@
             [frontend.worker.rtc.db-listener]
             [frontend.worker.rtc.migrate :as rtc-migrate]
             [frontend.worker.search :as search]
+            [frontend.worker.search-indexer :as search-indexer]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
             [frontend.worker.thread-atom]
@@ -269,6 +270,7 @@
   (swap! *datascript-conns dissoc repo)
   (swap! *client-ops-conns dissoc repo)
   (file-paths/forget! repo)
+  (search-indexer/close! repo)
   (when db (.close db))
   (when search (.close search))
   (when client-ops (.close client-ops))
@@ -348,6 +350,11 @@
                                        :client-ops client-ops-db})
       (doseq [db' dbs]
         (enable-sqlite-wal-mode! db'))
+      ;; The search db holds derived data and now commits once per DataScript
+      ;; tx (search-indexer/sync-tx!): skip the WAL fsync on each commit. WAL +
+      ;; NORMAL survives a process kill; a power loss can drop the last search
+      ;; commits, which the watermark check on open sees as a gap and heals.
+      (.exec search-db "PRAGMA synchronous=NORMAL")
       (common-sqlite/create-kvs-table! db)
       (when-not @*publishing? (common-sqlite/create-kvs-table! client-ops-db))
       (search/create-tables-and-triggers! search-db)
@@ -357,6 +364,9 @@
       (let [schema (ldb/get-schema repo)
             conn (common-sqlite/get-storage-conn storage schema)
             _ (perf-phase! "restore-conn")
+            ;; max-tx as stored, before this session's txs: the search index
+            ;; compares it with its watermark (search-indexer/on-open!)
+            stored-max-tx (:max-tx @conn)
             _ (db-fix/check-and-fix-schema! repo conn)
             _ (perf-phase! "schema-fix")
             _ (when datoms
@@ -386,7 +396,11 @@
             (let [client-ops (rtc-migrate/migration-results=>client-ops migration-result)]
               (client-op/add-ops! repo client-ops))))
 
-        (db-listener/listen-db-changes! repo (get @*datascript-conns repo))))))
+        (db-listener/listen-db-changes! repo (get @*datascript-conns repo))
+        ;; Trust, resume or heal the block search index (a walk the worker
+        ;; runs in slices once it is idle; no UI involvement)
+        (search-indexer/on-open! repo {:stored-max-tx stored-max-tx
+                                       :file-graph? (not db-based?)})))))
 
 (defn- iter->vec [iter']
   (when iter'
@@ -481,7 +495,13 @@
 ;; [graph service]
 (defonce *service (atom []))
 
-(defonce fns {"remoteInvoke" thread-api/remote-function})
+(defonce fns {"remoteInvoke" (fn [& args]
+                                ;; the search index walk yields more while calls
+                                ;; arrive or are still pending: stamp on entry and
+                                ;; again when the result settles
+                                (search-indexer/note-call!)
+                                (p/finally (apply thread-api/remote-function args)
+                                           (fn [_ _] (search-indexer/note-call!))))})
 
 (defn- start-db!
   [repo {:keys [close-other-db?]
@@ -571,6 +591,8 @@
   [repo q option]
   (let [search-db (get-search-db repo)
         conn (worker-state/get-datascript-conn repo)]
+    ;; builds the Fuse page index in slices when it is missing (small graphs)
+    (search-indexer/ensure-fuse! repo)
     (search/search-blocks repo conn search-db q option)))
 
 (def-thread-api :thread-api/block-refs-check
@@ -580,13 +602,17 @@
       (let [db @conn
             block (d/entity db id)]
         (if unlinked?
-          (let [title (string/lower-case (:block/title block))
-                result (m/? (search-blocks repo title {:limit 100}))]
-            (boolean (some (fn [b]
-                             (let [block (d/entity db (:db/id b))]
-                               (and (not= id (:db/id block))
-                                    (not ((set (map :db/id (:block/refs block))) id))
-                                    (string/includes? (string/lower-case (:block/title block)) title)))) result)))
+          (if (search-indexer/building? repo)
+            ;; The block index is incomplete while it builds: answer "maybe"
+            ;; (show the section) rather than a confident "none".
+            true
+            (let [title (string/lower-case (:block/title block))
+                  result (m/? (search-blocks repo title {:limit 100}))]
+              (boolean (some (fn [b]
+                               (let [block (d/entity db (:db/id b))]
+                                 (and (not= id (:db/id block))
+                                      (not ((set (map :db/id (:block/refs block))) id))
+                                      (string/includes? (string/lower-case (:block/title block)) title)))) result))))
           (some? (first (common-initial-data/get-block-refs db (:db/id block)))))))))
 
 (def-thread-api :thread-api/get-block-parents
@@ -701,14 +727,17 @@
 
 (def-thread-api :thread-api/search-truncate-tables
   [repo]
-  (p/let [db (get-search-db repo)]
-    (search/truncate-table! db)
-    nil))
+  (search-indexer/truncate! repo))
 
-(def-thread-api :thread-api/search-build-blocks-indice
+;; Rebuild (opts {:force? true}: truncate + worker walk, resolves when the walk
+;; ends) or ensure ({:force? false}: resume a pending walk, returns status).
+(def-thread-api :thread-api/search-rebuild-blocks-index
+  [repo opts]
+  (search-indexer/start! repo opts))
+
+(def-thread-api :thread-api/search-index-status
   [repo]
-  (when-let [conn (worker-state/get-datascript-conn repo)]
-    (search/build-blocks-indice repo @conn)))
+  (search-indexer/status repo))
 
 (def-thread-api :thread-api/search-build-pages-indice
   [_repo]
@@ -847,12 +876,15 @@
     ;; Perf instrumentation: one LSPERF line per call with its phase timings.
     ;; reset-file! is synchronous, so *perf-store only sees this call's stores.
     (reset! *perf-store {:ms 0 :calls 0})
+    (vreset! search-indexer/*sync-perf {:ms 0 :rows 0})
     (let [t0 (js/performance.now)
           timings (atom {})
           result (file-reset/reset-file! repo conn file-path content (assoc opts :timings timings))
           total-ms (- (js/performance.now) t0)
           {:keys [parse-ms mldoc-ms delete-ms build-tx-ms transact-ms]} @timings
           {store-ms :ms store-calls :calls} @*perf-store
+          ;; search index sync, inside transact (search-indexer/sync-tx!)
+          {search-ms :ms search-rows :rows} @search-indexer/*sync-perf
           round #(js/Math.round (or % 0))]
       (js/console.log
        (str "LSPERF "
@@ -866,6 +898,8 @@
                        :transact-ms (round transact-ms)
                        :store-ms (round store-ms)
                        :store-calls store-calls
+                       :search-ms (round search-ms)
+                       :search-rows search-rows
                        :total-ms (round total-ms)}))))
       result)))
 

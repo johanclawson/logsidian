@@ -90,14 +90,21 @@
                (vec result)))))))))
 
 (defn rebuild-indices!
+  "opts {:force? true} (the default) rebuilds: the db worker truncates and walks
+  the graph, and the promise resolves with the walk's result
+  ({:state \"complete\" ...}, {:cancelled true} or {:error msg}).
+  {:force? false} only lets the worker resume a pending walk; it resolves at
+  once with the index status."
   ([]
    (rebuild-indices! (state/get-current-repo)))
   ([repo]
+   (rebuild-indices! repo {:force? true}))
+  ([repo opts]
    (when repo
      (when-let [engine (get-engine repo)]
        (p/do!
         (protocol/rebuild-pages-indice! engine)
-        (protocol/rebuild-blocks-indice! engine))))))
+        (protocol/rebuild-blocks-indice! engine opts))))))
 
 (defn reset-indice!
   [repo]

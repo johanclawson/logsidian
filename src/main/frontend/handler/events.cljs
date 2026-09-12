@@ -68,7 +68,8 @@
             (async/<! (sync/<sync-stop))))
 
 (defmethod handle :graph/added [[_ repo {:keys [empty-graph?]}]]
-  (search-handler/rebuild-indices!)
+  ;; parsing already indexed every file (db worker, per tx): no full rebuild
+  (search-handler/ensure-indices!)
   (plugin-handler/hook-plugin-app :graph-after-indexed {:repo repo :empty-graph? empty-graph?})
   (route-handler/redirect-to-home!)
   (when-let [dir-name (and (not (config/db-based-graph? repo)) (config/get-repo-dir repo))]

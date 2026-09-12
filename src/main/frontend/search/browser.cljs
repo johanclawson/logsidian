@@ -1,8 +1,6 @@
 (ns frontend.search.browser
   "Browser implementation of search protocol"
-  (:require [frontend.config :as config]
-            [frontend.handler.file-based.property.util :as property-util]
-            [frontend.search.protocol :as protocol]
+  (:require [frontend.search.protocol :as protocol]
             [frontend.state :as state]
             [promesa.core :as p]))
 
@@ -11,22 +9,19 @@
   (query [_this q option]
     (state/<invoke-db-worker :thread-api/search-blocks (state/get-current-repo) q option))
   (rebuild-pages-indice! [_this]
-    (state/<invoke-db-worker :thread-api/search-build-pages-indice repo))
+    ;; The db worker builds the Fuse page index itself, in slices, when a
+    ;; search first needs it (frontend.worker.search-indexer/ensure-fuse!).
+    (p/resolved nil))
   (rebuild-blocks-indice! [this]
-    (p/let [repo (state/get-current-repo)
-            file-based? (config/local-file-based-graph? repo)
-            _ (protocol/truncate-blocks! this)
-            result (state/<invoke-db-worker :thread-api/search-build-blocks-indice repo)
-            blocks (if file-based?
-                     (->> result
-                          ;; remove built-in properties from content
-                          (map
-                           #(update % :content
-                                    (fn [content]
-                                      (property-util/remove-built-in-properties (get % :format :markdown) content)))))
-                     result)
-            _ (when (seq blocks)
-                (state/<invoke-db-worker :thread-api/search-upsert-blocks repo blocks))]))
+    (protocol/rebuild-blocks-indice! this {:force? true}))
+  (rebuild-blocks-indice! [_this opts]
+    ;; The db worker walks the graph and writes blocks_fts itself, in slices
+    ;; bounded by a time budget (frontend.worker.search-indexer): no block rows
+    ;; cross to the UI thread. {:force? true} truncates and walks, and resolves
+    ;; when the walk ends: {:state "complete" ...}, {:cancelled true} or
+    ;; {:error msg}. {:force? false} resumes a pending walk and resolves with
+    ;; the index status at once.
+    (state/<invoke-db-worker :thread-api/search-rebuild-blocks-index (state/get-current-repo) opts))
   (transact-blocks! [_this {:keys [blocks-to-remove-set
                                    blocks-to-add]}]
     (let [repo (state/get-current-repo)]

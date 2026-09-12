@@ -2,16 +2,14 @@
   "Db listeners for worker-db."
   (:require [clojure.string :as string]
             [datascript.core :as d]
-            [frontend.common.thread-api :as thread-api]
             [frontend.worker.pipeline :as worker-pipeline]
             [frontend.worker.rtc.gen-client-op :as gen-client-op]
-            [frontend.worker.search :as search]
+            [frontend.worker.search-indexer :as search-indexer]
             [frontend.worker.shared-service :as shared-service]
             [frontend.worker.state :as worker-state]
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]
-            [logseq.outliner.batch-tx :as batch-tx]
-            [promesa.core :as p]))
+            [logseq.outliner.batch-tx :as batch-tx]))
 
 (defmulti listen-db-changes
   (fn [listen-key & _] listen-key))
@@ -21,8 +19,7 @@
   [repo conn {:keys [tx-meta] :as tx-report}]
   (when repo (worker-state/set-db-latest-tx-time! repo))
   (when-not (:rtc-download-graph? tx-meta)
-    (let [{:keys [from-disk?]} tx-meta
-          result (worker-pipeline/invoke-hooks repo conn tx-report (worker-state/get-context))
+    (let [result (worker-pipeline/invoke-hooks repo conn tx-report (worker-state/get-context))
           tx-report' (:tx-report result)]
       (when result
         (let [data (merge
@@ -31,16 +28,24 @@
                      :tx-data (:tx-data tx-report')
                      :tx-meta tx-meta}
                     (dissoc result :tx-report))]
-          (shared-service/broadcast-to-clients! :sync-db-changes data))
+          (shared-service/broadcast-to-clients! :sync-db-changes data)))
 
-        (when-not from-disk?
-          (p/do!
-           ;; Sync SQLite search
-           (let [{:keys [blocks-to-remove-set blocks-to-add]} (search/sync-search-indice repo tx-report')]
-             (when (seq blocks-to-remove-set)
-               ((@thread-api/*thread-apis :thread-api/search-delete-blocks) repo blocks-to-remove-set))
-             (when (seq blocks-to-add)
-               ((@thread-api/*thread-apis :thread-api/search-upsert-blocks) repo blocks-to-add))))))
+      ;; Sync SQLite search synchronously, in this tx's own task, for every tx:
+      ;; from-disk ones too (first open, watcher edits, reconcile). A
+      ;; reset-conn! report restarts the index walk instead: tagged (reset-db!)
+      ;; or untagged (fix-broken-graph), which carries no :tempids while every
+      ;; transact report has them. Never throws.
+      (cond
+        (or (:reset-conn! tx-meta) (nil? (:tempids tx-report)))
+        (search-indexer/sync-tx! repo tx-report)
+
+        result
+        (search-indexer/sync-tx! repo tx-report')
+
+        ;; No hook result (e.g. :transact-new-graph-refs? txs): still advance
+        ;; the watermark, or the next open sees a gap and walks the graph
+        :else
+        (search-indexer/sync-tx! repo tx-report))
       tx-report')))
 
 (comment

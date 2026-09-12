@@ -28,6 +28,9 @@
    ;;(let [blocks (search-db/build-blocks-indice repo)])
     (call-service! service "search:rebuildBlocksIndice" {}))
 
+  (rebuild-blocks-indice! [_this _opts]
+    (call-service! service "search:rebuildBlocksIndice" {}))
+
   (rebuild-pages-indice! [_this]
     (call-service! service "search:rebuildPagesIndice" {}))
 

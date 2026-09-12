@@ -80,6 +80,11 @@
   ;; Check https://www.sqlite.org/fts5.html#the_experimental_trigram_tokenizer.
   (.exec db "CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(id, title, page, tokenize=\"trigram\")"))
 
+(defn- create-meta-table!
+  [db]
+  ;; Index state (see get-meta). Not dropped by drop-tables-and-triggers!.
+  (.exec db "CREATE TABLE IF NOT EXISTS search_meta (k TEXT PRIMARY KEY, v TEXT)"))
+
 (defn create-tables-and-triggers!
   "Open a SQLite db for search index"
   [db]
@@ -87,6 +92,7 @@
     (create-blocks-table! db)
     (create-blocks-fts-table! db)
     (add-blocks-fts-triggers! db)
+    (create-meta-table! db)
     (catch :default e
       (prn "Failed to create tables and triggers")
       (js/console.error e)
@@ -116,26 +122,121 @@ DROP TRIGGER IF EXISTS blocks_au;
   (str "(" (->> (map (fn [id] (str "'" id "'")) ids)
                 (string/join ", ")) ")"))
 
+(defn- upsert-row!
+  "Upsert one blocks row. A row with a bad id, page or title is skipped (and
+  logged) instead of throwing, so it can't roll back the rest of its batch or
+  pin a walk's cursor. Returns true when the row was written."
+  [^Object tx id title page]
+  (if (and (common-util/uuid-string? id)
+           (common-util/uuid-string? page)
+           (string? title))
+    (do
+      (.exec tx #js {:sql "INSERT INTO blocks (id, title, page) VALUES ($id, $title, $page) ON CONFLICT (id) DO UPDATE SET (title, page) = ($title, $page)"
+                     :bind #js {:$id id
+                                :$title title
+                                :$page page}})
+      true)
+    (do
+      (js/console.warn "search: skipped a row with a bad id, page or title" id page)
+      false)))
+
 (defn upsert-blocks!
   [^Object db blocks]
   (.transaction db (fn [tx]
                      (doseq [item blocks]
-                       (if (and (common-util/uuid-string? (.-id item))
-                                (common-util/uuid-string? (.-page item)))
-                         (.exec tx #js {:sql "INSERT INTO blocks (id, title, page) VALUES ($id, $title, $page) ON CONFLICT (id) DO UPDATE SET (title, page) = ($title, $page)"
-                                        :bind #js {:$id (.-id item)
-                                                   :$title (.-title item)
-                                                   :$page (.-page item)}})
-                         (do
-                           (js/console.error "Upsert blocks wrong data: ")
-                           (js/console.dir item)
-                           (throw (ex-info "Search upsert-blocks wrong data: "
-                                           (bean/->clj item)))))))))
+                       (upsert-row! tx (.-id item) (.-title item) (.-page item))))))
 
 (defn delete-blocks!
   [db ids]
   (let [sql (str "DELETE from blocks WHERE id IN " (clj-list->sql ids))]
     (.exec db sql)))
+
+;; Index state, one search_meta row per key. v is a TEXT column, so every value
+;; comes back as a string: rows->meta parses the integer keys on read.
+(def ^:private meta-keys
+  {:state "blocks_state"             ; "complete" | "building"
+   :cursor "blocks_cursor"           ; entity id the walk has indexed up to
+   :gen "blocks_gen"                 ; bumped by every truncate
+   :indexed-tx "blocks_indexed_tx"   ; max-tx of the last tx reflected in the index
+   :dirty? "blocks_dirty"})          ; an incremental sync failed: rebuild
+
+(def ^:private int-meta-keys #{:cursor :gen :indexed-tx})
+
+(defn meta->kvs
+  "search_meta [k v] rows for the state map m. nil values are skipped."
+  [m]
+  (keep (fn [[k v]]
+          (when-let [col (get meta-keys k)]
+            (when (some? v)
+              [col (if (boolean? v) (if v "1" "0") (str v))])))
+        m))
+
+(defn- parse-int
+  [v]
+  (let [n (cond (number? v) v
+                (string? v) (js/parseInt v 10)
+                :else js/NaN)]
+    (when (js/isFinite n)
+      (js/Math.trunc n))))
+
+(defn rows->meta
+  "State map from search_meta [k v] rows; the inverse of meta->kvs."
+  [rows]
+  (let [col->k (set/map-invert meta-keys)]
+    (reduce (fn [m [col v]]
+              (if-let [k (get col->k col)]
+                (assoc m k (cond
+                             (contains? int-meta-keys k) (parse-int v)
+                             (= k :dirty?) (contains? #{"1" 1 "true"} v)
+                             :else v))
+                m))
+            {}
+            rows)))
+
+(defn set-meta!
+  [^Object db m]
+  (doseq [[k v] (meta->kvs m)]
+    (.exec db #js {:sql "INSERT INTO search_meta (k, v) VALUES ($k, $v) ON CONFLICT (k) DO UPDATE SET v = excluded.v"
+                   :bind #js {:$k k :$v v}})))
+
+(defn set-meta-tx!
+  "set-meta! in one SQLite transaction: a multi-key state change is atomic and
+  costs one commit."
+  [^Object db m]
+  (.transaction db (fn [tx] (set-meta! tx m))))
+
+(defn get-meta
+  "Persisted index state: {:state :cursor :gen :indexed-tx :dirty?}, integers parsed."
+  [^Object db]
+  (rows->meta (bean/->clj (.exec db #js {:sql "SELECT k, v FROM search_meta"
+                                         :rowMode "array"}))))
+
+(defn blocks-empty?
+  [^Object db]
+  (empty? (bean/->clj (.exec db #js {:sql "SELECT 1 FROM blocks LIMIT 1"
+                                     :rowMode "array"}))))
+
+(defn commit-batch!
+  "One walk slice: rows ({:id :title :page} maps) and the walk's progress (a
+  state map for set-meta!) in ONE SQLite transaction, so a quit resumes from
+  the committed cursor."
+  [^Object db rows meta]
+  (.transaction db (fn [tx]
+                     (doseq [{:keys [id title page]} rows]
+                       (upsert-row! tx id title page))
+                     (set-meta! tx meta))))
+
+(defn sync-rows!
+  "Incremental path: delete + upsert of one DataScript tx, plus its watermark,
+  in one SQLite transaction."
+  [^Object db remove-ids rows meta]
+  (.transaction db (fn [tx]
+                     (when (seq remove-ids)
+                       (delete-blocks! tx remove-ids))
+                     (doseq [{:keys [id title page]} rows]
+                       (upsert-row! tx id title page))
+                     (when meta
+                       (set-meta! tx meta)))))
 
 (defonce max-snippet-length 250)
 
@@ -270,27 +371,65 @@ DROP TRIGGER IF EXISTS blocks_au;
         (prn "Error: failed to run block->index on block " (:db/id block))
         (js/console.error e)))))
 
+(defn- fuse-options
+  []
+  (clj->js {:keys ["title"]
+            :shouldSort true
+            :tokenize true
+            :distance 1024
+            :threshold 0.5 ;; search for 50% match from the start
+            :minMatchCharLength 1}))
+
+(def fuzzy-page-limit
+  "Above this many pages search-blocks never queries Fuse (too slow), so the
+  page index is not built either."
+  2500)
+
+(defn large-graph?
+  "More than fuzzy-page-limit pages. Walks at most fuzzy-page-limit + 1
+  :block/name datoms instead of counting all of them."
+  [db]
+  (> (count (take (inc fuzzy-page-limit) (d/datoms db :avet :block/name)))
+     fuzzy-page-limit))
+
+;; repo -> {:indice Fuse :cursor eid :token n} while a sliced page-index build
+;; (frontend.worker.search-indexer/ensure-fuse!) is in progress
+(defonce fuzzy-builds (atom {}))
+
+(defn new-fuzzy-indice
+  []
+  (fuse. #js [] (fuse-options)))
+
+(defn add-fuzzy-docs!
+  [^js indice docs]
+  (doseq [doc docs]
+    (.add indice (bean/->js doc))))
+
+(defn forget-fuzzy!
+  "Drop the Fuse page index of repo and any build in progress; the next search
+  starts a new sliced build."
+  [repo]
+  (swap! fuzzy-builds dissoc repo)
+  (swap! fuzzy-search-indices dissoc repo))
+
 (defn build-fuzzy-search-indice
-  "Build a block title indice from scratch.
+  "Build a block title indice from scratch, synchronously. Only DB graphs use
+  this; file graphs build it in slices (frontend.worker.search-indexer/ensure-fuse!).
    Incremental page title indice is implemented in frontend.search.sync-search-indice!"
   [repo db]
   (let [blocks (->> (get-all-fuzzy-supported-blocks db)
-                    (map block->index)
+                    (keep block->index)
                     (bean/->js))
-        indice (fuse. blocks
-                      (clj->js {:keys ["title"]
-                                :shouldSort true
-                                :tokenize true
-                                :distance 1024
-                                :threshold 0.5 ;; search for 50% match from the start
-                                :minMatchCharLength 1}))]
+        indice (fuse. blocks (fuse-options))]
     (swap! fuzzy-search-indices assoc repo indice)
     indice))
 
 (defn fuzzy-search
   "Return a list of blocks (pages && tagged blocks) that match the query. Takes the following
   options:
-   * :limit - Number of result to limit search results. Defaults to 100"
+   * :limit - Number of result to limit search results. Defaults to 100
+  For file graphs this uses only an index that is already built, and returns
+  nil otherwise: page titles still match through blocks_fts meanwhile."
   [repo db q {:keys [limit]
               :or {limit 100}}]
   (when repo
@@ -298,13 +437,14 @@ DROP TRIGGER IF EXISTS blocks_au;
           q (fuzzy/clean-str q)
           q (if (= \# (first q)) (subs q 1) q)]
       (when-not (string/blank? q)
-        (let [indice (or (get @fuzzy-search-indices repo)
-                         (build-fuzzy-search-indice repo db))
-              result (->> (.search indice q (clj->js {:limit limit}))
-                          (bean/->clj))]
-          (->> (map :item result)
-               (filter (fn [{:keys [title]}]
-                         (exact-matched? q title)))))))))
+        (when-let [indice (or (get @fuzzy-search-indices repo)
+                              (when (ldb/db-based-graph? db)
+                                (build-fuzzy-search-indice repo db)))]
+          (let [result (->> (.search indice q (clj->js {:limit limit}))
+                            (bean/->clj))]
+            (->> (map :item result)
+                 (filter (fn [{:keys [title]}]
+                           (exact-matched? q title))))))))))
 
 ;; Combine and re-rank results
 (defn combine-results
@@ -356,8 +496,7 @@ DROP TRIGGER IF EXISTS blocks_au;
   (m/sp
     (when-not (string/blank? q)
       (let [match-input (get-match-input q)
-            page-count (count (d/datoms @conn :avet :block/name))
-            large-graph? (> page-count 2500)
+            large? (large-graph? @conn)
             non-match-input (when (<= (count q) 2)
                               (str "%" (string/replace q #"\s+" "%") "%"))
             limit  (or limit 100)
@@ -381,7 +520,7 @@ DROP TRIGGER IF EXISTS blocks_au;
                                     (map (fn [result]
                                            (assoc result :keyword-score (fuzzy/score q (:title result)))))))
             ;; fuzzy is too slow for large graphs
-            fuzzy-result (when-not (or page large-graph?)
+            fuzzy-result (when-not (or page large?)
                            (->> (fuzzy-search repo @conn q option)
                                 (map (fn [result]
                                        (assoc result :keyword-score (fuzzy/score q (:title result)))))))
@@ -440,23 +579,78 @@ DROP TRIGGER IF EXISTS blocks_au;
         (common-util/distinct-by :block/uuid result)))))
 
 (defn truncate-table!
-  [db]
-  (drop-tables-and-triggers! db)
-  (create-tables-and-triggers! db))
+  "Drop and recreate the blocks tables. Records state building / cursor 0 /
+  gen + 1 (plus extra-meta) in the same SQLite transaction, so a quit after a
+  truncate resumes the walk instead of leaving an empty index that looks
+  complete. Returns the new gen."
+  ([db] (truncate-table! db nil))
+  ([^Object db extra-meta]
+   (let [gen (inc (or (:gen (get-meta db)) 0))]
+     (.transaction db (fn [tx]
+                        (drop-tables-and-triggers! tx)
+                        (create-tables-and-triggers! tx)
+                        (set-meta! tx (merge extra-meta
+                                             {:state "building" :cursor 0 :gen gen :dirty? false}))))
+     gen)))
 
-(defn get-all-blocks
-  [db]
-  (when db
-    (->> (d/datoms db :avet :block/uuid)
-         (map :v)
-         (keep #(d/entity db [:block/uuid %]))
-         (remove hidden-entity?))))
+(defn index-batch
+  "One slice of the full walk: AEVT :block/uuid from entity id (inc after-e),
+  in entity-id order, on the db value given. Stops at max-items entities,
+  max-chars of title, or the deadline (performance.now ms), but always
+  consumes at least one datom. Returns {:rows [{:id :title :page}] :last-e
+  :n (entities visited) :done?}."
+  [db after-e {:keys [max-items max-chars deadline]}]
+  (loop [ds (d/seek-datoms db :aevt :block/uuid (inc after-e))
+         rows (transient [])
+         n 0
+         chars 0
+         last-e after-e]
+    (let [dt (first ds)]
+      (cond
+        (or (nil? dt) (not= :block/uuid (:a dt)))
+        {:rows (persistent! rows) :last-e last-e :n n :done? true}
 
-(defn build-blocks-indice
-  [repo db]
-  (build-fuzzy-search-indice repo db)
-  (->> (get-all-blocks db)
-       (keep block->index)))
+        (and (pos? n)
+             (or (>= n max-items)
+                 (>= chars max-chars)
+                 (>= (js/performance.now) deadline)))
+        {:rows (persistent! rows) :last-e last-e :n n :done? false}
+
+        :else
+        (let [e (:e dt)
+              ent (d/entity db e)
+              row (when-not (hidden-entity? ent) (block->index ent))]
+          (recur (rest ds)
+                 (cond-> rows row (conj! row))
+                 (inc n)
+                 (+ chars (count (:title row)))
+                 e))))))
+
+(defn fuzzy-page-batch
+  "One slice of the Fuse page-index build: AEVT :block/name from entity id
+  (inc after-e). Same contract as index-batch; returns {:docs :last-e :n :done?}.
+  Takes every non-hidden :block/name entity, like get-all-fuzzy-supported-blocks
+  (a file-graph page without :block/type included)."
+  [db after-e {:keys [max-items deadline]}]
+  (loop [ds (d/seek-datoms db :aevt :block/name (inc after-e))
+         docs (transient [])
+         n 0
+         last-e after-e]
+    (let [dt (first ds)]
+      (cond
+        (or (nil? dt) (not= :block/name (:a dt)))
+        {:docs (persistent! docs) :last-e last-e :n n :done? true}
+
+        (and (pos? n)
+             (or (>= n max-items)
+                 (>= (js/performance.now) deadline)))
+        {:docs (persistent! docs) :last-e last-e :n n :done? false}
+
+        :else
+        (let [e (:e dt)
+              ent (d/entity db e)
+              doc (when-not (hidden-entity? ent) (block->index ent))]
+          (recur (rest ds) (cond-> docs doc (conj! doc)) (inc n) e))))))
 
 (defn- get-blocks-from-datoms-impl
   [repo {:keys [db-after db-before]} datoms]
@@ -496,17 +690,27 @@ DROP TRIGGER IF EXISTS blocks_au;
   (let [{:keys [blocks-to-add blocks-to-remove]} (get-affected-blocks repo tx-report)]
     ;; update page title indice
     (let [fuzzy-blocks-to-add (filter page-or-object? blocks-to-add)
-          fuzzy-blocks-to-remove (filter page-or-object? blocks-to-remove)]
+          fuzzy-blocks-to-remove (filter page-or-object? blocks-to-remove)
+          apply! (fn [^js indice to-remove to-add]
+                   (doseq [page-entity to-remove]
+                     (.remove indice (fn [page] (= (str (:block/uuid page-entity)) (gobj/get page "id")))))
+                   (doseq [page to-add]
+                     (.remove indice (fn [p] (= (str (:block/uuid page)) (gobj/get p "id"))))
+                     (when-let [doc (block->index page)]
+                       (.add indice (bean/->js doc)))))]
       (when (or (seq fuzzy-blocks-to-add) (seq fuzzy-blocks-to-remove))
         (swap! fuzzy-search-indices update repo
                (fn [indice]
                  (when indice
-                   (doseq [page-entity fuzzy-blocks-to-remove]
-                     (.remove indice (fn [page] (= (str (:block/uuid page-entity)) (gobj/get page "id")))))
-                   (doseq [page fuzzy-blocks-to-add]
-                     (.remove indice (fn [p] (= (str (:block/uuid page)) (gobj/get p "id"))))
-                     (.add indice (bean/->js (block->index page))))
-                   indice)))))
+                   (apply! indice fuzzy-blocks-to-remove fuzzy-blocks-to-add)
+                   indice)))
+        ;; A sliced build in progress reads pages above its cursor later, from
+        ;; the then-current db; changes at or below the cursor are applied here.
+        (when-let [{:keys [indice cursor]} (get @fuzzy-builds repo)]
+          (let [walked? #(<= (:db/id %) cursor)]
+            (apply! indice
+                    (filter walked? fuzzy-blocks-to-remove)
+                    (filter walked? fuzzy-blocks-to-add))))))
 
     ;; update block indice
     (when (or (seq blocks-to-add) (seq blocks-to-remove))

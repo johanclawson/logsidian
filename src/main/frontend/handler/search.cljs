@@ -113,21 +113,39 @@
   ([notice?]
    (println "Starting to rebuild search indices!")
    (when-let [repo (state/get-current-repo)]
-     (p/do!
-      (search/rebuild-indices!)
-      (when (ldb/get-key-value (db/get-db) :logseq.kv/graph-text-embedding-model-name)
-        (c.m/run-task
-          ::rebuild-embeddings
-          (m/sp
-            (c.m/<?
-             (state/<invoke-db-worker :thread-api/vec-search-cancel-indexing repo))
-            (c.m/<?
-             (state/<invoke-db-worker :thread-api/vec-search-embedding-graph repo {:reset-embedding? true})))
-          :succ (constantly nil)))
-      (when notice?
-        (notification/show!
-         "Search indices rebuilt successfully!"
-         :success))))))
+     ;; resolves when the worker's index walk has ended
+     (p/let [result (search/rebuild-indices! repo {:force? true})]
+       (when (ldb/get-key-value (db/get-db) :logseq.kv/graph-text-embedding-model-name)
+         (c.m/run-task
+           ::rebuild-embeddings
+           (m/sp
+             (c.m/<?
+              (state/<invoke-db-worker :thread-api/vec-search-cancel-indexing repo))
+             (c.m/<?
+              (state/<invoke-db-worker :thread-api/vec-search-embedding-graph repo {:reset-embedding? true})))
+           :succ (constantly nil)))
+       (when notice?
+         (cond
+           (= "complete" (:state result))
+           (notification/show!
+            "Search indices rebuilt successfully!"
+            :success)
+
+           (:error result)
+           (notification/show!
+            (str "Rebuilding the search index failed: " (:error result))
+            :error)))
+       result))))
+
+(defn ensure-indices!
+  "After a graph is added. Every first-open tx is indexed as it happens, so
+  normally there is nothing to do; the worker resumes a pending walk if there
+  is one. Plugin search engines still get their rebuild event."
+  []
+  (when-let [repo (state/get-current-repo)]
+    (-> (search/rebuild-indices! repo {:force? false})
+        (p/catch (fn [e]
+                   (js/console.error "Search index check failed" e))))))
 
 (defn highlight-exact-query
   [content q]
