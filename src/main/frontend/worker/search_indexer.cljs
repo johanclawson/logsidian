@@ -19,7 +19,7 @@
 
   Observability for the benchmark harness: `LSSEARCH {json}` console lines
   with :step open / build-start / progress / slow-slice / upsert-done /
-  sync-failed / failed / cancelled."
+  slow-sync / sync-failed / failed / cancelled."
   (:require [datascript.core :as d]
             [frontend.worker.search :as search]
             [frontend.worker.state :as worker-state]
@@ -43,6 +43,10 @@
 ;; persistent SQLite failure can't loop.
 (def ^:private max-restarts 3)
 (def ^:private progress-log-ms 1000)
+;; One tx's search sync above this logs a slow-sync line.
+(def ^:private slow-sync-ms 20)
+;; Rate limit for slow-sync lines: time of the last line, slow txs since, worst.
+(defonce ^:private *slow-sync (volatile! {:last-log -1e9 :n 0 :max-ms 0}))
 
 (defn- now [] (js/performance.now))
 
@@ -539,7 +543,8 @@
                   (get @search/fuzzy-search-indices repo)
                   (get @search/fuzzy-builds repo))
           (let [t0 (now)
-                {:keys [blocks-to-remove-set blocks-to-add]} (search/sync-search-indice repo tx-report)]
+                {:keys [blocks-to-remove-set blocks-to-add]} (search/sync-search-indice repo tx-report)
+                t-index (now)]
             (when sdb
               (let [tx (:max-tx (:db-after tx-report))
                     w (if (number? tx)
@@ -548,9 +553,29 @@
                 (search/sync-rows! sdb blocks-to-remove-set blocks-to-add {:indexed-tx w})
                 (when (number? w)
                   (swap! *repos assoc-in [repo :indexed-tx] w))))
-            (vswap! *sync-perf (fn [m] (-> m
-                                           (update :ms + (- (now) t0))
-                                           (update :rows + (count blocks-to-add)))))))))
+            (let [t1 (now)
+                  ms (- t1 t0)]
+              ;; :rows counts rows handed to the index (an unchanged one
+              ;; included, though its upsert writes nothing), :deletes block ids
+              ;; removed from it.
+              (vswap! *sync-perf (fn [m] (-> m
+                                             (update :ms + ms)
+                                             (update :rows + (count blocks-to-add)))))
+              ;; Perf instrumentation: one tx's sync, split into the DataScript
+              ;; side (affected blocks, block->index) and the SQLite commit.
+              ;; At most one line a second (bulk loads sync thousands of txs):
+              ;; :merged slow txs since the last line, :max-ms the worst of them.
+              (when (> ms slow-sync-ms)
+                (let [{:keys [last-log n max-ms]}
+                      (vswap! *slow-sync (fn [s] (-> s (update :n inc) (update :max-ms max ms))))]
+                  (when (>= (- t1 last-log) 1000)
+                    (vreset! *slow-sync {:last-log t1 :n 0 :max-ms 0})
+                    (log-step! "slow-sync" {:ms (js/Math.round ms)
+                                            :sql-ms (js/Math.round (- t1 t-index))
+                                            :rows (count blocks-to-add)
+                                            :deletes (count blocks-to-remove-set)
+                                            :merged n
+                                            :max-ms (js/Math.round max-ms)})))))))))
     (catch :default e
       (js/console.error "search: incremental sync failed" e)
       (mark-dirty! repo e))))

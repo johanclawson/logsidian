@@ -782,19 +782,44 @@
 (def-thread-api :thread-api/apply-outliner-ops
   [repo ops opts]
   (when-let [conn (worker-state/get-datascript-conn repo)]
-    (try
-      (worker-util/profile
-       "apply outliner ops"
-       (outliner-op/apply-ops! repo conn ops (worker-state/get-date-formatter repo) opts))
-      (catch :default e
-        (let [data (ex-data e)
-              {:keys [type payload]} (when (map? data) data)]
-          (case type
-            :notification
-            (do
-              (log/error ::apply-outliner-ops-failed e)
-              (shared-service/broadcast-to-clients! :notification [(:message payload) (:type payload) (:clear? payload) (:uid payload) (:timeout payload)]))
-            (throw e)))))))
+    ;; Perf instrumentation: one LSPERF line per call, splitting the worker time
+    ;; of a save into SQLite stores, the search sync and node restores.
+    ;; apply-ops! is synchronous, so the counters only see this call.
+    (reset! *perf-store {:ms 0 :calls 0})
+    (vreset! search-indexer/*sync-perf {:ms 0 :rows 0})
+    (let [t0 (js/performance.now)
+          {restores0 :restores restore-ms0 :restore-ms} @*perf]
+      (try
+        (worker-util/profile
+         "apply outliner ops"
+         (outliner-op/apply-ops! repo conn ops (worker-state/get-date-formatter repo) opts))
+        (catch :default e
+          (let [data (ex-data e)
+                {:keys [type payload]} (when (map? data) data)]
+            (case type
+              :notification
+              (do
+                (log/error ::apply-outliner-ops-failed e)
+                (shared-service/broadcast-to-clients! :notification [(:message payload) (:type payload) (:clear? payload) (:uid payload) (:timeout payload)]))
+              (throw e))))
+        (finally
+          (let [{store-ms :ms store-calls :calls} @*perf-store
+                {search-ms :ms search-rows :rows} @search-indexer/*sync-perf
+                {:keys [restores restore-ms]} @*perf
+                round #(js/Math.round (or % 0))]
+            (js/console.log
+             (str "LSPERF "
+                  (js/JSON.stringify
+                   (clj->js {:event "apply-ops"
+                             :op (some-> ops first first name)
+                             :ops (count ops)
+                             :total-ms (round (- (js/performance.now) t0))
+                             :store-ms (round store-ms)
+                             :store-calls store-calls
+                             :search-ms (round search-ms)
+                             :search-rows search-rows
+                             :restores (- (or restores 0) (or restores0 0))
+                             :restore-ms (round (- (or restore-ms 0) (or restore-ms0 0)))}))))))))))
 
 (def-thread-api :thread-api/file-writes-finished?
   [repo]
