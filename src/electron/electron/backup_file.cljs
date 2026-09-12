@@ -37,7 +37,8 @@
 (defn backup-file
   "backup CONTENT under DIR :backup-dir or :version-file-dir
   :backup-dir = `backup-dir`
-  :version-file-dir = `version-file-dir`"
+  :version-file-dir = `version-file-dir`
+  Returns the path of the new file, or nil when skip-backup-fn skipped it."
   [repo dir relative-path ext content & {:keys [add-desktop? skip-backup-fn]
                                          :or {add-desktop? true}}]
   {:pre [(contains? #{:backup-dir :version-file-dir} dir)]}
@@ -58,4 +59,5 @@
                                           ext))]
         (fs/writeFileSync new-path content)
         (fs/statSync new-path)
-        (truncate-old-versioned-files! dir*)))))
+        (truncate-old-versioned-files! dir*)
+        new-path))))

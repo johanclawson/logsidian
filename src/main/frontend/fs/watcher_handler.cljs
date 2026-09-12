@@ -166,6 +166,26 @@
   ;; return nil, otherwise the entire db will be transferred by ipc
   nil)
 
+(defn <reparse-from-disk!
+  "Makes the db of repo follow the disk for rpath after a guarded writeFile
+   refused to replace it (fs.node): reparses the file's disk content like a
+   watcher change event, or handles its absence like an unlink. Unlike a
+   watcher change it backs up nothing, since fs.node already saved the refused
+   content as a conflict copy. Resolves once done; failures are logged."
+  [repo rpath]
+  (let [repo-dir (config/get-repo-dir repo)]
+    (-> (p/let [exists? (fs/file-exists? repo-dir rpath)]
+          (if exists?
+            (p/let [stat (-> (fs/stat repo-dir rpath) (p/catch (constantly nil)))
+                    content (fs/read-file repo-dir rpath)
+                    db-content (db-async/<get-file repo rpath)]
+              (when (string? content)
+                (handle-add-and-change! repo rpath content db-content
+                                        (:ctime stat) (:mtime stat) false nil)))
+            (<handle-changed "unlink" {:dir repo-dir :path rpath})))
+        (p/catch (fn [e]
+                   (js/console.error "Reparsing" rpath "from disk after a refused write failed:" e))))))
+
 (def ^:private reconcile-concurrency
   "Graph files the reopen reconcile works on at once. Each one costs a stat and
    a read IPC call, a worker pull and, when changed, a reparse. The former p/all

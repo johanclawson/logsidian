@@ -30,6 +30,7 @@
             [electron.state :as state]
             [electron.utils :as utils]
             [electron.window :as win]
+            [electron.write-guard :as write-guard]
             [goog.functions :refer [debounce]]
             [logseq.cli.common.graph :as cli-common-graph]
             [logseq.common.graph :as common-graph]
@@ -120,30 +121,54 @@
   (logger/info ::copy-file from-path to-path)
   (fs-extra/copy from-path to-path))
 
-(defmethod handle :writeFile [window [_ repo path content]]
+(defmethod handle :backupConflictFile [_window [_ repo-dir rpath content]]
+  ;; Saves content that a guarded writeFile refused (frontend.fs.node) to
+  ;; logseq/bak/, next to the backups of that file. Returns the copy's path.
+  (logger/info ::backup-conflict-file rpath)
+  (backup-file/backup-file repo-dir :backup-dir rpath (node-path/extname rpath) content))
+
+(defmethod handle :writeFile [window [_ repo path content expected]]
+  ;; expected nil: legacy, unguarded write (below, unchanged). Otherwise a
+  ;; guarded write (electron.write-guard): expected is the exact content the
+  ;; app believes is on disk, or {:absent true} for a file that must not exist.
+  ;; It returns {:result "written"|"mismatch"|"exists"|"io-error" ...}, never
+  ;; writes on a refusal and neither backs up nor notifies: the renderer
+  ;; handles every result.
   (let [^js Buf (.-Buffer buffer)
         ^js content (if (instance? js/ArrayBuffer content)
                       (.from Buf content)
                       content)]
-    (try
-      (when (and (chmod-enabled?) (fs/existsSync path) (not (writable? path)))
-        (fs/chmodSync path "644"))
-      (fs/writeFileSync path content)
-      (utils/fs-stat->clj path)
-      (catch :default e
-        (logger/warn ::write-file path e)
-        (let [backup-path (try
-                            (backup-file/backup-file repo :backup-dir path (node-path/extname path) content)
-                            (catch :default e
-                              (logger/error ::write-file "backup file failed:" e)))]
-          (utils/send-to-renderer window "notification" {:type "error"
-                                                         :payload (str "Write to the file " path
-                                                                       " failed, "
-                                                                       e
-                                                                       (when backup-path
-                                                                         (str ". A backup file was saved to "
-                                                                              backup-path
-                                                                              ".")))}))))))
+    (if (some? expected)
+      (let [result (try
+                     (write-guard/guarded-write!
+                      path content (write-guard/normalize-expected expected)
+                      :before-replace (fn [path]
+                                        (when (and (chmod-enabled?) (not (writable? path)))
+                                          (fs/chmodSync path "644"))))
+                     (catch :default e
+                       {:result "io-error" :error (str e)}))]
+        (when-not (= "written" (:result result))
+          (logger/warn ::write-file-refused path (dissoc result :mtime :ctime)))
+        result)
+      (try
+        (when (and (chmod-enabled?) (fs/existsSync path) (not (writable? path)))
+          (fs/chmodSync path "644"))
+        (fs/writeFileSync path content)
+        (utils/fs-stat->clj path)
+        (catch :default e
+          (logger/warn ::write-file path e)
+          (let [backup-path (try
+                              (backup-file/backup-file repo :backup-dir path (node-path/extname path) content)
+                              (catch :default e
+                                (logger/error ::write-file "backup file failed:" e)))]
+            (utils/send-to-renderer window "notification" {:type "error"
+                                                           :payload (str "Write to the file " path
+                                                                         " failed, "
+                                                                         e
+                                                                         (when backup-path
+                                                                           (str ". A backup file was saved to "
+                                                                                backup-path
+                                                                                ".")))})))))))
 
 (defmethod handle :rename [_window [_ old-path new-path]]
   (logger/info ::rename "from" old-path "to" new-path)

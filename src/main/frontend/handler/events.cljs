@@ -188,6 +188,11 @@
          (export/auto-db-backup! repo {:backup-now? true})
          (fs-watcher/load-graph-files! repo))))))
 
+(defmethod handle :file/reparse-from-disk [[_ repo rpath]]
+  ;; published by frontend.fs.node after a guarded writeFile was refused
+  (fs-watcher/<reparse-from-disk! repo rpath)
+  nil)
+
 (defmethod handle :instrument [[_ {:keys [type payload] :as opts}]]
   (when-not (empty? (dissoc opts :type :payload))
     (js/console.error "instrument data-map should only contains [:type :payload]"))

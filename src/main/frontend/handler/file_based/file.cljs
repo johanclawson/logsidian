@@ -106,11 +106,14 @@
     true))
 
 (defn- write-file-aux!
-  [repo path content write-file-options]
-  (let [original-content (db/get-file repo path)
-        path-dir (config/get-repo-dir repo)
-        write-file-options' (merge write-file-options
-                                   (when original-content {:old-content original-content}))]
+  "Writes content to path as a guarded write (fs.node/guard-expected).
+   original-content is the db's content of path from before alter-file changed
+   the db, i.e. what the app last saw on disk, or nil for a new file. It used
+   to be read here, after alter-file had already put content into the db, so
+   it was the new content rather than the base."
+  [repo path content original-content write-file-options]
+  (let [path-dir (config/get-repo-dir repo)
+        write-file-options' (assoc write-file-options :old-content original-content)]
     (fs/write-plain-text-file! repo path-dir path content write-file-options')))
 
 (defn alter-global-file
@@ -155,7 +158,10 @@
                   :from-disk? from-disk?
                   :fs/event event
                   :ctime ctime
-                  :mtime mtime}]
+                  :mtime mtime}
+            ;; the base of the guarded write below, read before this fn puts
+            ;; content into the db
+            original-content (when-not from-disk? (db/get-file repo path))]
         (-> (p/let [result (if reset?
                              (p/do!
                               (when-let [page-id (file-model/get-file-page-id path)]
@@ -169,7 +175,7 @@
                                                         (when (some? verbose) {:verbose verbose}))))
                              (db/set-file-content! repo path content opts))
                     _ (when-not from-disk?
-                        (write-file-aux! repo path content {:skip-compare? skip-compare?}))]
+                        (write-file-aux! repo path content original-content {:skip-compare? skip-compare?}))]
               (when re-render-root? (ui-handler/re-render-root!))
 
               (cond
