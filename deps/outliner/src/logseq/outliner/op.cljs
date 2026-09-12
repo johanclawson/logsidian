@@ -143,7 +143,8 @@
                        ::tx-meta [:maybe map?]}}
    [:sequential op-schema]])
 
-(def ^:private ops-validator (m/validator ops-schema))
+;; Only used in an assert (elided in release builds): don't compile it at load.
+(def ^:private *ops-validator (delay (m/validator ops-schema)))
 
 (defonce ^:private *op-handlers (atom {}))
 
@@ -170,7 +171,7 @@
 
 (defn ^:large-vars/cleanup-todo apply-ops!
   [repo conn ops date-formatter opts]
-  (assert (ops-validator ops) ops)
+  (assert (@*ops-validator ops) ops)
   (let [opts' (assoc opts
                      :transact-opts {:conn conn}
                      :local-tx? true)

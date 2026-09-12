@@ -8,18 +8,23 @@
             [malli.error :as me]
             [malli.util :as mu]))
 
-(def ^:private db-schema-validator (m/validator db-malli-schema/DB))
-(def ^:private db-schema-explainer (m/explainer db-malli-schema/DB))
-(def ^:private closed-db-schema-validator (m/validator (mu/closed-schema db-malli-schema/DB)))
-(def ^:private closed-db-schema-explainer (m/explainer (mu/closed-schema db-malli-schema/DB)))
+;; Built lazily: this ns is loaded by logseq.db (so by the renderer's main
+;; bundle), and compiling the large DB schema into two validators, two
+;; explainers and two closed schemas at load cost ~0.5 s of the boot long task.
+;; They are only needed once something validates.
+(def ^:private *db-schema-validator (delay (m/validator db-malli-schema/DB)))
+(def ^:private *db-schema-explainer (delay (m/explainer db-malli-schema/DB)))
+(def ^:private *closed-db-schema (delay (mu/closed-schema db-malli-schema/DB)))
+(def ^:private *closed-db-schema-validator (delay (m/validator @*closed-db-schema)))
+(def ^:private *closed-db-schema-explainer (delay (m/explainer @*closed-db-schema)))
 
 (defn get-schema-validator
   [closed-schema?]
-  (if closed-schema? closed-db-schema-validator db-schema-validator))
+  (if closed-schema? @*closed-db-schema-validator @*db-schema-validator))
 
 (defn get-schema-explainer
   [closed-schema?]
-  (if closed-schema? closed-db-schema-explainer db-schema-explainer))
+  (if closed-schema? @*closed-db-schema-explainer @*db-schema-explainer))
 
 (defn validate-tx-report
   "Validates the datascript tx-report for entities that have changed. Returns
@@ -93,7 +98,7 @@
         errors (binding [db-malli-schema/*db-for-validate-fns* db]
                  (-> (map (fn [e]
                             (dissoc e :db/id))
-                          ent-maps) closed-db-schema-explainer :errors))]
+                          ent-maps) (get-schema-explainer true) :errors))]
     (cond-> {:datom-count (count datoms)
              :entities ent-maps*}
       (some? errors)

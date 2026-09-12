@@ -24,31 +24,37 @@
     "tx-meta option, generate undo ops from tx-data when true (default true)"))
 
 (def ^:private undo-op-item-schema
-  (mu/closed-schema
-   [:multi {:dispatch first}
-    [::db-transact
-     [:cat :keyword
-      [:map
-       [:tx-data [:sequential [:fn
-                               {:error/message "should be a Datom"}
-                               d/datom?]]]
-       [:tx-meta [:map {:closed false}
-                  [:outliner-op :keyword]]]
-       [:added-ids [:set :int]]
-       [:retracted-ids [:set :int]]]]]
+  [:multi {:dispatch first}
+   [::db-transact
+    [:cat :keyword
+     [:map
+      [:tx-data [:sequential [:fn
+                              {:error/message "should be a Datom"}
+                              d/datom?]]]
+      [:tx-meta [:map {:closed false}
+                 [:outliner-op :keyword]]]
+      [:added-ids [:set :int]]
+      [:retracted-ids [:set :int]]]]]
 
-    [::record-editor-info
-     [:cat :keyword
-      [:map
-       [:block-uuid :uuid]
-       [:container-id [:or :int [:enum :unknown-container]]]
-       [:start-pos [:maybe :int]]
-       [:end-pos [:maybe :int]]]]]
+   [::record-editor-info
+    [:cat :keyword
+     [:map
+      [:block-uuid :uuid]
+      [:container-id [:or :int [:enum :unknown-container]]]
+      [:start-pos [:maybe :int]]
+      [:end-pos [:maybe :int]]]]]
 
-    [::ui-state
-     [:cat :keyword :string]]]))
+   [::ui-state
+    [:cat :keyword :string]]])
 
-(def ^:private undo-op-validator (m/validator [:sequential undo-op-item-schema]))
+;; Only used in asserts (elided in release builds), so don't close/compile the
+;; schema at namespace load.
+(def ^:private *undo-op-validator
+  (delay (m/validator [:sequential (mu/closed-schema undo-op-item-schema)])))
+
+(defn- undo-op-validator
+  [op]
+  (@*undo-op-validator op))
 
 (defonce max-stack-length 100)
 (defonce *undo-ops (atom {}))
