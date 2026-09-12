@@ -277,6 +277,83 @@ The other recurring startup query, `q pull ?h [*] :in $ ?start ?today`
   `[?p :block/journal? true]` fails on every page — the same empty result as
   d/q; behaviour unchanged, cost gone.
 
+### Search index: every changed block scans the whole FTS table (2026-09-12)
+
+Found by Codex (`gpt-6-astra`), verified against the code and measured on the
+real 10k search db (69 938 rows, native SQLite 3.46 on a copy):
+
+- The FTS triggers (`worker/search.cljs` `add-blocks-fts-triggers!`) delete
+  with `DELETE from blocks_fts where id = old.id`. `id` is an ordinary FTS5
+  column, not the rowid, so FTS5 cannot look it up: `SCAN blocks_fts`.
+- `upsert-row!` does `ON CONFLICT (id) DO UPDATE` unconditionally, so even an
+  unchanged row fires the update trigger (delete-by-id + insert).
+
+| operation | median | plan |
+|---|---|---|
+| `DELETE FROM blocks_fts WHERE id = ?` (the trigger) | **68.8 ms** | `SCAN blocks_fts` |
+| `DELETE ... WHERE rowid = ?` | **0.14 ms** | `INDEX 0:=` |
+| unchanged upsert (fires the update trigger) | **70.3 ms** | |
+| upsert with `WHERE ... IS NOT excluded...` | **0.11 ms** | |
+
+So **every changed block costs ~70 ms in the search index at 10k** (more in
+wasm on OPFS), on every edit, since the index now syncs per transaction.
+Fix: give `blocks_fts` the `blocks` rowid and delete by rowid (~500×), skip
+no-op upserts, migrate old indexes with one rebuild.
+
+**Fix implemented** (`bench/fts-impl.json`, 2 agents, review ok with 3 minors):
+rowid-aligned triggers, no-op upserts, schema version 2 in `search_meta` plus a
+structural trigger check, migration = truncate + walk. Verified with native
+SQLite on a copy of the real 10k search db after applying the new scheme:
+
+| per row | before (scan by id) | after (by rowid) |
+|---|---|---|
+| changed upsert (update trigger) | 70.3 ms | **0.24 ms** |
+| unchanged upsert | 70.3 ms | **0.09 ms** (no trigger) |
+| block delete (delete trigger) | 68.8 ms | **0.15 ms** |
+
+After 10 edits and 10 deletes: 0 mismatched rows between `blocks` and
+`blocks_fts`, equal counts, search finds the edited rows. Rebuilding the FTS
+table for 69 938 rows took 16 s natively (in the app: the sliced walk).
+
+**Typing baseline before the fix** (`~/.cache/lsbench/typing-base2/`, harness
+`LSBENCH_TYPE=40`: two 40-character bursts into an existing journal block,
+editor focus checked; worker time per save, `apply-outliner-ops` sync):
+
+| | 1st save | 2nd save (an UPDATE of the row) |
+|---|---|---|
+| g-real | 156 ms | 130 ms |
+| g-10k | **467 ms** (cold) | 109 ms |
+
+The FTS scan does not show clearly here (109 ms at 10k vs 130 ms at 512), so
+either it is cheaper in wasm than natively or the edit path syncs differently;
+the fixed build logs `slow-sync` per transaction and will tell. Separately, a
+save costs 110–160 ms of worker time at any graph size, and ~0.5 s cold at
+10k — its own item on the typing path (outliner pipeline, refs, file write).
+
+**Where a save's 110–160 ms go** (code trace by an agent, 2026-09-12; not yet
+timed): `apply-outliner-ops :save-block` builds the tx (fixed cost), and
+`outliner-tx/transact!` makes **two DataScript txs per save** (the body plus an
+empty `:batch-tx/exit?` tx) — each stores to the main SQLite db (usually a
+one-row tail write, every ~32 datoms a full flush of dirty nodes). The main db
+leaves `synchronous` at its default, so each commit likely pays an OPFS
+`xSync`; the search db runs `NORMAL`. File graphs skip the worker pipeline
+(refs are parsed on the UI thread). The listener runs the per-tx search sync
+(the FTS scan above, the only graph-sized item) and transit-broadcasts the tx
+to the UI. The page's markdown is re-serialized on every save, but in a
+separate task ~1 s later (its cost grows with page size). Next: one LSPERF
+`apply-ops` line splitting store / search / restores / rest.
+
+The cold first save at 10k (467 ms) is **not** restores: the activity window
+around it shows 55 restores costing 23 ms; the second save (109 ms) had none.
+The likely rest is the FTS scan reading the search db cold (78 MB + 79 MB
+WAL, first statement preparation) — to be confirmed after the fix removes the
+scan.
+
+Also: the 10k search db has a **79 MB WAL next to a 78 MB main file** —
+checkpoints are not keeping it in check, consistent with Codex's leading
+theory for the commit spikes (WAL auto-checkpoint in the committing
+transaction; SAH-pool `xSync` flushes on every checkpoint).
+
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
 `slow-slice` split of the 258 slices over 100 ms: median 167 ms = **index 7 ms
@@ -316,6 +393,88 @@ db worker thread (`DedicatedWorker`) runs at ~60 % CPU and the UI thread
 and each thread waits for the other about half the time. Removing per-file
 work on either side helps, but the bigger lever is not waiting — keep several
 files in flight, or parse and transact in batches.
+
+## Investigations of what still blocks startup (2026-09-12, `bench/investigations.json`)
+
+Three read-only investigations, each checked by a critic (all "needs-changes",
+citations held; the critics flagged that several comparisons mixed builds and
+profiles).
+
+- **get-initial-data (8.5 s at 10k).** Decoded offline from the 10k storage:
+  93 021 datoms = pages 62 842 (10 542 pages, incl. 488 ref-only) + files
+  30 179 (`:file/content` only 6.9 MB). Pages are ~95 % of the ~21 MB of EAVT
+  leaves restored; dropping file content from the reply saves only ~1–2 s of
+  a ~10 s continuous worker block. The reopen reconcile (`load-graph-files!`)
+  fires **10 057 `pull`s at once, uncapped**, plus 20 000 IPC calls, on every
+  reopen. And persistent-sorted-set holds restored nodes through `js/WeakRef`
+  (`:ref-type :strong` is never read; DataScript's `accessed` hook is a TODO),
+  so a GC can throw away everything get-initial-data restored — which fits the
+  0 → 13 800 restore variance of the reconcile across runs.
+- **Search-db commit spikes.** WAL auto-checkpoint inside the committing
+  transaction (copy + 2–3 `sah.flush`) sets the floor; FTS5 merges set the
+  tail, amplified because every upsert statement flushes its own level-0
+  segment (one segment per row). Proposal: one statement per commit
+  (`json_each`; 3.2× fewer leaves, −31 % time in a replay), FTS5 merges and
+  checkpoints moved to idle time.
+- **UI boot freeze (~5 s, graph-independent).** The app is built with
+  `release ... --debug` (`package.json:92`): main.js 36 MB instead of ~11 MB,
+  compiled as a classic script without a code cache. Proposal: drop `--debug`
+  (keep source maps), then stop eager `<script defer>` loading of code-editor,
+  excalidraw and tldraw.
+
+### Step 4 designs (2026-09-12, `bench/step4-designs.json`, both "needs-changes")
+
+- **Search-db write path.** New facts: FTS5 flushes its pending data at every
+  statement savepoint and whenever a written rowid goes backwards, so the
+  per-row upserts create one segment per row (writeCounter 72 928 for
+  69 938 rows); the wasm build defaults to `DEFAULT_WAL_SYNCHRONOUS=2`, so
+  the **main db runs synchronous FULL: at least two OPFS flushes per save**
+  (body tx + empty batch-exit tx). Design: one statement per commit
+  (`json_each`), checkpoints and FTS5 merges out of the commit into a worker
+  maintenance tick, main db `synchronous=NORMAL`. The critique: a PASSIVE
+  checkpoint copies every frame and cannot be bounded, so moving it only
+  moves the stall — keep each one small by checkpointing often; the step-0
+  merge classifier is wrong (per-row FTS writes already look like merges).
+- **Reopen reconcile.** Step 1: at most 16 files in flight, no transact of
+  the pulled file map into the UI db. Steps 2-3 (compare in the worker,
+  mtime+size) missed content writers (`native_fs.cljs:236`, case-only
+  renames). The critique doubts step 1 bounds the stall: the lag appears
+  when the pulls are cold, which points back at the weak node references.
+
+Chosen for step 4: main db `synchronous=NORMAL`; search writes as one
+statement per commit, `wal_autocheckpoint=0` with small frequent checkpoints
+and bounded FTS5 merge steps in a maintenance tick; reconcile step 1. A node
+or row cache waits for the GC experiment.
+
+### Restored index nodes are only weakly held (Codex, verified 2026-09-12)
+
+Codex (`gpt-6-astra`) read persistent-sorted-set 0.1.2 and the DataScript
+fork; the load-bearing citations were checked by hand:
+
+- `make-reference` always wraps in `js/WeakRef` (PSS:330-332);
+  `node-child` installs restored children through it (PSS:429-445); the
+  restored root is weak too (PSS:624-629); `set-address!` weakens stored
+  inner nodes (PSS:340-345).
+- `:ref-type :strong` appears only in the reported settings (PSS:1350) and is
+  never read; `make-storage-adapter` ignores its opts (fork storage.cljs:75).
+- The fork's `restore` rebuilds nodes from decoded data with no cache
+  (storage.cljs:55-64) and `accessed` is `;; TODO: nil` (65-67); PSS calls
+  `accessed` with an address only, and not on restores or root hits.
+- Dirty (unflushed) nodes are held strongly, so a GC cannot lose unsaved
+  changes.
+
+So after any GC, point reads, index walks and the next transaction's path
+copy can pay restores again. Not yet proven to be what causes the repeated
+restores: that needs a controlled run (same search cold → warm → `gc()` in the
+worker across a task boundary → again; expected warm ≈ 0, after-gc ≈ cold).
+Harness: `LSBENCH_GCTEST=1` (starts the app with `--js-flags=--expose-gc`).
+
+Cache options (address reuse on store makes naïve address memoization wrong):
+a bounded LRU of restored clean nodes in the fork's `StorageAdapter`, cleared
+around every store batch; or, smaller and in our own code, an LRU of *decoded
+storage rows* in the worker's `new-sqlite-storage`, invalidated for every
+upserted address — it saves the SQL read and transit decode (the dominant
+restore cost) but still rebuilds nodes.
 
 ## Step 3 plan (2026-09-12)
 

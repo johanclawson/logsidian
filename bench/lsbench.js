@@ -248,6 +248,65 @@ async function observeUi(page) {
       await sleep(1000);
     }
 
+    // Optional: type into the first block of today's journal (graph COPY) and
+    // measure the edit path: thread-api calls (apply-outliner-ops includes the
+    // per-transaction search sync), worker stalls and UI long tasks.
+    if (process.env.LSBENCH_TYPE) {
+      // An existing block with text, so every save UPDATEs its search row (a new
+      // empty block's first save is an INSERT and skips the delete path). Two
+      // bursts with a pause: each burst ends in its own save.
+      const n = Number(process.env.LSBENCH_TYPE) || 40;
+      // Pick by block id and re-resolve before every click: React replaces the
+      // block's DOM when the editor opens and after each save, so a held element
+      // handle goes stale ("not attached to the DOM").
+      const blockId = await page.evaluate(() => {
+        for (const el of document.querySelectorAll('.journal-item .ls-block[blockid]')) {
+          const c = el.querySelector('.block-content');
+          if (c && c.innerText.trim().length > 3) return el.getAttribute('blockid');
+        }
+        return null;
+      }).catch(() => null);
+      const target = () => page.locator(`.ls-block[blockid="${blockId}"] .block-content`).first();
+      if (!blockId) {
+        result.typing = { error: 'no non-empty journal block to type into' };
+      } else try {
+        result.typing = { n, blockId, bursts: [] };
+        const editing = () => page.evaluate(() => document.activeElement && document.activeElement.tagName === 'TEXTAREA').catch(() => false);
+        for (let burst = 0; burst < 2; burst++) {
+          await target().scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
+          await target().click({ timeout: 5000 }).catch(() => {});
+          await sleep(800);
+          if (!(await editing())) { await target().click({ timeout: 5000 }).catch(() => {}); await sleep(800); }
+          if (!(await editing())) {
+            // not in the editor: typing would scroll the page, not edit a block
+            result.typing.bursts.push({ editing: false });
+            continue;
+          }
+          await page.keyboard.press('End');
+          const start = wall();
+          for (let i = 0; i < n; i++) {
+            await page.keyboard.type(i % 8 === 7 ? ' ' : 'x');
+            await sleep(90);
+          }
+          await sleep(1500); // the editor saves after a short idle
+          await page.keyboard.press('Escape');
+          await sleep(3500);
+          const stop = wall();
+          const win = records.filter((r) => overlaps(r, start, stop));
+          result.typing.bursts.push({ start, stop,
+            apis: win.filter((r) => r.api).map((r) => `${r.api.replace('thread-api/', '')} ${r['sync-ms']}/${r['total-ms']}ms`),
+            worker_max_ms: Math.max(0, ...win.filter((r) => r.phase).map(lag)),
+            ui_max_ms: Math.max(0, ...win.filter((r) => r.event === 'ui').map(lag)),
+            ui_longtasks: win.filter((r) => r.event === 'ui').length,
+            slow_syncs: win.filter((r) => r.event === 'search' && r.step === 'slow-sync').map((r) => `${r.ms}ms/${r.rows}rows/${r.deletes}del`) });
+        }
+        await page.screenshot({ path: path.join(outDir, 'typing.png') });
+      } catch (e) {
+        // record and carry on, so the run still closes the app and writes its result
+        result.typing.error = String((e && e.message) || e);
+      }
+    }
+
     // Optional: rebuild the search index through the command palette
     // (:search/re-index "Rebuild search index" -> search-handler/rebuild-indices!),
     // then wait for both threads to go quiet. Discriminates "the rebuild never

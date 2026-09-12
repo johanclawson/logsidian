@@ -1,5 +1,8 @@
 #!/bin/bash
 # usage: build-perf.sh [repoDir]   (default ~/dev/logsidian)
+#   CLJS_DEBUG=0  release ClojureScript without --debug (package.json's
+#                 cljs:release-electron passes --debug: pseudo-names and pretty
+#                 printing, main.js ~36 MB instead of ~11 MB)
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 export NODE_OPTIONS="--max-old-space-size=6144"
@@ -10,7 +13,12 @@ echo "[$(ts)] branch: $(git branch --show-current)  head: $(git log --oneline -1
 echo "[$(ts)] ===== 1 gulp:build (static/ from resources/, CSS) ====="
 yarn gulp:build
 echo "[$(ts)] ===== 2 cljs:release-electron (produces target/*.js) ====="
-yarn cljs:release-electron
+if [ "${CLJS_DEBUG:-1}" = 0 ]; then
+  echo "[$(ts)] (CLJS_DEBUG=0: release without --debug)"
+  clojure -M:cljs release app db-worker inference-worker electron && clojure -M:cljs release publishing
+else
+  yarn cljs:release-electron
+fi
 echo "[$(ts)] ===== 3 webpack-app-build (consumes target/*.js) ====="
 yarn webpack-app-build
 echo "[$(ts)] ===== 4 static deps ====="
