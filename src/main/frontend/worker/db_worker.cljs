@@ -155,7 +155,63 @@
        (.exec tx #js {:sql "INSERT INTO kvs (addr, content, addresses) values ($addr, $content, $addresses) on conflict(addr) do update set content = $content, addresses = $addresses"
                       :bind item})))))
 
-(defn restore-data-from-addr
+
+;; ---------------------------------------------------------------------------
+;; Perf instrumentation (branch perf/worker-stall-instrumentation, ADR-003 plan
+;; step 1). Measures how long the db worker's event loop is blocked and how
+;; many SQLite node restores each phase performs. Output: console lines
+;; prefixed "LSPERF " carrying one JSON object each. Not for merging as-is.
+(def ^:private perf-tick-ms 20)
+(defonce ^:private *perf-last-tick (atom (js/performance.now)))
+(defonce ^:private *perf
+  (atom {:restores 0 :restore-ms 0 :max-lag 0 :phase-start (js/performance.now)}))
+
+(defn- perf-log! [event m]
+  (js/console.log
+   (str "LSPERF " (js/JSON.stringify
+                   (clj->js (assoc m :event event :t (js/Math.round (js/performance.now))))))))
+
+(defn- perf-note-lag! [now]
+  ;; A timer that fires late means the loop was busy for that long.
+  (let [lag (- now @*perf-last-tick perf-tick-ms)]
+    (reset! *perf-last-tick now)
+    (when (> lag (:max-lag @*perf)) (swap! *perf assoc :max-lag lag))))
+
+(defonce ^:private perf-heartbeat
+  (js/setInterval (fn [] (perf-note-lag! (js/performance.now))) perf-tick-ms))
+
+(defn perf-phase!
+  "Log one record for the phase that just ended, then reset the counters.
+   The stall still in progress is counted here, since the heartbeat cannot
+   fire until this synchronous phase has returned."
+  ([phase] (perf-phase! phase nil))
+  ([phase extra]
+   (let [now (js/performance.now)
+         _ (perf-note-lag! now)
+         {:keys [restores restore-ms max-lag phase-start]} @*perf]
+     (perf-log! "phase" (merge {:phase phase
+                                :elapsed-ms (js/Math.round (- now phase-start))
+                                :max-lag-ms (js/Math.round (max 0 max-lag))
+                                :restores restores
+                                :restore-ms (js/Math.round restore-ms)}
+                               extra))
+     (swap! *perf assoc :restores 0 :restore-ms 0 :max-lag 0 :phase-start now))))
+
+(defonce ^:private perf-activity
+  ;; Once a second, report any window with restores or a stall over 50 ms,
+  ;; so work after startup (reconcile, queries) is visible too.
+  (js/setInterval
+   (fn []
+     (let [{:keys [restores max-lag]} @*perf]
+       (when (or (pos? restores) (> max-lag 50)) (perf-phase! "activity"))))
+   1000))
+
+;; Time spent in the SQLite storage adapter's -store (transit-write + upsert),
+;; read and reset per call by :thread-api/reset-file.
+(defonce ^:private *perf-store (atom {:ms 0 :calls 0}))
+;; ---------------------------------------------------------------------------
+
+(defn- restore-data-from-addr*
   "Update sqlite-cli/restore-data-from-addr when making changes"
   [db addr]
   (assert (some? db) "sqlite db not exists")
@@ -171,12 +227,23 @@
         (assoc data :addresses addresses)
         data))))
 
+(defn restore-data-from-addr
+  "Timed wrapper around restore-data-from-addr* (perf instrumentation)."
+  [db addr]
+  (let [t0 (js/performance.now)
+        r (restore-data-from-addr* db addr)]
+    (swap! *perf (fn [m] (-> m
+                             (update :restores inc)
+                             (update :restore-ms + (- (js/performance.now) t0)))))
+    r))
+
 (defn new-sqlite-storage
   "Update sqlite-cli/new-sqlite-storage when making changes"
   [^Object db]
   (reify IStorage
     (-store [_ addr+data-seq _delete-addrs]
-      (let [data (map
+      (let [t0 (js/performance.now)
+            data (map
                   (fn [[addr data]]
                     (let [data' (if (map? data) (dissoc data :addresses) data)
                           addresses (when (map? data)
@@ -185,8 +252,12 @@
                       #js {:$addr addr
                            :$content (sqlite-util/transit-write data')
                            :$addresses addresses}))
-                  addr+data-seq)]
-        (upsert-addr-content! db data)))
+                  addr+data-seq)
+            r (upsert-addr-content! db data)]
+        (swap! *perf-store (fn [m] (-> m
+                                       (update :calls inc)
+                                       (update :ms + (- (js/performance.now) t0)))))
+        r))
 
     (-restore [_ addr]
       (restore-data-from-addr db addr))))
@@ -263,7 +334,9 @@
 (defn- <create-or-open-db!
   [repo {:keys [config datoms] :as opts}]
   (when-not (worker-state/get-sqlite-conn repo)
-    (p/let [[db search-db client-ops-db :as dbs] (get-dbs repo)
+    (p/let [_ (perf-phase! "before-open")
+            [db search-db client-ops-db :as dbs] (get-dbs repo)
+            _ (perf-phase! "open-sqlite")
             storage (new-sqlite-storage db)
             client-ops-storage (when-not @*publishing?
                                  (new-sqlite-storage client-ops-db))
@@ -281,7 +354,9 @@
          (worker-pipeline/transact-pipeline repo tx-report)))
       (let [schema (ldb/get-schema repo)
             conn (common-sqlite/get-storage-conn storage schema)
+            _ (perf-phase! "restore-conn")
             _ (db-fix/check-and-fix-schema! repo conn)
+            _ (perf-phase! "schema-fix")
             _ (when datoms
                 (let [data (map (fn [datom]
                                   [:db/add (:e datom) (:a datom) (:v datom)]) datoms)]
@@ -302,7 +377,7 @@
                               config (select-keys opts [:import-type :graph-git-sha]))]
             (ldb/transact! conn initial-data {:initial-db? true})))
 
-        (gc-sqlite-dbs! db client-ops-db conn {})
+        (let [r (gc-sqlite-dbs! db client-ops-db conn {})] (perf-phase! "gc") r)
 
         (let [migration-result (db-migrate/migrate conn)]
           (when (client-op/rtc-db-graph? repo)
@@ -555,11 +630,13 @@
 
 (def-thread-api :thread-api/get-initial-data
   [repo opts]
-  (when-let [conn (worker-state/get-datascript-conn repo)]
+  (when-let [conn (do (perf-phase! "before-initial-data") (worker-state/get-datascript-conn repo))]
     (if (:file-graph-import? opts)
       {:schema (:schema @conn)
        :initial-data (vec (d/datoms @conn :eavt))}
-      (common-initial-data/get-initial-data @conn))))
+      (let [r (common-initial-data/get-initial-data @conn)]
+        (perf-phase! "initial-data" {:datoms (count (:initial-data r))})
+        r))))
 
 (def-thread-api :thread-api/reset-db
   [repo db-transit]
@@ -758,7 +835,30 @@
   [repo file-path content opts]
   ;; (prn :debug :reset-file :file-path file-path :opts opts)
   (when-let [conn (worker-state/get-datascript-conn repo)]
-    (file-reset/reset-file! repo conn file-path content opts)))
+    ;; Perf instrumentation: one LSPERF line per call with its phase timings.
+    ;; reset-file! is synchronous, so *perf-store only sees this call's stores.
+    (reset! *perf-store {:ms 0 :calls 0})
+    (let [t0 (js/performance.now)
+          timings (atom {})
+          result (file-reset/reset-file! repo conn file-path content (assoc opts :timings timings))
+          total-ms (- (js/performance.now) t0)
+          {:keys [parse-ms mldoc-ms delete-ms build-tx-ms transact-ms]} @timings
+          {store-ms :ms store-calls :calls} @*perf-store
+          round #(js/Math.round (or % 0))]
+      (js/console.log
+       (str "LSPERF "
+            (js/JSON.stringify
+             (clj->js {:event "reset-file"
+                       :path file-path
+                       :mldoc-ms (round mldoc-ms)
+                       :extract-ms (round (- (or parse-ms 0) (or mldoc-ms 0)))
+                       :delete-ms (round delete-ms)
+                       :build-tx-ms (round build-tx-ms)
+                       :transact-ms (round transact-ms)
+                       :store-ms (round store-ms)
+                       :store-calls store-calls
+                       :total-ms (round total-ms)}))))
+      result)))
 
 (def-thread-api :thread-api/gc-graph
   [repo]

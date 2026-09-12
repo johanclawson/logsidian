@@ -158,13 +158,17 @@ Options available:
   * :delete-blocks-fn - Optional fn which is called with the new page, file and existing block uuids
   which may be referenced elsewhere. Used to delete the existing blocks before saving the new ones.
    Implemented in file-common-handler/validate-and-get-blocks-to-delete for IoC
-  * :extract-options - Options map to pass to extract/extract"
+  * :extract-options - Options map to pass to extract/extract
+  * :timings - Optional atom. When given, phase durations in ms are assoc'd onto it:
+  :parse-ms (parse-file-data), :delete-ms (delete-blocks-fn), :build-tx-ms and
+  :transact-ms (ldb/transact!, including the storage write)"
   ([conn file-path content] (parse-file conn file-path content {}))
-  ([conn file-path content {:keys [delete-blocks-fn extract-options ctime mtime]
+  ([conn file-path content {:keys [delete-blocks-fn extract-options ctime mtime timings]
                             :or {delete-blocks-fn (constantly [])}
                             :as options}]
    ;; Parse file content (pure, no side effects)
-   (let [parsed (parse-file-data file-path content
+   (let [t0 (when timings (js/performance.now))
+         parsed (parse-file-data file-path content
                                  {:db @conn
                                   :extract-options extract-options
                                   :ctime ctime
@@ -176,15 +180,24 @@ Options available:
                   ;; Keep existing created-at, don't overwrite
                   (update parsed :file-entity dissoc :file/created-at)
                   parsed)
+         t1 (when timings (js/performance.now))
          ;; Get blocks to delete (use primary-page, not first of merged pages)
          delete-blocks (delete-blocks-fn
                         (:primary-page parsed)
                         file-path
                         (map (fn [block] {:block/uuid (:block/uuid block)}) (:blocks parsed)))
+         t2 (when timings (js/performance.now))
          ;; Build transaction
-         tx (build-file-tx parsed delete-blocks)]
+         tx (build-file-tx parsed delete-blocks)
+         t3 (when timings (js/performance.now))]
      ;; Commit to database
      (ldb/transact! conn tx (select-keys options [:new-graph? :from-disk?]))
+     (when timings
+       (swap! timings assoc
+              :parse-ms (- t1 t0)
+              :delete-ms (- t2 t1)
+              :build-tx-ms (- t3 t2)
+              :transact-ms (- (js/performance.now) t3)))
      {:tx tx
       :ast (:ast parsed)})))
 

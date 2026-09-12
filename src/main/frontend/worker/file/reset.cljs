@@ -8,7 +8,8 @@
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]
             [logseq.graph-parser :as graph-parser]
-            [logseq.graph-parser.db :as gp-db]))
+            [logseq.graph-parser.db :as gp-db]
+            [logseq.graph-parser.mldoc :as gp-mldoc]))
 
 (defn- page-exists-in-another-file
   "Conflict of files towards same page"
@@ -49,15 +50,51 @@
   (validate-existing-file repo conn file-page file-path)
   (graph-parser/get-blocks-to-delete @conn file-page file-path retain-uuid-blocks))
 
+(defn- parse-file-timed
+  "Perf instrumentation (branch perf/worker-stall-instrumentation): runs
+   graph-parser/parse-file with mldoc's parser entry points and its JSON->edn
+   conversion temporarily wrapped, and assoc's the summed time as :mldoc-ms onto
+   the `timings` atom. parse-file is synchronous, so the redefs cannot leak into
+   other callers. Only single-arity fns are wrapped, since calls to them go
+   through the var and see the redef."
+  [db-conn file-path content options timings]
+  (let [*mldoc-ms (volatile! 0)
+        add! (fn [t0] (vswap! *mldoc-ms + (- (js/performance.now) t0)))
+        parse-json gp-mldoc/parse-json
+        inline-parse-json gp-mldoc/inline-parse-json
+        json->clj common-util/json->clj]
+    (try
+      (with-redefs [gp-mldoc/parse-json (fn [content' config]
+                                          (let [t0 (js/performance.now)
+                                                r (parse-json content' config)]
+                                            (add! t0)
+                                            r))
+                    gp-mldoc/inline-parse-json (fn [text config]
+                                                 (let [t0 (js/performance.now)
+                                                       r (inline-parse-json text config)]
+                                                   (add! t0)
+                                                   r))
+                    common-util/json->clj (fn [json-string]
+                                            (let [t0 (js/performance.now)
+                                                  r (json->clj json-string)]
+                                              (add! t0)
+                                              r))]
+        (graph-parser/parse-file db-conn file-path content options))
+      (finally
+        (swap! timings assoc :mldoc-ms @*mldoc-ms)))))
+
 (defn- reset-file!*
   "Parse file.
    Decide how to treat the parsed file based on the file's triggering event
    options -
      :fs/reset-event - the event that triggered the file update
      :fs/local-file-change - file changed on local disk
-     :fs/remote-file-change - file changed on remote"
+     :fs/remote-file-change - file changed on remote
+     :timings - optional atom for perf phase timings, see graph-parser/parse-file"
   [db-conn file-path content options]
-  (graph-parser/parse-file db-conn file-path content options))
+  (if-let [timings (:timings options)]
+    (parse-file-timed db-conn file-path content options timings)
+    (graph-parser/parse-file db-conn file-path content options)))
 
 (defn reset-file!
   "Main fn for updating a db with the results of a parsed file"
