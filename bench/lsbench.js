@@ -447,7 +447,10 @@ function profStop(why) {
       } else try {
         result.typing = { n, blockId, bursts: [] };
         const editing = () => page.evaluate(() => document.activeElement && document.activeElement.tagName === 'TEXTAREA').catch(() => false);
-        for (let burst = 0; burst < 2; burst++) {
+        // LSBENCH_TYPE_BURSTS: more saves give store/search distributions
+        // (two saves cannot tell a checkpoint landing in one from a change)
+        const nBursts = Number(process.env.LSBENCH_TYPE_BURSTS) || 2;
+        for (let burst = 0; burst < nBursts; burst++) {
           await target().scrollIntoViewIfNeeded({ timeout: 5000 }).catch(() => {});
           await target().click({ timeout: 5000 }).catch(() => {});
           await sleep(800);
