@@ -73,10 +73,10 @@
     (string/replace shortcut #"(?i)mod"
                     (if util/mac? "meta" "ctrl"))))
 
-(defn shortcut-binding
-  "override by user custom binding"
-  [id]
-  (let [shortcut (get (get-bindings) id)]
+(defn- resolve-shortcut-binding
+  "`shortcut-binding` against an already fetched `bindings` (see `get-bindings`)."
+  [bindings id]
+  (let [shortcut (get bindings id)]
     (cond
       (nil? shortcut)
       (log/warn :shortcut/binding-not-found {:id id})
@@ -92,6 +92,11 @@
          [shortcut]
          shortcut)
        (mapv mod-key)))))
+
+(defn shortcut-binding
+  "override by user custom binding"
+  [id]
+  (resolve-shortcut-binding (get-bindings) id))
 
 (defn shortcut-item
   [id]
@@ -239,18 +244,28 @@
                             (= (count target) 1))
                         (= (first target) (first from))))))))))
 
-(defn shortcut-data-by-id [id]
-  (let [binding (shortcut-binding id)
-        data (-> (shortcuts-map-full) id)]
-    (assoc
-     data
-     :binding
-     (binding-for-display id binding))))
+(defn- shortcut-data
+  "`shortcut-data-by-id` against an already built `full-map` (see
+  `shortcuts-map-full`) and `bindings` (see `get-bindings`)."
+  [id full-map bindings]
+  (assoc
+   (get full-map id)
+   :binding
+   (binding-for-display id (resolve-shortcut-binding bindings id))))
 
-(defn shortcuts->commands [handler-id]
-  (let [m (get @shortcut-config/*config handler-id)]
-    (->> m
-         (map (fn [[id _]] (-> (shortcut-data-by-id id)
-                               (assoc :id id :handler-id handler-id)
-                               (rename-keys {:binding :shortcut
-                                             :fn      :action})))))))
+(defn shortcut-data-by-id [id]
+  (shortcut-data id (shortcuts-map-full) (get-bindings)))
+
+(defn shortcuts->commands
+  "Palette commands for the shortcuts of `handler-id`. `full-map` and
+  `bindings` default to (shortcuts-map-full) and (get-bindings); pass them to
+  share one build between several handlers."
+  ([handler-id]
+   (shortcuts->commands handler-id (shortcuts-map-full) (get-bindings)))
+  ([handler-id full-map bindings]
+   (let [m (get @shortcut-config/*config handler-id)]
+     (->> m
+          (map (fn [[id _]] (-> (shortcut-data id full-map bindings)
+                                (assoc :id id :handler-id handler-id)
+                                (rename-keys {:binding :shortcut
+                                              :fn      :action}))))))))
