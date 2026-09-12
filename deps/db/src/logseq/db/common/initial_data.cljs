@@ -256,16 +256,28 @@
           (assoc :children children))))))
 
 (defn get-latest-journals
-  [db]
-  (let [today (date-time-util/date->int (js/Date.))]
-    (->> (d/datoms db :avet :block/journal-day)
-         vec
-         rseq
-         (keep (fn [d]
-                 (when (<= (:v d) today)
-                   (let [e (d/entity db (:e d))]
-                     (when (and (common-entity-util/journal? e) (:db/id e))
-                       e))))))))
+  "Journal page entities with journal-day <= today, newest first (journal-day
+  descending, then db id descending). Lazy: walks the :block/journal-day AVET
+  index backwards, so callers bound the work with take/first. Realize the seq
+  within the same synchronous call; do not hold it across a transact.
+  `:after [journal-day db-id]` (a previous result's last journal) continues
+  strictly after that journal."
+  ([db] (get-latest-journals db nil))
+  ([db {:keys [after]}]
+   (let [today (date-time-util/date->int (js/Date.))
+         [after-day after-id] after]
+     (->> (if after
+            (d/rseek-datoms db :avet :block/journal-day after-day after-id)
+            (d/rseek-datoms db :avet :block/journal-day today))
+          ;; the reverse slice's lower bound has no attribute
+          (take-while #(= :block/journal-day (:a %)))
+          ;; skip the cursor datom itself, and future days when the cursor is past today
+          (drop-while #(or (> (:v %) today)
+                           (and (= after-id (:e %)) (= after-day (:v %)))))
+          (keep (fn [d]
+                  (let [e (d/entity db (:e d))]
+                    (when (and (common-entity-util/journal? e) (:db/id e))
+                      e))))))))
 
 (defn- get-structured-datoms
   [db]

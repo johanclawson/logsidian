@@ -430,16 +430,32 @@
       properties
       (distinct (mapcat keys entities)))))
 
+(def ^:private journals-default-limit 10)
+
+(def ^:private journals-max-limit
+  "Per-request cap on journal ids (ADR-003 budget). Callers page with :after."
+  200)
+
 (defn ^:api ^:large-vars/cleanup-todo get-view-data
   [db view-id {:keys [journals? _view-for-id view-feature-type group-by-property-ident input query-entity-ids query filters sorting]
                :as opts}]
   ;; TODO: create a view for journals maybe?
   (cond
     journals?
-    (let [ids (->> (ldb/get-latest-journals db)
-                   (mapv :db/id))]
-      {:count (count ids)
-       :data ids})
+    ;; One bounded page, newest first. :more? says whether older journals exist;
+    ;; pass :cursor back as :after to continue.
+    (let [limit (min journals-max-limit
+                     (let [limit (:limit opts)]
+                       (if (pos-int? limit) limit journals-default-limit)))
+          journals (into [] (take (inc limit))
+                         (ldb/get-latest-journals db {:after (:after opts)}))
+          more? (> (count journals) limit)
+          journals (if more? (pop journals) journals)
+          last-journal (peek journals)]
+      (cond-> {:data (mapv :db/id journals)
+               :more? more?}
+        last-journal
+        (assoc :cursor [(:block/journal-day last-journal) (:db/id last-journal)])))
     :else
     (let [view (d/entity db view-id)
           group-by-property (:logseq.property.view/group-by-property view)
