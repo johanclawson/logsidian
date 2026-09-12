@@ -51,13 +51,15 @@
   truncated and walked again (search-indexer/open-action, reason \"schema\").
 
   The FTS5 merge settings (fts-config) are not part of the version. FTS5
-  persists them in blocks_fts_config and ensure-fts-config! writes them on
-  every open, so an existing version 2 index takes them without a walk. A
-  version 2 build without the maintenance tick (search-indexer/start-maint!;
-  such builds only ever ran in bench profiles) that opens an index this build
-  configured inherits automerge=0 and merges only by crisismerge: up to 15
-  segments per level, slower queries, no wrong results. Accepted instead of a
-  schema bump, which would walk every index again."
+  persists them in blocks_fts_config and ensure-fts-config! writes any that
+  differ on every open, so an existing version 2 index takes them without a
+  walk: one an earlier step-4 build set to automerge=0 gets automerge 4 back
+  on its next open (one config row). fts-config is FTS5's defaults, so a
+  build without ensure-fts-config! that opens an index this build configured
+  merges as stock FTS5 does. A step-4 build (automerge=0, only ever run in
+  bench profiles) that opens it writes automerge=0 back, and this build
+  restores it on the next open. Accepted instead of a schema bump, which
+  would walk every index again."
   2)
 
 (def fts-triggers
@@ -155,16 +157,27 @@ END;"]])
   (.exec db "CREATE TABLE IF NOT EXISTS search_meta (k TEXT PRIMARY KEY, v TEXT)"))
 
 (def fts-config
-  "FTS5 merge settings of blocks_fts (ADR-003 step 4).
-  - automerge 0: no incremental merge inside the committing statement. The
-    worker's maintenance tick merges instead, in bounded steps (merge-step!).
-  - usermerge 4: a merge step folds a level once it has 4 segments, the
-    fan-out automerge 4 had, so total merge work and segments per query stay
-    as they were.
-  - crisismerge 16 (the default, written out so it is explicit): the
-    backstop for starved ticks. A level that reaches 16 segments is merged
-    whole inside the commit, and that cascades upward, so it is not raised."
-  {"automerge" 0 "crisismerge" 16 "usermerge" 4})
+  "FTS5 merge settings of blocks_fts (ADR-003 step 4). These are FTS5's
+  defaults, written out so they are explicit and so an index an earlier
+  step-4 build set to automerge 0 gets them back (ensure-fts-config!).
+  - automerge 4: incremental merging inside the committing statement. Its
+    work is proportional to the writes and done in the writer's
+    transaction: each time a commit takes the leaf write counter past a
+    multiple of 64, FTS5 merges up to 64 x levels leaf pages, from the level
+    with the most segments once it has 4. That keeps every level small, so
+    crisismerge never triggers. Most small saves cross no 64-leaf boundary
+    and merge nothing. Step 4 first ran automerge 0 and merged only from the
+    maintenance tick; during a walk the tick fell behind (merge N stuck at
+    1, 7% of the walk's WAL frames) and crisismerge ran inside commits
+    instead, twice as a level-2 merge of the whole index (3.3 s and 5.4 s
+    commits).
+  - usermerge 4: the idle drain's merge steps (merge-step!) fold a level
+    once it has 4 segments, the same fan-out.
+  - crisismerge 16: a level that reaches 16 segments is merged whole inside
+    the commit, and that cascades upward. The backstop, not the mechanism.
+  The maintenance tick (search-indexer) keeps the checkpoints and the idle
+  drain."
+  {"automerge" 4 "crisismerge" 16 "usermerge" 4})
 
 (defn- ensure-fts-config!
   "Write each fts-config key blocks_fts_config does not already hold, so a
@@ -548,10 +561,13 @@ DROP TRIGGER IF EXISTS blocks_au;
 
 (defn level0-segments
   "Level-0 segments of blocks_fts now, or nil when the structure record can't
-  be read. Commits add them (one per commit); only merges remove them. With
-  automerge=0 a level-0 count that went down between two ticks without a
-  merge step in between means a crisismerge ran inside a commit (or the
-  index was truncated). Never throws: it only feeds the maint line."
+  be read. Commits add them (one per commit); only merges remove them: the
+  tick's merge steps, automerge inside a commit and crisismerge. So a
+  level-0 count that went down between two ticks without a merge step in
+  between is an automerge fold (expected, roughly one per 64 leaf pages
+  written), a crisismerge, or a truncate: the maint line's l0-drops counts
+  them all, and an l0-max near crisismerge (16) tells a crisis apart. Never
+  throws: it only feeds the maint line."
   [^js db]
   (try
     (let [b (ffirst (query-rows db "SELECT block FROM blocks_fts_data WHERE id = 10"))]

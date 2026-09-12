@@ -86,18 +86,22 @@
 ;; save every 0.5-1 s while typing): the former 2 s max-pending rule adds
 ;; nothing on top of it and is gone.
 (def maint-checkpoint-max-age-ms 1000)
-;; FTS5 merge step ('merge', N): N budgets pages of leaf output. It starts at
-;; maint-merge-n-initial and adapts to step time (maint-merge-n), aiming at
-;; about 5 ms: halved after a step over maint-merge-slow-ms, doubled after
-;; maint-merge-grow-after steps in a row under maint-merge-fast-ms that all
-;; found work. FTS5 ends a step only at a term boundary, so even N=1 can run
-;; long on a common trigram. Always positive: a negative N merges the whole
-;; index.
-(def maint-merge-n-initial 8)
-(def maint-merge-n-min 1)
+;; FTS5 merge step ('merge', N), the idle drain's only (maint-action): N
+;; budgets pages of leaf output. It starts at maint-merge-n-initial and
+;; adapts to step time (maint-merge-n): halved after a step over
+;; maint-merge-slow-ms, doubled after maint-merge-grow-after steps in a row
+;; under maint-merge-fast-ms that all found work. In wasm a step has a fixed
+;; cost of about 15-17 ms (a bench walk: 17 ms median and ~25 WAL frames at
+;; N=1), so the slow threshold sits well above it: under the former 10 ms N
+;; could only halve, and it sat at 1 for a whole walk. A step at that fixed
+;; cost keeps N; only cheaper ones grow it. FTS5 ends a step only at a term
+;; boundary, so even a small N can run long on a common trigram. Always
+;; positive: a negative N merges the whole index.
+(def maint-merge-n-initial 16)
+(def maint-merge-n-min 4)
 (def maint-merge-n-max 64)
-(def maint-merge-slow-ms 10)
-(def maint-merge-fast-ms 2.5)
+(def maint-merge-slow-ms 40)
+(def maint-merge-fast-ms 10)
 (def maint-merge-grow-after 4)
 ;; Idle drain: one merge step per timer task, this far apart.
 (def maint-idle-step-delay-ms 16)
@@ -661,15 +665,20 @@
 ;; ---------------------------------------------------------------------------
 ;; Maintenance (ADR-003 step 4)
 ;;
-;; Commits to the search db no longer checkpoint the WAL or merge FTS5
-;; segments inline: wal_autocheckpoint is only a fallback threshold
-;; (search-wal-autocheckpoint), and blocks_fts runs automerge=0
-;; (search/fts-config). This tick does both between tasks and deletes orphan
-;; rows search-blocks found. A PASSIVE checkpoint still blocks the worker
-;; while it copies; it is moved out of the commit, not made cheaper, and each
-;; one that copies costs its flushes whatever it copies (the cost model at
-;; search-wal-autocheckpoint). So it runs when a page budget or an age says
-;; so, not on every tick that saw a write.
+;; Commits to the search db no longer checkpoint the WAL inline:
+;; wal_autocheckpoint is only a fallback threshold (search-wal-autocheckpoint).
+;; FTS5 merging stays in the commits (automerge, search/fts-config): its work
+;; is proportional to the writes, which a tick can't match during a walk
+;; (with automerge=0 the tick fell behind and crisismerge re-merged whole
+;; levels inside commits, up to 5.4 s). This tick checkpoints between tasks,
+;; runs the idle drain's merge steps and deletes orphan rows search-blocks
+;; found. The drain finishes what automerge left: a merge it ran out of
+;; pages for, or a level that reached usermerge segments since its last pass
+;; (a pass runs once per 64 leaf pages written). A PASSIVE checkpoint still
+;; blocks the worker while it copies; it is moved out of the commit, not
+;; made cheaper, and each one that copies costs its flushes whatever it
+;; copies (the cost model at search-wal-autocheckpoint). So it runs when a
+;; page budget or an age says so, not on every tick that saw a write.
 
 (defn maint-action
   "What one maintenance tick does (pure). m:
@@ -695,17 +704,19 @@
     Never merely because the last tick saw a write: a streak gets one
     checkpoint per budget or per second, not one per tick. One save gets a
     single checkpoint (:age) about a second later.
-  - :merge? is one positive FTS5 merge step now, whenever merge work may be
-    left (a first open, which never goes idle, merges too). Never in a tick
-    that checkpoints: that tick leaves the merge to the next one.
+  - :merge? is one positive FTS5 merge step now: only when idle, with merge
+    work possibly left and no checkpoint due (a tick that checkpoints leaves
+    the merge to the next one). Never while writes come in or the user
+    waits: automerge merges inside those commits (search/fts-config), and a
+    step costs about 15-17 ms and ~25 WAL frames in wasm even at a small N.
+    A first open, which never goes idle, merges by automerge alone.
   - :idle? is no application write for maint-quiet-ms and no thread-api
     call: the next tick then comes maint-idle-step-delay-ms later while the
     drain has work (maint-next-ms), one step per task.
   No tick has a time bound: a checkpoint copies every pending frame, and
-  FTS5 ends a merge step only at a term boundary. Steps that are too small or
-  too rare leave the work to crisismerge, a whole level inside a commit. The
-  maint line (ckpt-max-ms, ckpt-pending-max, merge-max-step-ms, l0-drops)
-  shows what each costs; the defs above are the knobs."
+  FTS5 ends a merge step only at a term boundary. The maint line
+  (ckpt-max-ms, ckpt-pending-max, merge-max-step-ms, l0-drops, l0-max) shows
+  what each costs; the defs above are the knobs."
   [{:keys [wrote? quiet-ms pending-pages budget-pages age-ms held? merge? busy?]}]
   (let [idle? (and (not wrote?) (not busy?) (>= quiet-ms maint-quiet-ms))
         ckpt (when (and (pos? pending-pages) (not held?))
@@ -714,7 +725,7 @@
                  (>= age-ms maint-checkpoint-max-age-ms) :age
                  (and idle? (not merge?)) :final))]
     {:ckpt ckpt
-     :merge? (boolean (and merge? (nil? ckpt)))
+     :merge? (boolean (and merge? idle? (nil? ckpt)))
      :idle? idle?}))
 
 (defn maint-observe
@@ -932,11 +943,11 @@
 (defn- maint-tick!
   "One tick; reschedules itself while sdb is still repo's search db. It
   deletes queued orphans, then does at most one of: a checkpoint (and its
-  restart row), or one FTS5 merge step. Nothing while the connection has a
-  transaction open. A checkpoint error is counted and retried later
-  (checkpoint!); any other failure stops the tick for this session (logged
-  once): the auto-checkpoint and crisismerge still bound the WAL and the
-  segments."
+  restart row), or one FTS5 merge step (idle only, maint-action). Nothing
+  while the connection has a transaction open. A checkpoint error is
+  counted and retried later (checkpoint!); any other failure stops the tick
+  for this session (logged once): the auto-checkpoint and automerge still
+  bound the WAL and the segments."
   [repo sdb]
   (let [st (get @*maint repo)]
     (if-not (and st
@@ -981,8 +992,10 @@
                   (when (pos? orphans)
                     (note-maint! (fn [m] (update m :orphans (fnil + 0) orphans))))
                   ;; Level 0 went down since the last tick with no merge step in
-                  ;; between: a crisismerge ran inside a commit (or the index was
-                  ;; truncated), the stall this tick is there to prevent.
+                  ;; between: an automerge fold inside a commit (expected, about
+                  ;; one per 64 leaf pages written), a crisismerge (the stall
+                  ;; automerge is there to prevent; an l0-max near crisismerge
+                  ;; shows one) or a truncate.
                   (when (and (some? l0) (some? (:l0 st)) (< l0 (:l0 st)))
                     (note-maint! (fn [m] (update m :l0-drops (fnil inc 0)))))
                   (when (or c step (pos? orphans))

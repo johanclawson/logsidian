@@ -238,7 +238,8 @@
         (is (every? #(string/starts-with? (:sql %) "INSERT INTO search_meta") (drop n (:log @store))))))))
 
 (deftest fts-config-test
-  (is (= {"automerge" 0 "crisismerge" 16 "usermerge" 4} search/fts-config))
+  (is (= {"automerge" 4 "crisismerge" 16 "usermerge" 4} search/fts-config)
+      "FTS5's defaults: automerge on, so merging stays in the commits")
   (let [{:keys [db store]} (fake-db {})
         fts-writes (fn [log] (filterv #(string/starts-with? (:sql %) "INSERT INTO blocks_fts(blocks_fts, rank)") log))]
     (search/create-tables-and-triggers! db)
@@ -249,11 +250,12 @@
       (let [n (count (:log @store))]
         (search/create-tables-and-triggers! db)
         (is (empty? (fts-writes (drop n (:log @store)))))))
-    (testing "only a differing key is written"
-      (swap! store assoc-in [:fts-config "automerge"] 4)
+    (testing "only a differing key is written: an index a step-4 build set to automerge 0"
+      (swap! store assoc-in [:fts-config "automerge"] 0)
       (let [n (count (:log @store))]
         (search/create-tables-and-triggers! db)
-        (is (= [{"$k" "automerge" "$v" 0}] (mapv :bind (fts-writes (drop n (:log @store))))))))
+        (is (= [{"$k" "automerge" "$v" 4}] (mapv :bind (fts-writes (drop n (:log @store))))))
+        (is (= search/fts-config (:fts-config @store)) "automerge back on")))
     (testing "a truncate recreates blocks_fts and sets them inside its transaction"
       (let [n (:transactions @store)]
         (search/truncate-table! db)

@@ -309,27 +309,35 @@
     (testing "a checkpoint and a merge both due: only the checkpoint"
       (is (= {:ckpt :age :merge? false :idle? false} (act (assoc writing :age-ms age :merge? true))))
       (is (= {:ckpt :budget :merge? false :idle? true}
-             (act (assoc idle :pending-pages soft :budget-pages soft :merge? true)))))
-    (testing "merges: a step whenever work may be left; idle? paces the next"
+             (act (assoc idle :pending-pages soft :budget-pages soft :merge? true))))
+      (is (= {:ckpt :age :merge? false :idle? true}
+             (act (assoc idle :pending-pages 10 :budget-pages 10 :age-ms age :merge? true)))
+          "idle too: the step waits for the next tick"))
+    (testing "merges: a step only when idle, never while writes come in or the user waits"
       (is (= {:ckpt nil :merge? true :idle? true} (act (assoc idle :merge? true))))
-      (is (= {:ckpt nil :merge? true :idle? false} (act (assoc idle :merge? true :busy? true))))
-      (is (= {:ckpt nil :merge? true :idle? false} (act (assoc writing :merge? true))))
-      (is (= {:ckpt nil :merge? true :idle? false} (act (assoc idle :merge? true :quiet-ms 750)))))))
+      (is (= {:ckpt nil :merge? false :idle? false} (act (assoc idle :merge? true :busy? true)))
+          "busy: automerge merges inside the commits")
+      (is (= {:ckpt nil :merge? false :idle? false} (act (assoc writing :merge? true)))
+          "a write on the last tick")
+      (is (= {:ckpt nil :merge? false :idle? false} (act (assoc idle :merge? true :quiet-ms 750)))
+          "before the quiet period"))))
 
 (deftest maint-checkpoint-then-merge-test
   (let [st {:tc 3 :ckpt-pages 0 :done-pages 0 :write-t 0 :app-t 0 :merge? true
             :merge-n 8 :merge-fast 0}
         [st1 m1] (search-indexer/maint-observe st 1000 3 40 0)
-        a1 (search-indexer/maint-action (assoc m1 :busy? true))
+        a1 (search-indexer/maint-action (assoc m1 :busy? false))
         st2 (search-indexer/maint-settle st1 1000 {:tc 4 :pages 42 :ckpt :complete :ckpt-pages 40
                                                    :merge-left? (:merge? st1)})
         [_ m2] (search-indexer/maint-observe st2 1250 4 42 0)
-        a2 (search-indexer/maint-action (assoc m2 :busy? true))]
-    (is (= {:ckpt :age :merge? false :idle? false} a1) "this tick: the checkpoint")
+        a2 (search-indexer/maint-action (assoc m2 :busy? false))]
+    (is (= {:ckpt :age :merge? false :idle? true} a1) "a quiet tick: the checkpoint")
     (is (true? (:merge? st2)) "merge work still pending")
     (is (= 0 (:pending-pages m2)) "the restart row is not pending")
     (is (= 2 (:budget-pages m2)) "but counts toward the next budget")
-    (is (= {:ckpt nil :merge? true :idle? false} a2) "the next tick: the merge")))
+    (is (= {:ckpt nil :merge? true :idle? true} a2) "the next tick: the merge")
+    (is (= {:ckpt nil :merge? false :idle? false} (search-indexer/maint-action (assoc m2 :busy? true)))
+        "not while the user waits: the step waits for idle")))
 
 (deftest maint-settle-test
   (let [st {:tc 5 :ckpt-pages 100 :done-pages 102 :write-t 0 :app-t 250 :merge? true}]
@@ -357,19 +365,25 @@
 (deftest maint-merge-n-test
   (let [f search-indexer/maint-merge-n
         g search-indexer/maint-merge-grow-after
-        st {:merge-n 8 :merge-fast 0}
+        slow search-indexer/maint-merge-slow-ms
+        fast search-indexer/maint-merge-fast-ms
+        n-min search-indexer/maint-merge-n-min
+        st {:merge-n 16 :merge-fast 0}
         grow (fn [n k] (reduce (fn [s _] (merge s (f s 1 true))) {:merge-n n :merge-fast 0} (range k)))]
-    (is (= {:merge-n 4 :merge-fast 0} (f st 12 true)) "halved after a step over 10 ms")
-    (is (= {:merge-n 4 :merge-fast 0} (f (assoc st :merge-fast 3) 12 false)))
-    (is (= 1 (:merge-n (f {:merge-n 1 :merge-fast 0} 50 true))) "never below 1")
-    (is (= 1 (:merge-n (f {:merge-n 3 :merge-fast 0} 50 true))))
-    (is (= {:merge-n 8 :merge-fast 1} (f st 1 true)) "one fast step: counted")
-    (is (= {:merge-n 8 :merge-fast 0} (f (assoc st :merge-fast 3) 5 true)) "a step in between: counted again")
-    (is (= {:merge-n 8 :merge-fast 0} (f (assoc st :merge-fast 3) 1 false))
+    (is (= {:merge-n 8 :merge-fast 0} (f st (inc slow) true)) "halved after a step over maint-merge-slow-ms")
+    (is (= {:merge-n 8 :merge-fast 0} (f (assoc st :merge-fast 3) (inc slow) false)))
+    (is (= n-min (:merge-n (f {:merge-n n-min :merge-fast 0} 100 true))) "never below maint-merge-n-min")
+    (is (= n-min (:merge-n (f {:merge-n 6 :merge-fast 0} 100 true))))
+    (is (= {:merge-n 16 :merge-fast 0} (f st 17 true))
+        "a step at wasm's fixed cost (15-17 ms) neither halves nor grows N")
+    (is (= {:merge-n 16 :merge-fast 1} (f st 1 true)) "one fast step: counted")
+    (is (= {:merge-n 16 :merge-fast 0} (f (assoc st :merge-fast 3) (/ (+ fast slow) 2) true))
+        "a step in between: counted again")
+    (is (= {:merge-n 16 :merge-fast 0} (f (assoc st :merge-fast 3) 1 false))
         "a step that found no work never grows N")
-    (is (= 8 (:merge-n (grow 8 (dec g)))))
-    (is (= 16 (:merge-n (grow 8 g))) "doubled after maint-merge-grow-after fast steps with work")
-    (is (= search-indexer/maint-merge-n-max (:merge-n (grow 8 (* 10 g)))) "capped")))
+    (is (= 16 (:merge-n (grow 16 (dec g)))))
+    (is (= 32 (:merge-n (grow 16 g))) "doubled after maint-merge-grow-after fast steps with work")
+    (is (= search-indexer/maint-merge-n-max (:merge-n (grow 16 (* 10 g)))) "capped")))
 
 (deftest maint-next-ms-test
   (let [f search-indexer/maint-next-ms
@@ -378,7 +392,7 @@
     (is (= d (f {:merge? true} 5000 true false)) "idle with merge work: the next step soon")
     (is (= d (f {:merge? false} 5000 true true)) "idle, drain done, pages pending: the final checkpoint soon")
     (is (= tick (f {:merge? false} 5000 true false)) "idle with nothing left: disarmed")
-    (is (= tick (f {:merge? true} 5000 false false)) "busy: one step per tick")
+    (is (= tick (f {:merge? true} 5000 false false)) "not idle: merge work waits, a tick every maint-tick-ms")
     (is (= tick (f {:merge? false :held-until 6000} 5000 true true)) "a held checkpoint does not spin")))
 
 (defn- simulate-maint
@@ -387,23 +401,28 @@
   model of the search db. writes: sorted [ms pages] application commits.
   opts:
   :busy?           a thread-api call before every task
-  :merge-per-write FTS5 merge work (pages) each commit leaves; a step of N
-                   takes up to N of it, writes that many pages and takes
-                   0.5 + 0.15 ms a page; with none left it changes 1 row
+  :merge-per-write FTS5 merge work (pages) each commit leaves for the idle
+                   drain (automerge does the rest inside the commits); a
+                   step of N takes up to N of it and writes that many pages;
+                   with none left it changes 1 row
+  :step-ms         a step's time from the pages it wrote, for
+                   maint-merge-n (default 0.5 + 0.15 ms a page)
   :outcomes        checkpoint index -> :complete, :partial or :failed
   A complete checkpoint writes a 2-page restart row. No orphans. Returns
-  :tasks ([t ckpt step?] per task), :ckpts (reasons), :max-wait (longest an
-  application write waited for a complete checkpoint), :max-pending (pages
-  pending at a checkpoint), :merged, :pending (pages left) and the final :st."
-  [writes end-ms & [{:keys [busy? merge-per-write outcomes]
-                     :or {busy? false merge-per-write 0 outcomes (constantly :complete)}}]]
+  :tasks ([t ckpt step?] per task), :steps (each merge step's N), :ckpts
+  (reasons), :max-wait (longest an application write waited for a complete
+  checkpoint), :max-pending (pages pending at a checkpoint), :merged,
+  :pending (pages left) and the final :st."
+  [writes end-ms & [{:keys [busy? merge-per-write outcomes step-ms]
+                     :or {busy? false merge-per-write 0 outcomes (constantly :complete)
+                          step-ms (fn [pages] (+ 0.5 (* 0.15 pages)))}}]]
   (let [writes (vec writes)
         all-pages (reduce + 0 (map second writes))]
     (loop [t search-indexer/maint-tick-ms
            st {:tc 0 :ckpt-pages 0 :done-pages 0 :write-t 0 :merge? false
                :merge-n search-indexer/maint-merge-n-initial :merge-fast 0}
            own {:pages 0 :tc 0 :merged 0 :ckpt-n 0 :ckpt-w 0}
-           out {:tasks [] :ckpts [] :max-wait 0 :max-pending 0}]
+           out {:tasks [] :steps [] :ckpts [] :max-wait 0 :max-pending 0}]
       (if (> t end-ms)
         (assoc out :st st :merged (:merged own)
                :pending (- (+ all-pages (:pages own)) (:done-pages st)))
@@ -427,7 +446,7 @@
                            st1 t {:tc (+ n-w (:tc own')) :pages pages' :ckpt outcome
                                   :ckpt-pages pages
                                   :merge-left? (if merge? (pos? step) (:merge? st1))})
-                    merge? (merge (search-indexer/maint-merge-n st1 (+ 0.5 (* 0.15 step)) (pos? step))))
+                    merge? (merge (search-indexer/maint-merge-n st1 (step-ms step) (pos? step))))
               wait (if (and (= :complete outcome) (> n-w (:ckpt-w own)))
                      (- t (first (nth writes (:ckpt-w own))))
                      0)]
@@ -437,6 +456,7 @@
                  (cond-> (-> out
                              (update :tasks conj [t ckpt merge?])
                              (update :max-wait max wait))
+                   merge? (update :steps conj (:merge-n st1))
                    ckpt (-> (update :ckpts conj ckpt)
                             (update :max-pending max (:pending-pages seen))))))))))
 
@@ -486,6 +506,8 @@
     (is (= 1 (count (filter #{:final} ckpts))))
     (is (every? (fn [[_ ckpt step?]] (not (and ckpt step?))) tasks) "never a checkpoint and a step in one task")
     (is (< 10 (count (filter #(nth % 2) drain))) "the drain ran")
+    (is (every? (fn [[t _ step?]] (or (not step?) (< (+ 1900 search-indexer/maint-quiet-ms) t))) tasks)
+        "no step while the commits come in: the drain starts a quiet second after the last")
     (is (every? #{delay-ms} (map - (rest drain-ts) drain-ts)) "one task every maint-idle-step-delay-ms")
     (is (= delay-ms (- final-t (last drain-ts))) "the final checkpoint in the next task")
     (let [after (filter #(> (first %) final-t) tasks)]
@@ -502,6 +524,35 @@
       (is (>= (- t2 t1) search-indexer/maint-checkpoint-max-age-ms) (str o ": after the hold"))
       (is (zero? pending) (str o))
       (is (nil? (:app-t st)) (str o)))))
+
+(deftest maint-no-merge-step-while-busy-test
+  (let [writes (map (fn [t] [t 6]) (range 100 2000 100))
+        {:keys [tasks ckpts merged pending st]}
+        (simulate-maint writes 10000 {:busy? true :merge-per-write 40})]
+    (is (not-any? #(nth % 2) tasks) "the user waits the whole time: not one merge step")
+    (is (zero? merged))
+    (is (true? (:merge? st)) "the work waits for the idle drain")
+    (is (seq ckpts) "checkpoints go on, busy or not")
+    (is (zero? pending) "every write checkpointed")))
+
+(deftest maint-drain-adapts-n-test
+  (let [writes (map (fn [t] [t 6]) (range 100 2000 100))
+        run (fn [step-ms] (simulate-maint writes 20000 {:merge-per-write 40 :step-ms step-ms}))
+        n0 search-indexer/maint-merge-n-initial]
+    (testing "steps at wasm's fixed cost (15 ms + 0.4 ms a page): N holds"
+      (let [{:keys [steps merged]} (run (fn [p] (+ 15 (* 0.4 p))))]
+        (is (= (* 19 40) merged))
+        (is (= #{n0} (set steps)) "never halved toward the minimum")))
+    (testing "cheap steps: N grows to maint-merge-n-max"
+      (let [{:keys [steps merged]} (run (fn [p] (+ 2 (* 0.1 p))))]
+        (is (= (* 19 40) merged))
+        (is (= search-indexer/maint-merge-n-max (last steps)))
+        (is (apply <= steps) "only ever doubled")))
+    (testing "slow steps: halved down to maint-merge-n-min, never below"
+      (let [{:keys [steps merged]} (run (constantly 50))]
+        (is (= (* 19 40) merged))
+        (is (= search-indexer/maint-merge-n-min (apply min steps) (last steps)))
+        (is (apply >= steps) "only ever halved")))))
 
 (deftest maint-inert-without-sqlite-test
   (let [{:keys [db]} (fake-sdb)]
