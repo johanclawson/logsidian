@@ -34,11 +34,12 @@
      (let [q (fuzzy/clean-str q)]
        (when-not (string/blank? q)
          (p/let [mldoc-exts (set (map name common-config/mldoc-support-formats))
-                 result (db-async/<get-files repo)
-                 files (->> result
-                            (map first)
-                            (remove (fn [file]
-                                      (mldoc-exts (util/get-file-ext file)))))]
+                 ;; worker returns non-mldoc paths from the :file/path index;
+                 ;; keep the UI filter as a guard
+                 paths (db-async/<get-file-paths repo :exclude-mldoc? true)
+                 files (remove (fn [file]
+                                 (mldoc-exts (util/get-file-ext file)))
+                               paths)]
            (when (seq files)
              (fuzzy/fuzzy-search files q :limit limit))))))))
 

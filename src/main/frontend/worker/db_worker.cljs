@@ -22,6 +22,7 @@
             [frontend.worker.embedding :as embedding]
             [frontend.worker.export :as worker-export]
             [frontend.worker.file :as file]
+            [frontend.worker.file-paths :as file-paths]
             [frontend.worker.file.reset :as file-reset]
             [frontend.worker.handler.page :as worker-page]
             [frontend.worker.handler.page.file-based.rename :as file-worker-page-rename]
@@ -267,6 +268,7 @@
   (swap! *sqlite-conns dissoc repo)
   (swap! *datascript-conns dissoc repo)
   (swap! *client-ops-conns dissoc repo)
+  (file-paths/forget! repo)
   (when db (.close db))
   (when search (.close search))
   (when client-ops (.close client-ops))
@@ -502,6 +504,13 @@
   [repo inputs]
   (when-let [conn (worker-state/get-datascript-conn repo)]
     (apply d/q (first inputs) @conn (rest inputs))))
+
+(def-thread-api :thread-api/get-file-paths
+  [repo {:keys [exclude-mldoc?]}]
+  (when-let [conn (worker-state/get-datascript-conn repo)]
+    (if exclude-mldoc?
+      (file-paths/non-mldoc-paths repo conn)
+      (file-paths/all-paths @conn))))
 
 (def-thread-api :thread-api/datoms
   [repo & args]

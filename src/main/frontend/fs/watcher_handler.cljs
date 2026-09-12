@@ -139,8 +139,8 @@
   (when graph
     (let [repo-dir (config/get-repo-dir graph)]
       ;; read all files in the repo dir, notify if readdir error
-      (p/let [db-files' (db-async/<get-files graph)
-              db-files (map first db-files')
+      (p/let [;; all paths, md/org included, or deleted-files would miss them
+              db-files (db-async/<get-file-paths graph)
               [files deleted-files]
               (-> (fs/readdir repo-dir :path-only? true)
                   (p/chain (fn [files]

@@ -36,6 +36,12 @@
                        [?file :file/path ?path]])]
     (->> result seq reverse (map #(vector (:file/path %) (or (:file/last-modified-at %) 0))))))
 
+(defn <get-file-paths
+  "Paths of file entities from the worker's :file/path AVET index (no pull, no mtime).
+  With :exclude-mldoc? true, only non-md/org paths, cached in the worker."
+  [graph & {:keys [exclude-mldoc?]}]
+  (state/<invoke-db-worker :thread-api/get-file-paths graph {:exclude-mldoc? (boolean exclude-mldoc?)}))
+
 (defn <get-all-templates
   [graph]
   (p/let [result (<q graph
