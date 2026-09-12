@@ -39,8 +39,12 @@ function summarize(r) {
     'slow-sync lines': syncs.length,
     'slow-sync max ms': syncs.length ? Math.max(...syncs.map((x) => x['max-ms'] || x.ms)) : null,
     'maint lines': maint.length,
-    'maint ckpts': maintSum('checkpoints') ?? maintSum('ckpts'),
-    'maint ckpt max ms': maintMax('ckpt-max-ms') ?? maintMax('ckpt-ms-max'),
+    // maint lines merge counts per second; checkpoint time is ckpt-ms (summed
+    // within a line), the WAL's peak frame count wal-log-max
+    'maint ckpt ms sum': maintSum('ckpt-ms'),
+    'maint ckpt ms max': maintMax('ckpt-ms'),
+    'maint wal frames max': maintMax('wal-log-max'),
+    'maint merge n max': maintMax('merge-n-max'),
     'maint busy tick max': maintMax('busy-tick-max-ms'),
     'maint idle tick max': maintMax('idle-tick-max-ms'),
     'maint merge max ms': maintMax('merge-max-step-ms'),
