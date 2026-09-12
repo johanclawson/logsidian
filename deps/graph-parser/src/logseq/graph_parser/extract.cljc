@@ -14,6 +14,7 @@
             [logseq.common.util :as common-util]
             [logseq.db :as ldb]
             [logseq.graph-parser.block :as gp-block]
+            [logseq.graph-parser.block-identity :as block-identity]
             [logseq.graph-parser.mldoc :as gp-mldoc]
             [logseq.graph-parser.property :as gp-property]
             [logseq.graph-parser.text :as text]
@@ -176,21 +177,6 @@
       (seq invalid-properties)
       (assoc :block/invalid-properties invalid-properties))))
 
-(defn- attach-block-ids-if-match
-  "If block-ids are provided and match the number of blocks, attach them to blocks
-   If block-ids are provided but don't match the number of blocks, WARN and ignore
-   If block-ids are not provided (nil), just ignore"
-  [block-ids blocks]
-  (or (when block-ids
-        (if (= (count block-ids) (count blocks))
-          (mapv (fn [block-id block]
-                  (if (some? block-id)
-                    (assoc block :block/uuid (uuid block-id))
-                    block))
-                block-ids blocks)
-          (log/error :gp-extract/attach-block-ids-not-match "attach-block-ids-if-match: block-ids provided, but doesn't match the number of blocks, ignoring")))
-      blocks))
-
 (defn- build-pages-aux
   [db page-map ref-pages date-formatter format]
   (let [namespace-pages (let [page (:block/title page-map)]
@@ -220,24 +206,22 @@
 (defn- extract-pages-and-blocks
   "uri-encoded? - if is true, apply URL decode on the file path
    options -
-     :resolve-uuid-fn - Optional fn which is called to resolve uuids of each block. Enables diff-merge
-       (2 ways diff) based uuid resolution upon external editing.
-       returns a list of the uuids, given the receiving ast, or nil if not able to resolve.
-       Implemented in reset-file-handler/diff-merge-uuids-2ways for IoC
-       Called in gp-extract/extract as AST is being parsed and properties are extracted there"
-  [format ast properties file content {:keys [date-formatter db filename-format resolve-uuid-fn]
-                                       :or {resolve-uuid-fn (constantly nil)}
+     :reuse-uuids? - When set, blocks that continue a block of the page already
+       bound to `file` in `db` get that block's uuid instead of a fresh one
+       (see logseq.graph-parser.block-identity). Set by the app for every
+       re-parse of a file (frontend.worker.file.reset/reset-file!)"
+  [format ast properties file content {:keys [date-formatter db filename-format reuse-uuids?]
                                        :as options}]
   (assert db "Datascript DB is required")
   (try
     (let [page (get-page-name file ast false filename-format)
           [page page-name _journal-day] (gp-block/convert-page-if-journal page date-formatter)
           options' (assoc options :page-name page-name)
-          ;; In case of diff-merge (2way) triggered, use the uuids to override the ones extracted from the AST
-          override-uuids (resolve-uuid-fn format ast content options')
           *extracted-block-ids (atom #{})
-          blocks (->> (gp-block/extract-blocks ast content format options')
-                      (attach-block-ids-if-match override-uuids)
+          blocks (->> (cond->> (gp-block/extract-blocks ast content format options')
+                        reuse-uuids?
+                        (block-identity/reuse-block-uuids
+                         (block-identity/page-blocks-for-identity db file page-name)))
                       (mapv #(gp-block/fix-block-id-if-duplicated! db page-name *extracted-block-ids %))
                       ;; FIXME: use page uuid
                       (gp-block/with-parent-and-order {:block/name page-name})

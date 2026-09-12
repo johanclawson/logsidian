@@ -110,7 +110,11 @@
                                             :date-formatter (worker-state/get-date-formatter repo)
                                             :block-pattern (common-config/get-block-pattern
                                                             (or (common-util/get-format file-path) :markdown))
-                                            :filename-format (:file/name-format config)}
+                                            :filename-format (:file/name-format config)
+                                            ;; keep the uuids (and entities) of blocks the new
+                                            ;; content continues; a no-op when no page is bound
+                                            ;; to the file yet
+                                            :reuse-uuids? true}
                                            ;; To avoid skipping the `:or` bounds for keyword destructuring
                                            (when (some? verbose) {:verbose verbose}))})]
      (:tx (reset-file!* conn file-path content options)))))

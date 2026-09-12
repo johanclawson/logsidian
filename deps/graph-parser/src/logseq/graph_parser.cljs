@@ -10,11 +10,25 @@
             [logseq.db.file-based.schema :as file-schema]
             [logseq.graph-parser.extract :as extract]))
 
+(def ^:private retained-block-retract-attributes
+  "Attributes cleared on a block entity that a re-parse keeps (its uuid is
+  among the new blocks') before the new block map is upserted onto it. The
+  map's cardinality-one attributes overwrite the old values, but these are
+  either cardinality-many (the map's values would be added to the old ones, so
+  a removed link would stay in :block/refs) or absent from the map when the
+  file no longer has them (:block/collapsed? is only set when true)."
+  (conj file-schema/retract-attributes :block/refs :block/collapsed?))
+
 (defn- retract-blocks-tx
+  "`blocks` are entities. A block whose uuid is in `retain-uuids` keeps its
+  entity and loses the attributes above that it has; any other is retracted."
   [blocks retain-uuids]
-  (mapcat (fn [{uuid' :block/uuid eid :db/id}]
+  (mapcat (fn [{uuid' :block/uuid eid :db/id :as block}]
             (if (and uuid' (contains? retain-uuids uuid'))
-              (map (fn [attr] [:db.fn/retractAttribute eid attr]) file-schema/retract-attributes)
+              (keep (fn [attr]
+                      (when (some? (get block attr))
+                        [:db.fn/retractAttribute eid attr]))
+                    retained-block-retract-attributes)
               (when eid [[:db.fn/retractEntity eid]])))
           blocks))
 
