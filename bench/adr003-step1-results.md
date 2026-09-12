@@ -549,6 +549,76 @@ The next candidates are:
   linear shortcut registration and a Map LRU for the block AST cache (about
   0.5 s profiled together).
 
+### RC2: all fixes together (build of a866a35, 2026-09-12, `~/.cache/lsbench/rc2/`)
+
+RC2 contains:
+
+- search step 4 with the maintenance fix (FTS5 automerge back on, the tick
+  keeps checkpoints and idle merges);
+- boot fixes 1-3 plus the two follow-ups (linear shortcut registration and
+  a Map LRU for the block AST cache);
+- the restored-node LRU;
+- the reopen reconcile changes;
+- the write guard.
+
+The typing runs now take 10 saves (`LSBENCH_TYPE_BURSTS=10`).
+
+**Full index walk at 10k (manual rebuild, 69 938 rows):**
+
+| | FTS build | step 4 | RC2 |
+|---|---|---|---|
+| walk | 254 s | 153 s | **180 s** |
+| longest slice | 757 ms | 5 416 ms | **722 ms** |
+| p99 slice | 269 ms | 94 ms | 233 ms |
+| slices > 100 ms | 266 | 34 | 180 |
+| WAL frames, maximum | – | 3 746 | 974 |
+| longest merge step | – | 151 ms | 40 ms |
+
+- **The step-4 whole-index crisis merges are gone.** The slowest slice is
+  722 ms, and the WAL never passes the fallback threshold.
+- **The walk is better than the FTS build on every row.** It takes 180 s
+  where the arbiter predicted 200–230 s.
+- **The price of a merged index:** the p99 slice and the count over 100 ms
+  are back near the FTS build's shape.
+
+**Typing, 10 saves on the trusted 10k index** (`save-block`):
+
+| | median | max |
+|---|---|---|
+| worker time per save | 94 ms | 200 ms |
+| store (two commits) | 25 ms | 69 ms |
+| search sync (one row) | 24 ms | 39 ms |
+
+The worst worker stall (get-initial-data) is still 9.6 s at 10k.
+
+**Restored-node LRU** (`gctest/rc2`, the same search four times around a
+forced `gc()`):
+
+| run | step 4 restores | RC2 restores | RC2 search-blocks total |
+|---|---|---|---|
+| cold | 1 438 | 1 290 | 1 070 ms |
+| warm | 653 | **0** | 392 ms |
+| after `gc()` | 729 | **0** | 375 ms |
+| warm again | 0 | 0 | 213 ms |
+
+After a GC no index node has to be restored, and a repeated search stays
+cheap. The first search hit on the trusted 10k graph went from 1 885 to
+1 518 ms.
+
+**Boot, longest boot task per launch:**
+
+| | run 1 | run 2 | run 3 | mean |
+|---|---|---|---|---|
+| before | 6 164 | 4 808 | 5 879 | 5 617 ms |
+| boot fixes 1-3 | 3 058 | 2 910 | 2 831 | 2 933 ms |
+| RC2 (+ follow-ups) | 2 406 | 2 686 | 2 623 | **2 572 ms** |
+
+The full suite gated RC2 once. One test got a foreign rejection that another
+test leaked. The cause is a promesa 11.0.678 bug in the drain loop, shared
+by unrelated promise chains: one thrown handler rejected later ones. It is
+now patched with a local override of `promesa/impl/promise.js` (32f102e),
+and the leaking test is fixed (995fe78).
+
 ### Data safety: step-4 build vs master (`bench/lssafety.js`, 2026-09-12)
 
 First runs of the data-safety harness (`~/.cache/lsbench/safety/20260912-124151`
