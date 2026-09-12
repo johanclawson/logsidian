@@ -71,6 +71,9 @@
                                      (log/error :write-file/conflict-copy-failed {:path rpath :error error})
                                      nil)))]
       (log-guard! rpath outcome copy-path)
+      ;; the result names the copy, so callers can tell a preserved refusal
+      ;; (frontend.handler.file-based.file/alter-files-outcome)
+      (gobj/set result "copy" (when (string? copy-path) copy-path))
       (if (string? copy-path)
         (do
           (state/pub-event! [:notification/show
@@ -86,6 +89,41 @@
                                           " Copy your changes elsewhere before editing this page again.")
                             :status :error
                             :clear? false}]))
+      result)))
+
+(defn- <handle-failed-write!
+  "A guarded writeFile failed (\"io-error\") or returned something unexpected.
+   The disk was not changed (electron.write-guard). The proposed content is
+   saved as a conflict copy under logseq/bak/conflicts/, and an error notice
+   that stays names it. There is no reparse: the db keeps the proposal, and
+   the page's next save rewrites the whole file, the natural retry. Calls
+   error-handler with the error. Resolves to an \"io-error\" result whose
+   \"copy\" is the copy's path, or nil when saving it failed too, so callers
+   (alter-file, alter-files) can tell."
+  [dir rpath file-fpath content result outcome error-handler]
+  (let [result (if (and (object? result) (= "io-error" outcome))
+                 result
+                 #js {:result "io-error"
+                      :error (str "unexpected result " (pr-str outcome))})]
+    (p/let [copy-path (-> (ipc/ipc "backupConflictFile" dir rpath content)
+                          (p/catch (fn [error]
+                                     (log/error :write-file/conflict-copy-failed {:path rpath :error error})
+                                     nil)))
+            copy-path (when (string? copy-path) copy-path)
+            message (str "Write to the file " file-fpath " failed: " (gobj/get result "error")
+                         (if copy-path
+                           (str ". Your version was saved to " copy-path ".")
+                           (str ", and saving your version to logseq/bak/conflicts/ failed too."
+                                " Copy your changes elsewhere before closing the app.")))
+            error (ex-info message {:path file-fpath :result "io-error" :copy copy-path})]
+      (log-guard! rpath "io-error" copy-path)
+      (gobj/set result "copy" copy-path)
+      (state/pub-event! [:notification/show {:content message
+                                             :status :error
+                                             :clear? false}])
+      (if error-handler
+        (error-handler error)
+        (log/error :write-file-failed error))
       result)))
 
 (defn- write-file-impl!
@@ -132,23 +170,8 @@
               ("mismatch" "exists")
               (<handle-refused-write! repo dir rpath content result)
 
-              ;; io-error, or an unexpected result: the disk was not changed
-              ;; (electron.write-guard). Resolves to a result whose outcome
-              ;; is "io-error", so callers (alter-file) can tell.
-              (let [message (str "Write to the file " file-fpath " failed: "
-                                 (or (when (object? result) (gobj/get result "error"))
-                                     (str "unexpected result " (pr-str outcome))))
-                    error (ex-info message {:path file-fpath :result outcome})]
-                (log-guard! rpath "io-error" nil)
-                (state/pub-event! [:notification/show {:content message
-                                                       :status :error
-                                                       :clear? false}])
-                (if error-handler
-                  (error-handler error)
-                  (log/error :write-file-failed error))
-                (if (= "io-error" outcome)
-                  result
-                  #js {:result "io-error" :error message}))))
+              ;; io-error, or an unexpected result
+              (<handle-failed-write! dir rpath file-fpath content result outcome error-handler)))
           (p/catch (fn [error]
                      (if error-handler
                        (error-handler error)
