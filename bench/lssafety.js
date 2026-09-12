@@ -32,7 +32,8 @@
 //     the UI db when the reconcile runs (set-missing-block-ids! reads the UI db).
 //   3 live-external-edit    With the app open and idle, a journal is rewritten
 //     from outside (write-temp-and-rename, as OneDrive or another PC does). After
-//     typing into a different page the external version must still be on disk.
+//     typing into a different page the external version must still be on disk
+//     (and the typed page must hold the editor's text, see "Typed text").
 //     Typing into the SAME page right after an external rewrite (race: before
 //     the watcher's 2 s awaitWriteFinish fires) and after the UI showed it
 //     (settled) is recorded as "policy": outcome merged / backup+overwrite /
@@ -43,20 +44,23 @@
 //     before the reconcile has read the new one. config.edn must still carry
 //     the offline edit (the app may change :default-home around it).
 //   5 burst-writes          Several saves into one page within ~1 s while an
-//     external writer appends to a different file: every typed token is in
-//     the page exactly once and the other file is exactly base + appends.
+//     external writer appends to a different file: every typed segment (as the
+//     editor had it) is in the page exactly once and the other file is exactly
+//     base + appends.
 //   6 typing-roundtrip      Typing into a journal, close, reopen: the typed text
-//     is in the file exactly once, the reopen does not rewrite the file, and no
-//     other file changed.
+//     (as the editor had it) is in the file exactly once, the reopen does not
+//     rewrite the file, and no other file changed.
 //   7 two-ops-one-flush     Type into block one, Enter, type into the new block,
 //     Escape, all within ~1 s (one worker flush carries :save-block and
-//     :insert-blocks). Both tokens on disk exactly once, no LSGUARD refusal, no
-//     new bak file, no "not saved"/conflict notification (fail on each).
+//     :insert-blocks; the ~1 s includes two editor read-backs). Both segments
+//     (as the editor had them) on disk exactly once, no LSGUARD refusal, no new
+//     bak file, no "not saved"/conflict notification (fail on each).
 //   8 typing-through-external-rewrite  ~3 s of continuous typing with Enter
 //     presses into a page while the harness rewrites that page's file from
 //     outside mid-way (write-temp-and-rename). FAIL if the external tokens are
-//     not on disk at the end (a stale proposal overwrote them). WARN if a typed
-//     token is neither in the final file nor in any bak/conflict copy.
+//     not on disk at the end (a stale proposal overwrote them). WARN if a token
+//     the editor had (read back before each Enter/Escape) is neither in the
+//     final file nor in any bak/conflict copy.
 //   9 bak-unwritable        (optional, only with --only) logseq/bak is chmod 000,
 //     then a same-page refusal is staged. Expects an error notification and the
 //     typed text still visible in the UI; permissions are restored in finally.
@@ -73,6 +77,29 @@
 // (LSNOTE, a MutationObserver on .ui__notifications-content), so short-lived
 // ones count too.
 //
+// Typed text: each typed segment is read back from the editor (the focused
+// TEXTAREA's value, document.activeElement) once it is open and right before
+// Escape or Enter leaves it; the segment's text is what that value gained (a
+// block Enter just made counts as empty). The file checks of scenarios 3, 5, 6,
+// 7 and 8 compare the file against this editor text (once, nothing else
+// changed), not against the keys sent: a keystroke that never reached the
+// editor (seen: a 'c' dropped mid-word while Enter's new block editor was being
+// set up) is not a write-path failure. It is the WARN check "keystrokes lost
+// before the editor had them", with both strings (also for an Enter that never
+// reached it). When the editor cannot be read (not focused, another block, or
+// its text changed under the typing), the intended text is assumed and the
+// check details say so. result.json: segments[] {intended, actual, source
+// editor|intended, differs, why}; tokens also gets the editor text of a segment
+// that differs, so bak/conflict copies are searched for it.
+//
+// App errors: LSERR/pageerror records count in "app errors" (a warning, lserr
+// column); console.error lines are listed. Each launch records when the harness
+// asked the app to close (close_requested_wall, on the launch's own clock; add
+// the launch's t0_ms for the scenario timeline). Errors at or after it are
+// shutdown noise (worker calls still pending while the window is destroyed):
+// counted as shutdown_errors (shutdn column), kept per launch under shutdown,
+// not warned about.
+//
 // Statuses: pass / fail / error (harness trouble: the app could not be driven).
 // Checks carry a severity: fail (gates), warn (reported), policy, info.
 //
@@ -82,7 +109,8 @@
 //               (default ~/.cache/lsbench/safety/<timestamp>)
 //   --timeout   per scenario, default 900 s
 //   --only      also the way to run optional scenarios (bak-unwritable)
-//   --selftest  checks the pure helpers (template, edits, verify, guard) in DIR; no app
+//   --selftest  checks the pure helpers (template, edits, verify, guard, typed
+//               segments, shutdown errors) in DIR; no app
 // env: LSSAFETY_APP or LSBENCH_APP = app binary (default: the perf worktree's
 //      build), LSSAFETY_PLAYWRIGHT = playwright module path.
 // Exit code: 0 all pass, 1 any fail/error, 2 usage or refused path.
@@ -325,8 +353,9 @@ const bakOf = (rel, bakNew) => {
 //   exact    {content, tokens}  file must equal content (added id:: lines -> warn)
 //   contains {fragments}        every fragment must be in the file
 //   absent   {severity}         file must not exist
-//   typed    {base, target, typed:[..], tokens:[..]}  typed page: each token once,
-//            the target block line = base line + typed, every other line kept
+//   typed    {base, target, typed:[..], tokens:[..], inserted?, note?}  typed page:
+//            each token once, the target block line = base line + typed, every
+//            other line kept; typed/tokens are the editor's text (typedFromSegments)
 //   policy / ignore             excluded from the untouched-files check
 function checkExpectation(e, after, bakNew) {
   const a = after.get(e.path);
@@ -364,7 +393,7 @@ function checkExpectation(e, after, bakNew) {
     const want = baseLines.slice();
     // inserted: whole lines expected right after the target block (Enter makes a sibling)
     const ins = e.inserted || [];
-    if (idx >= 0) { want[idx] = baseLines[idx] + e.typed.join(''); want.splice(idx + 1, 0, ...ins.map((l) => l.trim())); }
+    if (idx >= 0) { want[idx] = (baseLines[idx] + e.typed.join('')).trim(); want.splice(idx + 1, 0, ...ins.map((l) => l.trim())); }
     const got = norm(a.text);
     const semantic = idx >= 0 && JSON.stringify(want) === JSON.stringify(got);
     const raw = e.base.split('\n');
@@ -372,7 +401,7 @@ function checkExpectation(e, after, bakNew) {
     if (ri >= 0) { raw[ri] += e.typed.join(''); raw.splice(ri + 1, 0, ...ins); }
     const once = Object.values(counts).every((c) => c === 1);
     return { name, severity: sev, ok: once && semantic, token_counts: counts,
-      detail: !once ? 'typed text missing or duplicated' : (semantic ? 'typed once, other lines kept' : 'other lines changed'),
+      detail: (!once ? 'typed text missing or duplicated' : (semantic ? 'typed once, other lines kept' : 'other lines changed')) + (e.note ? ` (${e.note})` : ''),
       byte_exact: a.text === raw.join('\n'), diff: semantic ? undefined : lineDiff(want.join('\n'), got.join('\n')) };
   }
   return { name, severity: 'info', ok: true, detail: e.kind };
@@ -416,6 +445,84 @@ function samePageOutcome({ finalText, extTokens, revertedText, typedToken, bakTe
     : !ext && typed ? (extInBak ? 'backup+overwrite' : 'overwrite-without-backup')
       : ext && !typed ? 'typed-dropped (refused or superseded)' : 'both-lost';
   return { outcome, external_survived: ext, typed_survived: typed, external_in_bak: extInBak };
+}
+
+// ---- typed segments (keystroke delivery) ---------------------------------------
+// pre/post: the editor's value before the typing ('' for the block Enter just
+// made) and App.editorValue() ({focused, value, block} or {focused: false})
+// read right before leaving it. The segment's text is what post gained over
+// pre. enterFrom: the editor read right before that Enter; if post is still
+// that block, Enter never reached the editor (enter_missed) and pre is its
+// value. Unreadable editor -> the intended text, source 'intended', why.
+function segmentActual(intended, pre, post, { block = null, enterFrom = null } = {}) {
+  const r = { intended, actual: intended, source: 'intended', differs: false };
+  if (!post || !post.focused) {
+    r.why = `editor not readable before leaving it (${(post && post.error) || 'no block editor focused'}): intended text assumed`;
+    return r;
+  }
+  r.block = post.block;
+  if (enterFrom && enterFrom.focused && post.block && post.block === enterFrom.block) { pre = enterFrom.value; r.enter_missed = true; }
+  if (block && post.block !== block) { r.why = `the focused editor is block ${post.block}, not ${block}: intended text assumed`; return r; }
+  if (pre == null) { r.why = 'editor value before the typing unknown: intended text assumed'; return r; }
+  if (!post.value.startsWith(pre)) {
+    r.why = `editor text changed under the typing (before ${JSON.stringify(pre.slice(-80))}, at leave ${JSON.stringify(post.value.slice(-120))}): intended text assumed`;
+    return r;
+  }
+  r.actual = post.value.slice(pre.length);
+  r.source = 'editor';
+  r.differs = r.actual !== intended;
+  return r;
+}
+// One editor session with several segments (scenario 8): the session's editor
+// text is split over them by whitespace-led chunks. If the chunk counts differ
+// (a lost space or segment) every segment is marked as differing (editor_text:
+// the session's text); one whose text is not in it keeps the intended text.
+function sessionSegments(intended, pre, post, opts = {}) {
+  const whole = segmentActual(intended.join(''), pre, post, opts);
+  const seg = (s, k, x) => ({ intended: s, actual: s, source: whole.source, differs: false,
+    ...(k === 0 && whole.enter_missed ? { enter_missed: true } : {}), ...x });
+  if (whole.source !== 'editor') return intended.map((s, k) => seg(s, k, { why: whole.why }));
+  const chunks = (t) => t.match(/\s*\S+/g) || [];
+  const got = chunks(whole.actual);
+  const per = intended.map((s) => chunks(s).length);
+  if (per.reduce((a, b) => a + b, 0) === got.length) {
+    let i = 0;
+    return intended.map((s, k) => { const a = got.slice(i, i + per[k]).join(''); i += per[k]; return seg(s, k, { actual: a, differs: a !== s }); });
+  }
+  return intended.map((s, k) => seg(s, k, { differs: true, editor_text: whole.actual,
+    ...(whole.actual.includes(s.trim()) ? {} : { source: 'intended',
+      why: `editor text ${JSON.stringify(whole.actual.slice(0, 200))} does not split into the ${intended.length} typed segments: intended text assumed` }) }));
+}
+// WARN, never a write-path failure: segments whose editor text differs from the keys sent
+function keystrokeCheck(segs) {
+  const lost = segs.filter((s) => s.differs || s.enter_missed);
+  const assumed = segs.filter((s) => s.source !== 'editor');
+  const list = lost.slice(0, 8).map((s) => `${s.enter_missed ? 'the Enter before it never reached the editor; ' : ''}typed ${JSON.stringify(s.intended)}, editor had ${
+    s.editor_text != null ? `(whole session) ${JSON.stringify(s.editor_text.slice(0, 200))}` : JSON.stringify(s.actual)}`);
+  if (lost.length > 8) list.push(`... ${lost.length - 8} more`);
+  const parts = [lost.length
+    ? `${lost.length}/${segs.length} segment(s): ${list.join('; ')} (keystroke delivery, not the write path: the file is checked against the editor text)`
+    : `${segs.length - assumed.length}/${segs.length} segment(s) read back from the editor as typed`];
+  if (assumed.length) parts.push(`${assumed.length} not read back, intended text assumed: ${[...new Set(assumed.map((s) => s.why))].slice(0, 3).join('; ')}`);
+  return { name: 'keystrokes lost before the editor had them', severity: 'warn', ok: !lost.length, detail: parts.join('; '),
+    segments: { total: segs.length, read_back: segs.length - assumed.length, assumed: assumed.length, differing: lost.length } };
+}
+// typed-expectation parts: the editor's text of each segment, tokens = each
+// non-empty segment trimmed (to be in the file exactly once)
+function typedFromSegments(segs) {
+  const assumed = segs.filter((s) => s.source !== 'editor').length;
+  return { typed: segs.map((s) => s.actual), tokens: segs.map((s) => s.actual.trim()).filter(Boolean),
+    note: assumed ? `${assumed}/${segs.length} segment(s) not read back from the editor, intended text assumed` : undefined };
+}
+// occurrences of t not followed by a digit: a token that lost its last
+// character ("qsw..n1") must not match a later one ("qsw..n10z")
+const countToken = (s, t) => (t ? (s.match(new RegExp(`${t.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}(?![0-9])`, 'g')) || []).length : 0);
+
+// errors (wall on the launch's clock) at or after its close request are shutdown noise
+function splitShutdown(errors, closeWall) {
+  const run = []; const shutdown = [];
+  for (const e of errors) (closeWall != null && e.wall >= closeWall ? shutdown : run).push(e);
+  return { run, shutdown };
 }
 
 // ---- write guard (LSGUARD) -----------------------------------------------------
@@ -528,7 +635,10 @@ class App {
     this.lastActivity = Date.now();
     this.prevTicks = new Map();
     this.closed = false;
-    this.info = { label };
+    // this launch's wall (ms since t0) when the harness asked the app to close
+    this.closeRequestedWall = null;
+    // t0 on the scenario timeline: wall + t0_ms = timeline t
+    this.info = { label, t0_ms: this.t0 - ctx.t0 };
   }
   wall() { return Date.now() - this.t0; }
 
@@ -786,15 +896,21 @@ class App {
   }
 
   // click the block's .block-content (block.cljs) to open the editor (a TEXTAREA
-  // inside the same .ls-block), append text at the end, Escape saves
+  // inside the same .ls-block), append text at the end, Escape saves. The editor
+  // is read before the typing and right before Escape: seg (segmentActual) is
+  // the text it really got; it goes to ctx.segments.
   async typeInto(blockId, text, { fast = false } = {}) {
     const t0 = Date.now();
     if (!(await this.openEditor(blockId, { fast }))) return { ok: false, why: 'editor did not open', ms: Date.now() - t0 };
+    const pre = await this.editorValue();
     await within(this.page.keyboard.type(text, { delay: fast ? 0 : 15 }), 20000, 'type');
     await sleep(fast ? 40 : 300);
+    const post = await this.editorValue();
     await within(this.page.keyboard.press('Escape'), 5000, 'Escape');
     this.ctx.appWrote = true;
-    return { ok: true, ms: Date.now() - t0 };
+    const seg = segmentActual(text, pre.focused ? pre.value : null, post, { block: blockId });
+    this.ctx.addSegment(seg);
+    return { ok: true, ms: Date.now() - t0, seg };
   }
 
   // click .block-content until its TEXTAREA has focus, caret to the end
@@ -821,6 +937,17 @@ class App {
       const a = document.activeElement;
       return !!(a && a.tagName === 'TEXTAREA' && a.closest('.ls-block'));
     }), 5000, 'editingAny').catch(() => false);
+  }
+
+  // what the focused block editor holds now (read before Escape/Enter leaves
+  // it): {focused, value, block} or {focused: false[, error]}
+  async editorValue() {
+    return within(this.page.evaluate(() => {
+      const a = document.activeElement;
+      if (!(a && a.tagName === 'TEXTAREA' && a.closest('.ls-block'))) return { focused: false };
+      const b = a.closest('[blockid]');
+      return { focused: true, value: a.value, block: b ? b.getAttribute('blockid') : null };
+    }), 5000, 'editorValue').catch((e) => ({ focused: false, error: errText(e) }));
   }
 
   notesSince(wall) { return this.notes.filter((n) => n.wall >= wall); }
@@ -869,6 +996,9 @@ class App {
     try { if (this.page) this.info.notifications = await this.notifications(); } catch (_) {}
     let kids = [];
     try { kids = descendants(this.pid); } catch (_) {}
+    // errors from here on are shutdown noise (splitShutdown)
+    this.closeRequestedWall = this.wall();
+    c.requested_wall = this.closeRequestedWall;
     try { await within(this.app.close(), 30000, 'app.close'); } catch (e) { c.ok = false; c.error = errText(e); }
     // hard stop for anything of this app still alive (only our own tree, only this binary)
     let killed = 0;
@@ -883,9 +1013,14 @@ class App {
     this.ctx.step(`${this.label}: closed ${JSON.stringify(c)}`);
   }
 
+  // errors at or after the close request are listed under shutdown, not in lserr/console_errors
   summary() {
+    const le = splitShutdown(this.lserr, this.closeRequestedWall);
+    const ce = splitShutdown(this.consoleErrors, this.closeRequestedWall);
     return { ...this.info, launched_wall_ms: this.info.window_ms, records: this.records.length,
-      lserr: this.lserr, guard: this.guard, notes: this.notes, console_errors: this.consoleErrors.slice(0, 30) };
+      close_requested_wall: this.closeRequestedWall, lserr: le.run, guard: this.guard, notes: this.notes,
+      console_errors: ce.run.slice(0, 30), shutdown_errors: le.shutdown.length + ce.shutdown.length,
+      shutdown: { lserr: le.shutdown, console_errors: ce.shutdown.slice(0, 30) } };
   }
 }
 
@@ -897,7 +1032,9 @@ function makeCtx(name, root, opts, templateOpts = {}) {
     opts, apps: [], aborted: false, timeline: [], t0: Date.now(), tokens: [],
     // stagesConflict: guard refusals are expected; copyExpect[rel]: tokens a
     // conflict copy of rel should hold; cleanup: run in runScenario's finally
-    stagesConflict: false, copyExpect: {}, cleanup: [], appWrote: false };
+    stagesConflict: false, copyExpect: {}, cleanup: [], appWrote: false,
+    // every typed segment: intended vs what the editor had (segmentActual)
+    segments: [] };
   for (const d of [ctx.graph, path.join(ctx.profile, 'home'), ctx.out]) fs.mkdirSync(assertSafePath(d), { recursive: true });
   ctx.tpl = makeTemplate(templateOpts);
   writeFiles(ctx.graph, ctx.tpl.files);
@@ -919,6 +1056,13 @@ function makeCtx(name, root, opts, templateOpts = {}) {
   ctx.snapshot = () => snapshotDir(ctx.graph);
   ctx.step = (msg) => { ctx.timeline.push({ t: Date.now() - ctx.t0, msg }); log(`${name}: ${msg}`); };
   ctx.tok = (tag) => { const t = `qs${tag}${crypto.randomBytes(4).toString('hex')}`; ctx.tokens.push(t); return t; };
+  // the editor text of a segment that lost keystrokes joins the tokens, so bak
+  // and conflict copies are searched for what the app really had
+  ctx.addSegment = (s) => {
+    ctx.segments.push(s);
+    const a = s.actual.trim();
+    if (a && s.actual !== s.intended && !ctx.tokens.includes(a)) ctx.tokens.push(a);
+  };
   ctx.launch = async (label, o) => {
     const a = new App(ctx, label);
     ctx.apps.push(a);
@@ -1055,10 +1199,11 @@ scenarios['live-external-edit'] = {
     const typed5 = ` typed ${tF}`;
     const r5 = await b.typeInto(id5, typed5);
     check(res, 'typed into a different page', r5.ok, r5.why || `${r5.ms} ms`, 'fail');
-    res.page05_written = await waitFileContains(ctx.abs(P5), [tF], 20000);
+    const t5 = r5.ok ? typedFromSegments([r5.seg]) : { typed: [], tokens: [] };
+    res.page05_written = await waitFileContains(ctx.abs(P5), t5.tokens, 20000);
     await b.settle();
     exp.push({ path: JX, kind: 'exact', content: jxContent, tokens: [tE, tE2], why: 'external rewrite while the app was open' });
-    exp.push({ path: P5, kind: 'typed', base: before.get(P5).text, target: 'Page 05 block one', typed: r5.ok ? [typed5] : [], tokens: r5.ok ? [tF] : [], why: 'typed page' });
+    exp.push({ path: P5, kind: 'typed', base: before.get(P5).text, target: 'Page 05 block one', typed: t5.typed, tokens: t5.tokens, note: t5.note, why: 'typed page' });
 
     // B and C (policy): typing into the SAME page after an external rewrite
     res.policy = {};
@@ -1091,13 +1236,17 @@ scenarios['live-external-edit'] = {
       const id2 = (await b.blockIdByText(`${N} block one`)) || id;
       const r = await b.typeInto(id2, ` typed ${tI}`);
       o.typing = r;
+      // judged by what the editor had (a keystroke lost on the way is not the app's write)
+      const typedTok = (r.ok && r.seg.actual.trim()) || tI;
+      o.typed_editor_text = typedTok;
+      ctx.copyExpect[rel] = [typedTok];
       await sleep(6000);
       await b.settle();
       o.notifications = await b.notifications();
       const disk1 = snapshotDir(ctx.graph);
       const finalText = disk1.has(rel) ? disk1.get(rel).text : null;
-      const baks = newBaks(disk0, disk1, [tG, tH, tI]).filter((x) => x.path.startsWith(`logseq/bak/pages/${N}/`));
-      Object.assign(o, samePageOutcome({ finalText, extTokens: [tG, tH], revertedText: `${N} block to change`, typedToken: tI, bakTexts: baks.map((x) => x.text) }));
+      const baks = newBaks(disk0, disk1, [tG, tH, typedTok]).filter((x) => x.path.startsWith(`logseq/bak/pages/${N}/`));
+      Object.assign(o, samePageOutcome({ finalText, extTokens: [tG, tH], revertedText: `${N} block to change`, typedToken: typedTok, bakTexts: baks.map((x) => x.text) }));
       o.bak_files = baks.map(({ text, ...x }) => x);
       o.final_diff_vs_external = finalText === ext ? [] : lineDiff(ext, finalText || '');
       res.policy[key] = o;
@@ -1166,25 +1315,25 @@ scenarios['burst-writes'] = {
         await sleep(150);
       }
     })();
-    const typed = []; const tokens = []; const rounds = [];
+    const segs = []; const rounds = [];
     const t0 = Date.now();
     for (let k = 1; k <= 4; k++) {
-      const s = ` b${k}${tL}`;
-      const r = await b.typeInto(id, s, { fast: true });
+      const r = await b.typeInto(id, ` b${k}${tL}`, { fast: true });
       rounds.push(r);
-      if (r.ok) { typed.push(s); tokens.push(`b${k}${tL}`); }
+      if (r.ok) segs.push(r.seg);
     }
     res.burst = { span_ms: Date.now() - t0, rounds };
     await writer;
     check(res, 'all typing rounds reached the editor', rounds.every((r) => r.ok), JSON.stringify(rounds.map((r) => r.ok)), 'warn');
-    if (!typed.length) throw new Error('no typing round reached the editor');
+    if (!segs.length) throw new Error('no typing round reached the editor');
+    const { typed, tokens, note } = typedFromSegments(segs);
     res.typed_written = await waitFileContains(ctx.abs(P2), tokens, 20000);
     await sleep(3000);
     await b.settle();
     await b.close();
     return { before, exp: [
       { path: EXT, kind: 'exact', content: ext, tokens: [1, 2, 3, 4, 5, 6].map((k) => `${tX}n${k}`), why: 'external appends during the burst' },
-      { path: P2, kind: 'typed', base: before.get(P2).text, target: 'Page 02 block one', typed, tokens, why: 'burst of saves' },
+      { path: P2, kind: 'typed', base: before.get(P2).text, target: 'Page 02 block one', typed, tokens, note, why: 'burst of saves' },
     ] };
   },
 };
@@ -1198,18 +1347,20 @@ scenarios['typing-roundtrip'] = {
     const b = await reopen(ctx);
     const id = await b.gotoPage(isoDay(12), `Journal ${isoDay(12)} note alpha`);
     if (!id) throw new Error(`journal ${isoDay(12)} did not render`);
-    const typed = ` typed ${tM}`;
-    const r = await b.typeInto(id, typed);
+    const r = await b.typeInto(id, ` typed ${tM}`);
     if (!r.ok) throw new Error(`typing failed: ${r.why}`);
-    res.typed_written = await waitFileContains(ctx.abs(J), [tM], 20000);
+    const tt = typedFromSegments([r.seg]);
+    // search for the token as the editor had it (the segment's last word)
+    const sTok = r.seg.actual.trim().split(/\s+/).pop() || tM;
+    res.typed_written = await waitFileContains(ctx.abs(J), tt.tokens, 20000);
     await b.settle();
     await b.close();
     const mid = ctx.snapshot();
     res.after_first_close_sha = mid.has(J) ? mid.get(J).sha : null;
     const c = await reopen(ctx, 'reopen2');
-    const s = await c.search(tM);
+    const s = await c.search(sTok);
     res.searches = [s];
-    check(res, `search finds ${tM} after reopen`, s.hit, s.error || (s.hit ? 'hit' : 'not found'), 'warn');
+    check(res, `search finds ${sTok} after reopen`, s.hit, s.error || (s.hit ? 'hit' : 'not found'), 'warn');
     await c.settle();
     await c.close();
     res.after_hook = (after) => {
@@ -1219,7 +1370,7 @@ scenarios['typing-roundtrip'] = {
         { diff: a && m && a.sha !== m.sha ? lineDiff(m.text, a.text) : undefined });
     };
     return { before, exp: [
-      { path: J, kind: 'typed', base: before.get(J).text, target: `Journal ${isoDay(12)} note alpha`, typed: [typed], tokens: [tM], why: 'typed journal' },
+      { path: J, kind: 'typed', base: before.get(J).text, target: `Journal ${isoDay(12)} note alpha`, typed: tt.typed, tokens: tt.tokens, note: tt.note, why: 'typed journal' },
     ] };
   },
 };
@@ -1235,19 +1386,28 @@ scenarios['two-ops-one-flush'] = {
     const id = await b.gotoPage(N.toLowerCase(), `${N} block one`);
     if (!id) throw new Error(`${N} did not render`);
     const t1 = ctx.tok('s'); const t2 = ctx.tok('t');
+    const s1 = ` one ${t1}`; const s2 = `two ${t2}`;
     const disk0 = snapshotDir(ctx.graph);
     const w0 = b.wall();
     if (!(await b.openEditor(id, { fast: true }))) throw new Error('editor did not open');
+    const pre1 = await b.editorValue();
     const t0 = Date.now();
-    await within(b.page.keyboard.type(` one ${t1}`, { delay: 0 }), 10000, 'type 1');
+    await within(b.page.keyboard.type(s1, { delay: 0 }), 10000, 'type 1');
+    const post1 = await b.editorValue(); // block one, right before Enter leaves it
     await within(b.page.keyboard.press('Enter'), 5000, 'Enter'); // :editor/new-block (shortcut/config.cljs)
-    await within(b.page.keyboard.type(`two ${t2}`, { delay: 0 }), 10000, 'type 2');
+    await within(b.page.keyboard.type(s2, { delay: 0 }), 10000, 'type 2');
     await sleep(40);
+    const post2 = await b.editorValue(); // the new block, right before Escape leaves it
     await within(b.page.keyboard.press('Escape'), 5000, 'Escape');
     ctx.appWrote = true;
-    res.two_ops = { ops_ms: Date.now() - t0 };
-    check(res, 'both ops inside ~1 s', res.two_ops.ops_ms <= 1100, `${res.two_ops.ops_ms} ms`, 'warn');
-    res.typed_written = await waitFileContains(ctx.abs(P), [t1, t2], 20000);
+    const opsMs = Date.now() - t0;
+    const seg1 = segmentActual(s1, pre1.focused ? pre1.value : null, post1, { block: id });
+    const seg2 = segmentActual(s2, '', post2, { enterFrom: post1 }); // Enter at the end: an empty block
+    ctx.addSegment(seg1); ctx.addSegment(seg2);
+    res.two_ops = { ops_ms: opsMs, segments: [seg1, seg2] };
+    check(res, 'both ops inside ~1 s', opsMs <= 1100, `${opsMs} ms (with 2 editor read-backs)`, 'warn');
+    const tt = typedFromSegments([seg1, seg2]);
+    res.typed_written = await waitFileContains(ctx.abs(P), tt.tokens, 20000);
     await sleep(3000);
     await b.settle();
     const disk1 = snapshotDir(ctx.graph);
@@ -1259,8 +1419,10 @@ scenarios['two-ops-one-flush'] = {
     check(res, 'no "not saved"/conflict notification', !bad.length, bad.length ? JSON.stringify(bad).slice(0, 400) : 'none', 'fail');
     await b.close();
     return { before, exp: [
-      { path: P, kind: 'typed', base: before.get(P).text, target: `${N} block one`, typed: [` one ${t1}`], inserted: [`- two ${t2}`],
-        tokens: [t1, t2], why: 'type, Enter, type in one flush' },
+      // the editor's text; an Enter that never reached the editor left both segments in block one
+      { path: P, kind: 'typed', base: before.get(P).text, target: `${N} block one`,
+        typed: seg2.enter_missed ? [seg1.actual, seg2.actual] : [seg1.actual], inserted: seg2.enter_missed ? [] : [`- ${seg2.actual}`],
+        tokens: tt.tokens, note: tt.note, why: 'type, Enter, type in one flush' },
     ] };
   },
 };
@@ -1277,7 +1439,7 @@ scenarios['typing-through-external-rewrite'] = {
     ctx.stagesConflict = true;
     const tW = ctx.tok('w'); const tG = ctx.tok('g'); const tH = ctx.tok('h');
     const extTokens = [tG, tH];
-    const rw = { typed: [], skipped: 0, reopened: 0, ext_at_ms: null };
+    const rw = { typed: [], segments: [], skipped: 0, reopened: 0, ext_at_ms: null };
     res.rewrite = rw;
     const external = () => {
       const cur = ctx.read(P);
@@ -1289,25 +1451,53 @@ scenarios['typing-through-external-rewrite'] = {
       rw.external_content = ext;
       ctx.step(`external rewrite of ${P} after ${rw.ext_at_ms} ms of typing`);
     };
+    // Each editor session (open or Enter -> Enter, Escape or losing the editor)
+    // is read back right before it is left; its tokens are what the editor's
+    // value gained (sessionSegments). A session whose editor was lost (an
+    // external change reset it) cannot be read: intended tokens assumed.
+    let sess = null;
+    const begin = async (blockId) => {
+      const v = await b.editorValue();
+      sess = { pre: v.focused ? v.value : null, segs: [], opts: { block: blockId } };
+    };
+    const leave = async () => {
+      let post = null;
+      if (sess && sess.segs.length) {
+        post = await b.editorValue();
+        for (const s of sessionSegments(sess.segs, sess.pre, post, sess.opts)) { rw.segments.push(s); ctx.addSegment(s); }
+      }
+      sess = null;
+      return post;
+    };
     if (!(await b.openEditor(id))) throw new Error('editor did not open');
     ctx.appWrote = true;
+    await begin(id);
     const t0 = Date.now();
     for (let k = 1; Date.now() - t0 < 3000 && k <= 80; k++) {
       if (rw.ext_at_ms == null && Date.now() - t0 >= 1500) external();
       // an external change can reset the editor; keys sent to a non-editing
       // page would fire shortcuts, so reopen block one first
       if (!(await b.editingAny())) {
+        await leave();
         const id2 = (await b.blockIdByText(`${N} block one`)) || id;
         if (!(await b.openEditor(id2, { fast: true }))) { rw.skipped++; await sleep(100); continue; }
         rw.reopened++;
+        await begin(id2);
       }
+      if (!sess) await begin(null);
       const tok = `${tW}n${k}z`;
       await within(b.page.keyboard.type(` ${tok}`, { delay: 10 }), 10000, 'type');
       rw.typed.push(tok);
-      if (k % 3 === 0) await within(b.page.keyboard.press('Enter'), 5000, 'Enter');
+      sess.segs.push(` ${tok}`);
+      if (k % 3 === 0) {
+        const post = await leave();
+        await within(b.page.keyboard.press('Enter'), 5000, 'Enter');
+        sess = { pre: '', segs: [], opts: { enterFrom: post } }; // Enter at the end: an empty block
+      }
     }
     if (rw.ext_at_ms == null) external();
     rw.span_ms = Date.now() - t0;
+    await leave();
     await within(b.page.keyboard.press('Escape'), 5000, 'Escape').catch(() => {});
     check(res, 'typing kept going across the rewrite', rw.typed.length >= 4 && rw.skipped < 5, JSON.stringify({ typed: rw.typed.length, skipped: rw.skipped, reopened: rw.reopened }), 'warn');
     await sleep(6000);
@@ -1322,14 +1512,22 @@ scenarios['typing-through-external-rewrite'] = {
       check(res, 'external rewrite on disk at the end', !missingExt.length,
         missingExt.length ? `missing ${missingExt.join(', ')} (overwritten by a stale proposal?)` : 'both external tokens present', 'fail',
         { in_bak: missingExt.length ? (baks.some((x) => missingExt.every((t) => x.text.includes(t))) ? 'yes' : 'no') : undefined });
-      const inFile = rw.typed.filter((t) => text.includes(t));
-      const inCopy = rw.typed.filter((t) => !text.includes(t) && baks.some((x) => x.text.includes(t)));
-      const lost = rw.typed.filter((t) => !text.includes(t) && !baks.some((x) => x.text.includes(t)));
-      const dup = rw.typed.filter((t) => countOf(text, t) > 1);
+      // accounted by what the editor had: a keystroke lost before the editor is
+      // the keystroke check's business, not a lost write
+      const tokOf = (s) => s.actual.trim();
+      const toks = rw.segments.map(tokOf).filter(Boolean);
+      const never = rw.segments.filter((s) => !tokOf(s)).map((s) => s.intended.trim());
+      const assumed = rw.segments.filter((s) => s.source !== 'editor').length;
+      const inCopies = (t) => baks.some((x) => countToken(x.text, t) > 0);
+      const inFile = toks.filter((t) => countToken(text, t) > 0);
+      const inCopy = toks.filter((t) => !countToken(text, t) && inCopies(t));
+      const lost = toks.filter((t) => !countToken(text, t) && !inCopies(t));
+      const dup = toks.filter((t) => countToken(text, t) > 1);
       rw.final = { typed_in_file: inFile.length, typed_in_copy_only: inCopy, typed_lost: lost, typed_duplicated: dup,
-        bak_files: baks.map((x) => x.path) };
-      check(res, 'every typed token in the final file or a bak/conflict copy', !lost.length,
-        lost.length ? `lost ${lost.length}/${rw.typed.length}: ${lost.join(', ')}` : `${inFile.length} in file, ${inCopy.length} only in a copy`, 'warn');
+        never_reached_editor: never, not_read_back: assumed, bak_files: baks.map((x) => x.path) };
+      const note = assumed ? `; ${assumed}/${rw.segments.length} not read back from the editor, intended token assumed` : '';
+      check(res, 'every typed token the editor had in the final file or a bak/conflict copy', !lost.length,
+        `${lost.length ? `lost ${lost.length}/${toks.length}: ${lost.join(', ')}` : `${inFile.length} in file, ${inCopy.length} only in a copy`}${note}`, 'warn');
       if (dup.length) check(res, 'typed tokens once in the final file', false, `duplicated: ${dup.join(', ')}`, 'warn');
     };
     return { before, exp: [{ path: P, kind: 'policy' }] };
@@ -1376,7 +1574,7 @@ scenarios['bak-unwritable'] = {
       o.notifications = b.notesSince(w0);
       o.dom_notifications = await b.notifications();
       o.guard = b.guard.filter((g) => g.wall >= w0);
-      o.ui_has_typed = await b.uiHasText(tI);
+      o.ui_has_typed = await b.uiHasText(o.typing.seg.actual.trim() || tI);
       await b.shot('bak-unwritable');
       check(res, 'error notification shown', errs.length > 0, errs.length ? errs[0].text.slice(0, 200) : JSON.stringify(o.dom_notifications).slice(0, 200), 'fail');
       check(res, 'typed text still visible in the UI', o.ui_has_typed, o.ui_has_typed ? 'visible' : 'gone (reparsed?)', 'fail');
@@ -1420,6 +1618,8 @@ async function runScenario(name, root, opts) {
     if (primeChanged.length) check(res, 'first open left existing files alone', false, primeChanged.join(', '), 'warn');
     const bakNew = newBaks(before, after, ctx.tokens);
     res.checks.push(...verify(before, after, exp, { bakNew }));
+    // keystroke delivery (keys sent vs editor text), apart from the write path
+    if (ctx.segments.length) res.checks.push(keystrokeCheck(ctx.segments));
     if (res.after_hook) { res.after_hook(after); delete res.after_hook; }
     // write guard: refusals gate unless the scenario staged a conflict; copies are reported
     const guardRecs = [].concat(...ctx.apps.map((a) => a.guard.map((g) => ({ launch: a.label, ...g }))));
@@ -1464,8 +1664,11 @@ async function runScenario(name, root, opts) {
       if (runP) await within(runP.catch(() => {}), 60000, 'abandoned run').catch(() => {});
       for (const a of ctx.apps) await a.close().catch(() => {});
       res.launches = ctx.apps.map((a) => a.summary());
+      // before each launch's close request; later ones are shutdown noise (per launch under shutdown)
       res.lserr_count = res.launches.reduce((n, l) => n + l.lserr.length, 0);
+      res.shutdown_errors = res.launches.reduce((n, l) => n + l.shutdown_errors, 0);
       if (res.lserr_count) res.warnings.push(`app errors (LSERR/pageerror): ${res.lserr_count}`);
+      res.segments = ctx.segments;
       res.timeline = ctx.timeline;
       res.tokens = ctx.tokens;
       // after a harness error the verification block never ran: still say whether the guard spoke
@@ -1485,8 +1688,8 @@ function summaryTable(results) {
   const rows = results.map((r) => [r.scenario, r.status.toUpperCase(),
     `${r.checks.filter((c) => c.ok && c.severity === 'fail').length}/${r.checks.filter((c) => c.severity === 'fail').length}`,
     String(r.warnings.length), String(r.policy_checks ? r.policy_checks.length : 0), String(r.bak_new ? r.bak_new.length : 0),
-    String(r.lserr_count || 0), r.guard ? r.guard.status : '-', `${Math.round(r.duration_ms / 1000)}s`, (r.reasons[0] || '').slice(0, 110)]);
-  const head = ['scenario', 'status', 'gates', 'warn', 'policy', 'bak', 'lserr', 'guard', 'time', 'first reason'];
+    String(r.lserr_count || 0), String(r.shutdown_errors || 0), r.guard ? r.guard.status : '-', `${Math.round(r.duration_ms / 1000)}s`, (r.reasons[0] || '').slice(0, 110)]);
+  const head = ['scenario', 'status', 'gates', 'warn', 'policy', 'bak', 'lserr', 'shutdn', 'guard', 'time', 'first reason'];
   const w = head.map((h, i) => Math.max(h.length, ...rows.map((r) => r[i].length)));
   const fmt = (r) => r.map((c, i) => (i === r.length - 1 ? c : c.padEnd(w[i]))).join('  ');
   return [fmt(head), fmt(w.map((n) => '-'.repeat(n))), ...rows.map(fmt)].join('\n');
@@ -1522,12 +1725,14 @@ async function main(argv) {
     const r = await runScenario(n, root, o);
     results.push(r);
     console.log(`LSSAFETY_RESULT ${JSON.stringify({ scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [],
-      guard: r.guard ? r.guard.status : null, guard_counts: r.guard ? r.guard.counts : null, result: path.join(r.dir || root, 'result.json') })}`);
+      guard: r.guard ? r.guard.status : null, guard_counts: r.guard ? r.guard.counts : null,
+      lserr: r.lserr_count || 0, shutdown_errors: r.shutdown_errors || 0, result: path.join(r.dir || root, 'result.json') })}`);
   }
   const table = summaryTable(results);
   fs.writeFileSync(path.join(root, 'summary.json'), JSON.stringify({ app: APP, root, results: results.map((r) => ({
     scenario: r.scenario, status: r.status, reasons: r.reasons, warnings: r.warnings, policy: r.policy_checks || [],
-    guard: r.guard ? r.guard.status : null, duration_ms: r.duration_ms })) }, null, 1));
+    guard: r.guard ? r.guard.status : null, lserr: r.lserr_count || 0, shutdown_errors: r.shutdown_errors || 0,
+    duration_ms: r.duration_ms })) }, null, 1));
   fs.writeFileSync(path.join(root, 'summary.txt'), `${table}\n`);
   console.log(`\n${table}\n\nresults: ${root}`);
   return results.every((r) => r.status === 'pass') ? 0 : 1;
@@ -1630,6 +1835,72 @@ function selftest(dir) {
   fs.writeFileSync(path.join(g, T4), b4.replace('- Page 04 block one plain text', '- Page 04 block one plain text one s1tok\n- two t2tok'));
   c = checkExpectation({ path: T4, kind: 'typed', base: b4, target: 'Page 04 block one', typed: [' one s1tok'], inserted: ['- two t2tok'], tokens: ['s1tok', 't2tok'] }, snapshotDir(g), []);
   assert.ok(c.ok && c.byte_exact, JSON.stringify(c));
+  // typed segments: the file is checked against the editor's text, not the keys sent
+  const ed = (value, block = 'B1') => ({ focused: true, value, block });
+  let sg = segmentActual('two qstcdc4d61a', '', ed('two qstdc4d61a', 'B2'), { enterFrom: ed('x one s1tok') });
+  assert.ok(sg.source === 'editor' && sg.actual === 'two qstdc4d61a' && sg.differs && !sg.enter_missed, JSON.stringify(sg));
+  sg = segmentActual(' ok', 'a', ed('a ok'), { block: 'B1' });
+  assert.ok(sg.source === 'editor' && sg.actual === ' ok' && !sg.differs, JSON.stringify(sg));
+  sg = segmentActual(' ok', 'a', { focused: false });
+  assert.ok(sg.source === 'intended' && sg.actual === ' ok' && /not readable/.test(sg.why), JSON.stringify(sg));
+  sg = segmentActual(' ok', 'a', ed('a ok', 'B2'), { block: 'B1' });
+  assert.ok(sg.source === 'intended' && /B2/.test(sg.why), JSON.stringify(sg));
+  sg = segmentActual(' ok', 'a', ed('reparsed'));
+  assert.ok(sg.source === 'intended' && /changed under/.test(sg.why), JSON.stringify(sg));
+  sg = segmentActual('two t', '', ed('x one stwo t'), { enterFrom: ed('x one s') });
+  assert.ok(sg.enter_missed && sg.source === 'editor' && sg.actual === 'two t', JSON.stringify(sg));
+  // sessions of several tokens (scenario 8)
+  let ss = sessionSegments([' qa1z', ' qa2z', ' qa3z'], 'x', ed('x qa1z qa2 qa3z'));
+  assert.deepStrictEqual(ss.map((s) => [s.actual, s.differs]), [[' qa1z', false], [' qa2', true], [' qa3z', false]]);
+  ss = sessionSegments([' qa1z', ' qa2z'], 'x', ed('x qa1zqa2z')); // a lost space: found, but the session differs
+  assert.ok(ss.every((s) => s.source === 'editor' && s.differs && s.editor_text === ' qa1zqa2z'), JSON.stringify(ss));
+  ss = sessionSegments([' qa1z', ' qa2z'], 'x', ed('x qa1z'));
+  assert.deepStrictEqual(ss.map((s) => s.source), ['editor', 'intended']);
+  ss = sessionSegments([' qa1z'], 'x', { focused: false });
+  assert.ok(ss[0].source === 'intended' && /not readable/.test(ss[0].why));
+  // the keystroke check: a WARN with both strings, never a fail; fallbacks said so
+  let kc = keystrokeCheck([segmentActual('two qstcdc4d61a', '', ed('two qstdc4d61a')), segmentActual(' ok', 'a', { focused: false })]);
+  assert.ok(!kc.ok && kc.severity === 'warn' && kc.detail.includes('"two qstcdc4d61a"') && kc.detail.includes('"two qstdc4d61a"')
+    && /intended text assumed/.test(kc.detail), kc.detail);
+  kc = keystrokeCheck([segmentActual(' ok', 'a', ed('a ok'))]);
+  assert.ok(kc.ok && kc.severity === 'warn', kc.detail);
+  // run 1's case: the file holds what the editor had -> the file check passes
+  const k1 = segmentActual(' one s1tok', 'Page 04 block one plain text', ed('Page 04 block one plain text one s1tok'), { block: 'B1' });
+  const k2 = segmentActual('two qstcdc4d61a', '', ed('two qstdc4d61a', 'B2'), { enterFrom: ed('Page 04 block one plain text one s1tok') });
+  const kt = typedFromSegments([k1, k2]);
+  assert.deepStrictEqual(kt.tokens, ['one s1tok', 'two qstdc4d61a']);
+  fs.writeFileSync(path.join(g, T4), b4.replace('- Page 04 block one plain text', '- Page 04 block one plain text one s1tok\n- two qstdc4d61a'));
+  const e4 = { path: T4, kind: 'typed', base: b4, target: 'Page 04 block one', typed: [k1.actual], inserted: [`- ${k2.actual}`], tokens: kt.tokens };
+  c = checkExpectation(e4, snapshotDir(g), []);
+  assert.ok(c.ok && c.byte_exact && !kt.note, JSON.stringify(c));
+  c = checkExpectation({ ...e4, inserted: ['- two qstcdc4d61a'], tokens: ['one s1tok', 'two qstcdc4d61a'] }, snapshotDir(g), []);
+  assert.ok(!c.ok, 'against the keys sent the same file fails (the old check)');
+  // a write that lost what the editor had still fails
+  fs.writeFileSync(path.join(g, T4), b4.replace('- Page 04 block one plain text', '- Page 04 block one plain text one s1tok'));
+  c = checkExpectation(e4, snapshotDir(g), []);
+  assert.ok(!c.ok && c.token_counts['two qstdc4d61a'] === 0, JSON.stringify(c));
+  // not read back: the intended text is assumed and the detail says so
+  const kf = typedFromSegments([segmentActual(' one s1tok', null, { focused: false })]);
+  c = checkExpectation({ path: T4, kind: 'typed', base: b4, target: 'Page 04 block one', typed: kf.typed, tokens: kf.tokens, note: kf.note }, snapshotDir(g), []);
+  assert.ok(c.ok && /intended text assumed/.test(c.detail), JSON.stringify(c));
+  // trailing blanks of a segment are not a changed line (the file side is trimmed too)
+  c = checkExpectation({ path: T4, kind: 'typed', base: b4, target: 'Page 04 block one', typed: [' one s1tok '], tokens: ['one s1tok'] }, snapshotDir(g), []);
+  assert.ok(c.ok, JSON.stringify(c));
+  // token matching: a token that lost its last character does not match a later one
+  assert.strictEqual(countToken('x qswn10z y', 'qswn1'), 0);
+  assert.strictEqual(countToken('x qswn1 y', 'qswn1'), 1);
+  assert.strictEqual(countToken('qswn1zqswn2z', 'qswn2z'), 1);
+  // errors at or after the close request are shutdown noise
+  const sp = splitShutdown([{ wall: 100 }, { wall: 5000 }, { wall: 5600 }], 5000);
+  assert.deepStrictEqual([sp.run.length, sp.shutdown.length], [1, 2]);
+  assert.strictEqual(splitShutdown([{ wall: 9e9 }], null).shutdown.length, 0, 'no close request: nothing is shutdown');
+  const fake = new App({ t0: Date.now() }, 'fake');
+  fake.lserr = [{ wall: 10, kind: 'error', msg: 'mid-run' }, { wall: 900, kind: 'pageerror', msg: 'ExceptionInfo' }];
+  fake.consoleErrors = [{ wall: 950, msg: 'Unexpected webworker error' }, { wall: 20, msg: 'early' }];
+  fake.closeRequestedWall = 800;
+  const fsum = fake.summary();
+  assert.ok(fsum.lserr.length === 1 && fsum.console_errors.length === 1 && fsum.shutdown_errors === 2
+    && fsum.shutdown.lserr[0].msg === 'ExceptionInfo' && fsum.close_requested_wall === 800, JSON.stringify(fsum));
   // write guard records
   assert.deepStrictEqual(parseGuardLine('LSGUARD {"path":"pages/a.md","result":"mismatch","copy":"logseq/bak/conflicts/a.md"}'),
     { path: 'pages/a.md', result: 'mismatch', copy: 'logseq/bak/conflicts/a.md' });
@@ -1657,7 +1928,8 @@ function selftest(dir) {
 
 module.exports = { makeTemplate, appendBlock, replaceBlockLine, deleteBlock, snapshotDir, verify, checkExpectation,
   lineDiff, stripAddedIdLines, samePageOutcome, assertSafePath, classify, newBaks,
-  parseGuardLine, graphRel, guardReport, conflictCopies };
+  parseGuardLine, graphRel, guardReport, conflictCopies, segmentActual, sessionSegments, keystrokeCheck,
+  typedFromSegments, countToken, splitShutdown };
 
 if (require.main === module) {
   const stop = async (sig) => {
