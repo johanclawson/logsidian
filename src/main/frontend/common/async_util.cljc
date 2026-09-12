@@ -55,11 +55,18 @@
                       (let [i @*next]
                         (vswap! *next inc)
                         (vswap! *active inc)
-                        ;; p/do turns a synchronous throw of f into a rejection
-                        (-> (p/do (f (nth items i)))
-                            (p/catch identity)
-                            (p/then (fn [v]
-                                      (vswap! *results assoc i v)
+                        ;; A synchronous throw of f becomes a rejection here,
+                        ;; explicitly: relying on p/do for that left the throw
+                        ;; unhandled (seen with nbb's promesa), the bookkeeping
+                        ;; below never ran and the whole call never settled.
+                        ;; The error is stored inside the catch handler, which
+                        ;; returns nil, for the same reason: an error returned
+                        ;; from a handler is coerced back into a rejection.
+                        (-> (try (p/promise (f (nth items i)))
+                                 (catch :default e (p/rejected e)))
+                            (p/then (fn [v] (vswap! *results assoc i v) nil))
+                            (p/catch (fn [e] (vswap! *results assoc i e) nil))
+                            (p/then (fn [_]
                                       (vswap! *active dec)
                                       (if (and (= @*next total) (zero? @*active))
                                         (done @*results)
