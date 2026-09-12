@@ -134,7 +134,9 @@
   ;; app believes is on disk, or {:absent true} for a file that must not exist.
   ;; It returns {:result "written"|"mismatch"|"exists"|"io-error" ...}, never
   ;; writes on a refusal and neither backs up nor notifies: the renderer
-  ;; handles every result.
+  ;; handles every result. It replaces a file by renaming a temporary
+  ;; sibling over it; the chmod below makes a read-only destination writable
+  ;; first, as the legacy write does, and the new file gets its mode.
   (let [^js Buf (.-Buffer buffer)
         ^js content (if (instance? js/ArrayBuffer content)
                       (.from Buf content)
