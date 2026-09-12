@@ -13,6 +13,10 @@
 //           and per thread-api calls when the build has them)
 //   LSUI    long tasks (>= 100 ms) on the renderer main thread, via PerformanceObserver
 // "Quiet" means neither thread has reported anything for the given time.
+//
+// LSBENCH_CPUPROF=1 also records a V8 CPU profile of the app window's main
+// thread from boot to LSBENCH_CPUPROF_SEC (default 25) s -> <outDir>/boot.cpuprofile
+// (open in DevTools > Performance, or summarise with cpuprof-top.js).
 const { _electron: electron } = require('/home/johan/dev/logsidian/node_modules/playwright');
 const fs = require('fs');
 const path = require('path');
@@ -123,15 +127,146 @@ async function observeUi(page) {
   }).catch(() => {});
 }
 
+// ---- LSBENCH_CPUPROF: name the ~5 s boot long task ----------------------------
+// The task starts ~5.5 s after the renderer's time origin, before the db worker
+// opens the graph, and a smaller bundle does not shorten it, so it is work done
+// at boot. LSUI can only say that it happened; a sampling profile of the
+// renderer main thread says what ran.
+//
+// Attach timing: every window is profiled from the moment Playwright reports
+// it. Playwright's Electron loader holds back the app's 'ready' event until it
+// has connected, so the main window (created on 'ready' by window.cljs
+// create-main-window!, which calls loadURL straight away) arrives as a new target
+// that Playwright pauses, initialises and resumes before it emits 'window'.
+// Profiler.start therefore lands a few ms to ~100 ms after the document starts,
+// possibly before index.html even commits (the profile then starts before the
+// time origin: start_origin_ms < 0). A task at ~5.5 s is covered either way; the
+// numbers recorded below say by how much. The splash window is profiled too but
+// closes during boot, which discards its profile.
+const CPUPROF = !!process.env.LSBENCH_CPUPROF;
+const CPUPROF_SEC = Number(process.env.LSBENCH_CPUPROF_SEC) || 25;
+const cpuprof = { sec: CPUPROF_SEC, interval_us: 500, windows: [] }; // becomes result.cpuprof
+const profs = []; // { page, info, session, ready, closed }
+let appPage = null; // the window that renders the app, once the harness has found it
+let profStopped = null;
+const errText = (e) => String((e && e.message) || e);
+// a CDP call can wait on a busy (or wedged) main thread; never let it hang the run
+const within = (p, ms, what) => Promise.race([p, new Promise((_, rej) =>
+  setTimeout(() => rej(new Error(`${what}: no answer in ${ms} ms`)), ms).unref())]);
+
+function profStart(w) {
+  if (profs.some((p) => p.page === w)) return;
+  const info = { window: profs.length, url: w.url() };
+  const p = { page: w, info };
+  profs.push(p);
+  cpuprof.windows.push(info);
+  w.once('close', () => { p.closed = true; });
+  p.ready = (async () => {
+    try {
+      p.session = await w.context().newCDPSession(w);
+      await p.session.send('Profiler.enable');
+      await p.session.send('Profiler.setSamplingInterval', { interval: cpuprof.interval_us });
+      await p.session.send('Profiler.start');
+      info.start_wall_ms = wall();
+    } catch (e) { info.error = errText(e); return; }
+    // The page's own reading of the start, in ms after its time origin. Only an
+    // upper bound: the evaluate runs when the main thread is next free (late if
+    // a long task is already running), and it reads whatever document is loaded
+    // then, perhaps the blank one before index.html (see href/origin). The
+    // clock mapping at stop time is the exact figure.
+    for (let i = 0; i < 3 && !(info.start_eval && info.start_eval.now != null); i++) {
+      try {
+        info.start_eval = await within(w.evaluate(() =>
+          ({ now: Math.round(performance.now()), origin: performance.timeOrigin, href: location.href.slice(0, 120) })),
+        30000, 'start evaluate');
+        info.start_eval.wall_ms = wall();
+      } catch (e) { info.start_eval = { error: errText(e) }; await sleep(200); } // navigated meanwhile
+    }
+  })();
+}
+
+// Where the page's time origin sits on the profile's clock. Profile timestamps
+// (µs), the page's performance.now() and Node's process.hrtime all read
+// CLOCK_MONOTONIC on Linux, so one evaluate bracketed by two hrtime reads pins
+// the origin to within half its round trip. Best of 5.
+async function originOnProfileClock(page) {
+  let best = null;
+  for (let i = 0; i < 5; i++) {
+    const a = process.hrtime.bigint();
+    const now = await within(page.evaluate(() => performance.now()), 30000, 'clock evaluate');
+    const b = process.hrtime.bigint();
+    const rtt = Number(b - a) / 1e6;
+    if (!best || rtt < best.rtt_ms) best = { rtt_ms: +rtt.toFixed(2), origin_us: Number((a + b) / 2n) / 1000 - now * 1000 };
+  }
+  return best;
+}
+
+// Stops every profile once (timer or end of run, whichever comes first) and
+// writes the app window's as boot.cpuprofile. Never throws: failures land in
+// cpuprof.error / windows[i].error.
+function profStop(why) {
+  profStopped = profStopped || (async () => {
+    try {
+      Object.assign(cpuprof, { stop_reason: why, stop_wall_ms: wall() });
+      const got = [];
+      for (const p of profs) {
+        await p.ready;
+        if (!p.session || p.info.error) continue;
+        if (p.closed) { p.info.closed = true; continue; }
+        try {
+          // map the clock before stopping: if the page is busy the evaluate
+          // waits, and the profile keeps sampling meanwhile
+          const clock = await originOnProfileClock(p.page).catch((e) => ({ error: errText(e) }));
+          const { profile } = await within(p.session.send('Profiler.stop'), 60000, 'Profiler.stop');
+          const i = p.info;
+          Object.assign(i, { samples: profile.samples.length, duration_ms: Math.round((profile.endTime - profile.startTime) / 1000) });
+          if (clock.error) i.clock_error = clock.error;
+          else Object.assign(i, { clock_rtt_ms: clock.rtt_ms,
+            start_origin_ms: Math.round((profile.startTime - clock.origin_us) / 1000),
+            end_origin_ms: Math.round((profile.endTime - clock.origin_us) / 1000) });
+          got.push({ p, profile });
+        } catch (e) { if (p.closed) p.info.closed = true; else p.info.error = errText(e); }
+        p.session.detach().catch(() => {});
+      }
+      // before the harness has found the app window (timer fired very early),
+      // the biggest profile is the best guess
+      const main = appPage ? got.find((g) => g.p.page === appPage)
+        : got.sort((a, b) => b.profile.samples.length - a.profile.samples.length)[0];
+      for (const g of got) {
+        g.p.info.file = g === main ? 'boot.cpuprofile' : `boot-w${g.p.info.window}.cpuprofile`;
+        fs.writeFileSync(path.join(outDir, g.p.info.file), JSON.stringify(g.profile));
+      }
+      if (main) {
+        const { start_wall_ms, start_origin_ms, end_origin_ms, clock_error } = main.p.info;
+        Object.assign(cpuprof, { file: 'boot.cpuprofile', app_window: main.p.page === appPage,
+          start_wall_ms, start_origin_ms, end_origin_ms, ...(clock_error ? { clock_error } : {}) });
+      } else {
+        const own = profs.find((p) => p.page === appPage);
+        cpuprof.error = `no profile of the app window${own && own.info.error ? `: ${own.info.error}` : ''}`;
+      }
+    } catch (e) { cpuprof.error = errText(e); }
+  })();
+  return profStopped;
+}
+
 (async () => {
   const app = await electron.launch({
     executablePath: APP,
     // the tool shell has no X/Wayland session; Chromium's headless ozone
     // platform renders offscreen and still supports screenshots
-    args: ['--no-sandbox', '--ozone-platform=headless', `--user-data-dir=${profile}/chromium`],
+    args: ['--no-sandbox', '--ozone-platform=headless', `--user-data-dir=${profile}/chromium`,
+      // the GC experiment calls gc() inside the db worker
+      ...(process.env.LSBENCH_GCTEST ? ['--js-flags=--expose-gc'] : [])],
     env: { ...process.env, HOME: `${profile}/home`, ELECTRON_ENABLE_LOGGING: '1' },
     timeout: 120000,
   });
+  if (CPUPROF) {
+    // first thing after launch, before any await, so no window slips past
+    app.on('window', profStart);
+    for (const w of app.windows()) profStart(w);
+    // measured from t0 (just before launch), the zero of every *_wall_ms figure
+    setTimeout(() => profStop(`${CPUPROF_SEC} s timer`), Math.max(0, CPUPROF_SEC * 1000 - wall())).unref();
+  }
   app.on('window', attach);
   for (const w of app.windows()) attach(w);
   if (graph) {
@@ -149,8 +284,10 @@ async function observeUi(page) {
     if (!page) await sleep(500);
   }
   page = page || (await app.firstWindow());
+  if (CPUPROF) { appPage = page; profStart(page); } // no-op unless its 'window' event was missed
   await observeUi(page);
   const result = { mode, graph, launched_ms: wall() };
+  if (CPUPROF) result.cpuprof = cpuprof; // shared object: the partial checkpoints show progress
   // checkpoint every 2 s: a run stopped from outside keeps its records
   setInterval(() => fs.writeFileSync(path.join(outDir, `${mode}.partial.json`),
     JSON.stringify({ ...result, partial_ms: wall(), records }, null, 1)), 2000).unref();
@@ -246,6 +383,44 @@ async function observeUi(page) {
         c.scrollTop = 0;
       });
       await sleep(1000);
+    }
+
+    // Optional: does a GC in the db worker throw away restored index nodes?
+    // (persistent-sorted-set holds restored nodes through js/WeakRef only.)
+    // Same search cold, warm, then gc() in the worker across a task boundary,
+    // then the same search again; restores per window. Needs the app started
+    // with --js-flags=--expose-gc (set below when LSBENCH_GCTEST is on).
+    if (process.env.LSBENCH_GCTEST) {
+      const q = process.env.LSBENCH_GCTEST_QUERY || 'möte';
+      const one = async (label) => {
+        await page.keyboard.press('Escape');
+        await page.keyboard.press('Control+k');
+        const input = await page.waitForSelector('input.cp__cmdk-search-input', { timeout: 10000 }).catch(() => null);
+        if (!input) return { label, error: 'no search input' };
+        const start = wall();
+        await input.fill(q);
+        await sleep(1500);
+        const end = Date.now() + 60000;
+        while (Date.now() < end && Date.now() - lastActivity < 3000) await sleep(250);
+        const stop = wall();
+        await page.keyboard.press('Escape');
+        await sleep(500);
+        const win = records.filter((r) => overlaps(r, start, stop));
+        return { label, start, stop,
+          restores: win.filter((r) => r.phase).reduce((a, r) => a + (r.restores || 0), 0),
+          restore_ms: Math.round(win.filter((r) => r.phase).reduce((a, r) => a + (r['restore-ms'] || 0), 0)),
+          apis: win.filter((r) => r.api).map((r) => `${r.api.replace('thread-api/', '')} ${r['sync-ms']}/${r['total-ms']}ms`) };
+      };
+      result.gctest = [];
+      result.gctest.push(await one('cold'));
+      result.gctest.push(await one('warm'));
+      const workers = page.workers();
+      const gcRan = [];
+      for (const w of workers) gcRan.push(await w.evaluate(() => { if (typeof gc === 'function') { gc(); return true; } return false; }).catch((e) => String(e)));
+      await sleep(1500); // let the worker reach later tasks before the next search
+      result.gctest.push({ label: 'gc', workers: workers.length, gc_ran: gcRan });
+      result.gctest.push(await one('after-gc'));
+      result.gctest.push(await one('warm-again'));
     }
 
     // Optional: type into the first block of today's journal (graph COPY) and
@@ -378,6 +553,21 @@ async function observeUi(page) {
     result.done_ms = wall();
   }
 
+  if (CPUPROF) {
+    try {
+      await profStop('end of run');
+      // The long LSUI tasks as windows for cpuprof-top.js (ms after profile
+      // start); LSUI starts are relative to the same time origin as start_origin_ms.
+      // covered = the profile spans the whole task.
+      if (cpuprof.start_origin_ms != null) {
+        cpuprof.longtasks = records.filter((r) => r.event === 'ui' && r.dur >= 1000).map((r) => ({
+          start: r.start, dur: r.dur,
+          prof_from_ms: r.start - cpuprof.start_origin_ms, prof_to_ms: r.start + r.dur - cpuprof.start_origin_ms,
+          covered: r.start >= cpuprof.start_origin_ms && r.start + r.dur <= cpuprof.end_origin_ms }));
+      }
+      if (cpuprof.error) result.cpuprof_error = cpuprof.error;
+    } catch (e) { result.cpuprof_error = errText(e); }
+  }
   result.records = records;
   fs.writeFileSync(path.join(outDir, `${mode}.json`), JSON.stringify(result, null, 1));
   const worker = records.filter((r) => r.event === 'phase' || r.api);
@@ -386,6 +576,8 @@ async function observeUi(page) {
     clicked: result.clicked, quiet: result.quiet, records: records.length,
     worker_max_ms: Math.max(0, ...worker.map(lag)),
     ui_max_ms: Math.max(0, ...ui.map(lag)), ui_longtasks: ui.length,
-    restores: records.filter((r) => r.event === 'phase').reduce((a, p) => a + (p.restores || 0), 0) }));
+    restores: records.filter((r) => r.event === 'phase').reduce((a, p) => a + (p.restores || 0), 0),
+    ...(CPUPROF ? { cpuprof_file: cpuprof.file, cpuprof_start_origin_ms: cpuprof.start_origin_ms,
+      cpuprof_error: result.cpuprof_error } : {}) }));
   await app.close();
 })().catch((e) => { console.error('FAILED:', e && e.stack || e); process.exit(1); });
