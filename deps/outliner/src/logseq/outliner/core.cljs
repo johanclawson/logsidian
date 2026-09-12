@@ -517,21 +517,117 @@
         (mapcat #(tree-seq map? children-key %))
         (map #(dissoc % :block/children)))))
 
+(declare insert-blocks)
+
+(def ^:private save-block-placement-keys
+  "Keys of a save-block map that place the block in its page. They were read
+   together with the map's :db/id, so when that :db/id is stale they can name
+   retracted entities too."
+  [:block/parent :block/page :block/order])
+
+(defn- keep-user-edit-of-missing-block
+  "The insert-blocks result that keeps `block`, a user's edit whose block no
+   longer exists, as the last top-level block of the page it was on, with the
+   block's uuid (so the editor, which still edits that uuid, keeps working and
+   refs to the uuid resolve again). nil when that page is gone too."
+  [repo db block]
+  (let [page-ref (:block/page block)
+        page (some->> (if (or (number? page-ref) (vector? page-ref)) page-ref (:db/id page-ref))
+                      (d/entity db))]
+    (when (:block/name page)
+      (let [gone? (fn [r]
+                    (let [id (if (number? r) r (when (map? r) (:db/id r)))]
+                      (and (number? id) (nil? (d/entity db id)))))
+            kept (as-> block m
+                   (apply dissoc m :db/id :block/children :block/level save-block-placement-keys)
+                   (into {} (remove (fn [[k _]] (= "block.temp" (namespace k)))) m)
+                   (reduce (fn [m k]
+                             (if (coll? (get m k))
+                               (update m k #(vec (remove gone? %)))
+                               m))
+                           m
+                           [:block/refs :block/path-refs :block/tags]))]
+        (insert-blocks repo db [kept] page {:sibling? false
+                                            :bottom? true
+                                            :keep-uuid? true
+                                            :outliner-op :insert-blocks})))))
+
+(defn- save-missing-block
+  "save-block of a map whose block no longer exists (neither its :db/id nor its
+   :block/uuid resolve). A file graph's from-disk re-parse retracts the page's
+   blocks and gives blocks without an id:: property new uuids, so a save that
+   the UI built from its older copy of the db can name a block that is gone.
+   A user's edit (opts :user-edit?) is kept in a file graph, see
+   keep-user-edit-of-missing-block; when that isn't possible it throws a
+   :notification that names the text, so the loss is never silent. Any other
+   save (e.g. the id:: repair of watcher-handler/set-missing-block-ids!) is
+   skipped with a warning: its content is the old db copy of a block that the
+   re-parse has replaced."
+  [repo db block opts]
+  (let [block-uuid (:block/uuid block)
+        title (:block/title block)
+        user-edit? (and (:user-edit? opts) (string? title))
+        kept (when (and user-edit? block-uuid (not (sqlite-util/db-based-graph? repo)))
+               (keep-user-edit-of-missing-block repo db block))]
+    (cond
+      kept
+      (do
+        (js/console.warn "save-block: the block was gone, the edit is kept as a new block with its uuid"
+                         (str block-uuid))
+        kept)
+
+      user-edit?
+      (let [message (str "Your edit could not be saved, its block no longer exists"
+                         " (was its file changed on disk?). The text was: "
+                         (common-util/safe-subs title 0 500))]
+        (js/console.error "save-block: the block is gone, the edit is lost" (str block-uuid) title)
+        (throw (ex-info message
+                        {:type :notification
+                         :payload {:type :error
+                                   :message message
+                                   :clear? false
+                                   :block/uuid block-uuid}})))
+
+      :else
+      (js/console.warn "save-block: skipped, the block no longer exists"
+                       (str (or block-uuid (:db/id block)))))))
+
 (defn ^:api save-block
-  "Save the `block`."
+  "Save the `block`: an entity, or a map naming its block by :db/id and/or
+   :block/uuid.
+   A map's :db/id is used when it is still the block with the map's
+   :block/uuid, else the block is looked up by :block/uuid (the UI builds a
+   save from its copy of the db, which can trail the worker's; a stale :db/id
+   then names a retracted entity). In that case the map's placement keys are
+   left out and the resolved :db/id is used. When the block is gone either way,
+   see save-missing-block. Before, such a map reached otree/-save as a plain
+   map (the asserts are elided in release builds and (merge nil block) is the
+   map) and failed with 'No protocol method INode.-save'."
   [repo db date-formatter block opts]
   {:pre [(map? block)]}
-  (let [*txs-state (atom [])
-        block' (if (de/entity? block)
-                 block
-                 (do
-                   (assert (or (:db/id block) (:block/uuid block)) "save-block db/id not exists")
-                   (when-let [eid (or (:db/id block) (when-let [id (:block/uuid block)] [:block/uuid id]))]
-                     (let [ent (d/entity db eid)]
-                       (assert (some? ent) "save-block entity not exists")
-                       (merge ent block)))))]
-    (otree/-save block' *txs-state db repo date-formatter opts)
-    {:tx-data @*txs-state}))
+  (if (de/entity? block)
+    (let [*txs-state (atom [])]
+      (otree/-save block *txs-state db repo date-formatter opts)
+      {:tx-data @*txs-state})
+    (do
+      (assert (or (:db/id block) (:block/uuid block)) "save-block db/id not exists")
+      (let [block-uuid (:block/uuid block)
+            by-id (when-let [id (:db/id block)]
+                    (let [e (d/entity db id)]
+                      (when (and e (or (nil? block-uuid) (= block-uuid (:block/uuid e))))
+                        e)))
+            ent (or by-id
+                    (when block-uuid (d/entity db [:block/uuid block-uuid])))]
+        (if-not ent
+          (save-missing-block repo db block opts)
+          (let [*txs-state (atom [])
+                block' (if (or by-id (nil? (:db/id block)))
+                         (merge ent block)
+                         ;; the map's :db/id is stale, the uuid resolved
+                         (merge ent (-> (apply dissoc block save-block-placement-keys)
+                                        (assoc :db/id (:db/id ent)))))]
+            (otree/-save block' *txs-state db repo date-formatter opts)
+            {:tx-data @*txs-state}))))))
 
 (defn- get-right-siblings
   "Get `node`'s right siblings."

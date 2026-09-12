@@ -274,7 +274,10 @@
         opts' (assoc opts :outliner-op :save-block)]
     (ui-outliner-tx/transact!
      opts'
-     (outliner-save-block! block'))))
+     ;; :user-edit? tells the worker this is the user's text: if its block is
+     ;; gone by the time the save runs (a from-disk re-parse replaced it), the
+     ;; text is kept instead of dropped (logseq.outliner.core/save-missing-block)
+     (outliner-save-block! block' {:user-edit? true}))))
 
 ;; id: block dom id, "ls-block-counter-uuid"
 (defn- another-block-with-same-id-exists?

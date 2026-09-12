@@ -570,6 +570,131 @@ tags:: tag1, tag2
       (is (not (contains? updated-pages "blarg"))
           "Deleted, orphaned page no longer exists"))))
 
+;;; save-block of a map whose :db/id or :block/uuid no longer resolve. In a
+;;; release build (asserts elided) such a map reached otree/-save as a plain map:
+;;; "No protocol method INode.-save defined for type object".
+
+(defn- save-block-with-opts!
+  [block opts]
+  (outliner-tx/transact! (transact-opts)
+                         (outliner-core/save-block! test-db (db/get-db test-db false)
+                                                    (state/get-date-formatter)
+                                                    block
+                                                    opts)))
+
+(defn- pull-block-by-title
+  [conn title]
+  (ffirst (d/q '[:find (pull ?b [*]) :in $ ?title :where [?b :block/title ?title]] @conn title)))
+
+(defn- reparse-block!
+  "Does to `block` (pulled) what a from-disk re-parse of its file does to a
+   block without an id:: property: retracts it and creates it anew, with a new
+   :db/id and a new uuid."
+  [conn block]
+  (d/transact! conn [[:db.fn/retractEntity (:db/id block)]])
+  (d/transact! conn [(-> block (dissoc :db/id) (assoc :block/uuid (random-uuid)))]))
+
+(defn- id-repair-map
+  "The map watcher-handler/set-missing-block-ids! saves through
+   file-property-handler/batch-set-block-property-aux!: no :db/id."
+  [title block-uuid]
+  {:block/uuid block-uuid
+   :block/properties {:id (str block-uuid)}
+   :block/properties-order [:id]
+   :block/properties-text-values {:id (str block-uuid)}
+   :block/title (str title "\nid:: " block-uuid)})
+
+(deftest save-block-map-without-db-id-test
+  (load-test-files [{:file/path "pages/idless.md"
+                     :file/content "- block without id\n- second block"}])
+  (testing "a map without :db/id saves to the block with its :block/uuid"
+    (let [conn (db/get-db test-db false)
+          {db-id :db/id block-uuid :block/uuid} (pull-block-by-title conn "block without id")
+          m (id-repair-map "block without id" block-uuid)]
+      (save-block-with-opts! m {:retract-attributes? false})
+      (let [e (d/entity @conn [:block/uuid block-uuid])]
+        (is (= db-id (:db/id e)))
+        (is (= (:block/title m) (:block/title e))))))
+
+  (testing "the id:: repair of a block that a re-parse replaced is skipped"
+    (let [conn (db/get-db test-db false)
+          block (pull-block-by-title conn "second block")
+          gone-uuid (:block/uuid block)
+          _ (reparse-block! conn block)
+          blocks-before (get-blocks-count)]
+      (save-block-with-opts! (id-repair-map "second block" gone-uuid) {:retract-attributes? false})
+      (is (nil? (d/entity @conn [:block/uuid gone-uuid])) "the gone block is not recreated")
+      (is (= blocks-before (get-blocks-count)))
+      (is (some? (pull-block-by-title conn "second block")) "the re-parsed block is untouched"))))
+
+(deftest save-block-stale-db-id-test
+  (load-test-files [{:file/path "pages/stale.md"
+                     :file/content "- stale target\n- other"}])
+  (testing "a stale :db/id: the block is resolved by uuid, the map's placement is not written"
+    (let [conn (db/get-db test-db false)
+          block (pull-block-by-title conn "stale target")
+          page-id (:db/id (:block/page block))
+          _ (d/transact! conn [[:db.fn/retractEntity (:db/id block)]])
+          _ (d/transact! conn [(dissoc block :db/id)])
+          recreated-id (:db/id (d/entity @conn [:block/uuid (:block/uuid block)]))
+          _ (assert (not= (:db/id block) recreated-id))]
+      (save-block-with-opts! (assoc block
+                                    :block/title "stale target typed"
+                                    :block/parent {:db/id 99999999})
+                             {:user-edit? true})
+      (let [e (d/entity @conn [:block/uuid (:block/uuid block)])]
+        (is (= recreated-id (:db/id e)))
+        (is (= "stale target typed" (:block/title e)))
+        (is (= page-id (:db/id (:block/parent e))))
+        (is (nil? (pull-block-by-title conn "stale target")))))))
+
+(deftest save-block-user-edit-after-reparse-test
+  (load-test-files [{:file/path "pages/race.md"
+                     :file/content "- block one\n- block two"}])
+  (let [conn (db/get-db test-db false)
+        stale (pull-block-by-title conn "block one")
+        block-uuid (:block/uuid stale)
+        page-id (:db/id (:block/page stale))
+        _ (reparse-block! conn stale)]
+    (testing "a save that is not the user's text is skipped"
+      (save-block-with-opts! (assoc stale :block/title "block one repaired") {})
+      (is (nil? (d/entity @conn [:block/uuid block-uuid])))
+      (is (nil? (pull-block-by-title conn "block one repaired"))))
+
+    (testing "the user's typed text is kept, with its uuid, as the page's last block"
+      ;; the shape of the failing save: the editor's map with the stale :db/id
+      (save-block-with-opts! (assoc stale
+                                    :block/title "block one typed"
+                                    :block.temp/ast-title [["Plain" "block one"]]
+                                    :block.temp/load-status :full)
+                             {:user-edit? true})
+      (let [kept (d/entity @conn [:block/uuid block-uuid])
+            last-block (last (ldb/sort-by-order (:block/_parent (d/entity @conn page-id))))]
+        (is (= "block one typed" (:block/title kept)))
+        (is (= page-id (:db/id (:block/page kept))))
+        (is (= page-id (:db/id (:block/parent kept))))
+        (is (= (:db/id kept) (:db/id last-block)))
+        (is (nil? (:block.temp/ast-title kept)))
+        (is (some? (pull-block-by-title conn "block one")) "the re-parsed block is still there")
+        (is (some? (pull-block-by-title conn "block two")))))))
+
+(deftest save-block-user-edit-of-deleted-page-test
+  (load-test-files [{:file/path "pages/gone.md"
+                     :file/content "- doomed block"}])
+  (testing "a user's edit that cannot be kept is not dropped silently"
+    (let [conn (db/get-db test-db false)
+          stale (pull-block-by-title conn "doomed block")
+          _ (d/transact! conn [[:db.fn/retractEntity (:db/id stale)]
+                               [:db.fn/retractEntity (:db/id (:block/page stale))]])
+          error (try
+                  (save-block-with-opts! (assoc stale :block/title "doomed block typed")
+                                         {:user-edit? true})
+                  nil
+                  (catch :default e e))]
+      (is (= :notification (:type (ex-data error))))
+      (is (re-find #"doomed block typed" (get-in (ex-data error) [:payload :message])))
+      (is (nil? (pull-block-by-title conn "doomed block typed"))))))
+
 ;;; Fuzzy tests
 
 (def init-id (atom 100))
