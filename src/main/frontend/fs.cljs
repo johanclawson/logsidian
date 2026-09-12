@@ -85,7 +85,12 @@
       (protocol/rmdir! fs dir))))
 
 (defn write-plain-text-file!
-  "Use it only for plain-text files, not binary"
+  "Use it only for plain-text files, not binary.
+   Resolves to what the backend's write resolved to: for a guarded write
+   (frontend.fs.node/guard-expected) a result whose \"result\" is \"written\",
+   \"mismatch\", \"exists\" or \"io-error\"; for other writes nil or the
+   backend's value. A guarded write that fails before the backend reports
+   resolves to an \"io-error\" result, so no caller takes it for written."
   [repo dir rpath content opts]
   (when content
     (let [path (common-util/path-normalize rpath)
@@ -100,14 +105,16 @@
                                                                           :fs (type fs-record)
                                                                           :user-agent (when js/navigator js/navigator.userAgent)
                                                                           :content-length (count content)}}])))
-               _ (protocol/write-file! fs-record repo dir path content opts)])
+               result (protocol/write-file! fs-record repo dir path content opts)]
+         result)
        (p/catch (fn [error]
                   (log/error :file/write-failed {:dir dir
                                                  :path path
                                                  :error error})
                   ;; Disable this temporarily
                   ;; (js/alert "Current file can't be saved! Please copy its content to your local file system and click the refresh button.")
-                  ))))))
+                  (when (node/guard-expected opts)
+                    #js {:result "io-error" :error (str error)})))))))
 
 ;; read-file should return string on all platforms
 (defn read-file

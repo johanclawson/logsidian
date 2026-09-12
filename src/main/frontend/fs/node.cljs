@@ -121,13 +121,22 @@
               ("mismatch" "exists")
               (<handle-refused-write! repo dir rpath content result)
 
+              ;; io-error, or an unexpected result: the disk was not changed
+              ;; (electron.write-guard). Resolves to a result whose outcome
+              ;; is "io-error", so callers (alter-file) can tell.
               (let [message (str "Write to the file " file-fpath " failed: "
                                  (or (when (object? result) (gobj/get result "error"))
-                                     (str "unexpected result " (pr-str outcome))))]
+                                     (str "unexpected result " (pr-str outcome))))
+                    error (ex-info message {:path file-fpath :result outcome})]
                 (state/pub-event! [:notification/show {:content message
                                                        :status :error
                                                        :clear? false}])
-                (throw (ex-info message {:path file-fpath :result outcome})))))
+                (if error-handler
+                  (error-handler error)
+                  (log/error :write-file-failed error))
+                (if (= "io-error" outcome)
+                  result
+                  #js {:result "io-error" :error message}))))
           (p/catch (fn [error]
                      (if error-handler
                        (error-handler error)

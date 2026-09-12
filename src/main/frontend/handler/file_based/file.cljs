@@ -15,6 +15,7 @@
             [frontend.state :as state]
             [frontend.util :as util]
             [frontend.worker.file.reset :as file-reset]
+            [goog.object :as gobj]
             [lambdaisland.glogi :as log]
             [logseq.common.config :as common-config]
             [logseq.common.path :as path]
@@ -139,6 +140,22 @@
                                            :payload {:type :write-file/failed-for-alter-file}}]))))))
     (log/error :msg "alter-global-file does not support this file" :file path)))
 
+(defn apply-written-content?
+  "Whether alter-file applies the content beyond the db once written, i.e.
+   restores the repo config from it or reloads it as the custom CSS.
+   - from-disk?: the content came from disk, nothing was written: applies.
+     This is also how a refused write's reparse (fs.node) applies the disk's
+     content instead of the refused one.
+   - a guarded write (fs.node) resolves to a result with an outcome: applies
+     only on \"written\"; not on \"mismatch\"/\"exists\" (refused, the reparse
+     follows) or \"io-error\" (the disk was not changed).
+   - a write reporting no outcome (skip-compare?, the browser backends):
+     applies, as before the guard."
+  [from-disk? write-result]
+  (or (boolean from-disk?)
+      (let [outcome (when (some? write-result) (gobj/get write-result "result"))]
+        (or (nil? outcome) (= "written" outcome)))))
+
 (defn alter-file
   "Write any in-DB file, e.g. repo config, page, whiteboard, etc."
   [repo path content {:keys [reset? re-render-root? from-disk? skip-compare? new-graph? verbose
@@ -174,20 +191,24 @@
                                                          ;; To avoid skipping the `:or` bounds for keyword destructuring
                                                         (when (some? verbose) {:verbose verbose}))))
                              (db/set-file-content! repo path content opts))
-                    _ (when-not from-disk?
-                        (write-file-aux! repo path content original-content {:skip-compare? skip-compare?}))]
+                    write-result (when-not from-disk?
+                                   (write-file-aux! repo path content original-content {:skip-compare? skip-compare?}))]
               (when re-render-root? (ui-handler/re-render-root!))
 
-              (cond
-                (= path "logseq/custom.css")
-                (do
-                  ;; ui-handler will load css from db and config
-                  (db/set-file-content! repo path content)
-                  (ui-handler/add-style-if-exists!))
+              (if (apply-written-content? from-disk? write-result)
+                (cond
+                  (= path "logseq/custom.css")
+                  (do
+                    ;; ui-handler will load css from db and config
+                    (db/set-file-content! repo path content)
+                    (ui-handler/add-style-if-exists!))
 
-                (= path "logseq/config.edn")
-                (p/let [_ (repo-config-handler/restore-repo-config! repo content)]
-                  (state/pub-event! [:shortcut/refresh])))
+                  (= path "logseq/config.edn")
+                  (p/let [_ (repo-config-handler/restore-repo-config! repo content)]
+                    (state/pub-event! [:shortcut/refresh])))
+                (log/warn :alter-file/not-applied
+                          {:path path
+                           :result (gobj/get write-result "result")}))
 
               result)
             (p/catch
