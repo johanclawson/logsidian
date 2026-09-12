@@ -79,12 +79,42 @@ if (errs.length) {
   console.log(`\n-- errors (${errs.length})`);
   errs.slice(0, 10).forEach((x) => console.log(`  @${x.wall} ${x.event === 'err' ? `renderer ${x.kind}` : `${x.thread} ${x.api} [${x.stage}]`}: ${(x.msg || '').split('\n')[0].slice(0, 200)}`));
 }
+// per save: worker time split into store / search sync / restores (apply-ops)
+const ops = recs.filter((x) => x.event === 'apply-ops');
+if (ops.length) {
+  console.log(`\n-- apply-outliner-ops (${ops.length})`);
+  ops.slice(0, 12).forEach((x) => console.log(`  @${x.wall} ${String(x.op).padEnd(12)} total ${String(x['total-ms']).padStart(4)}  store ${String(x['store-ms']).padStart(3)} (${x['store-calls']})  search ${String(x['search-ms']).padStart(3)} (${x['search-rows']} rows)  restores ${x['restore-ms']} ms (${x.restores})`));
+}
+
+// reopen reconcile (UI side, one line per run)
+recs.filter((x) => x.event === 'reconcile').forEach((x) => {
+  const { wall, event, ...rest } = x;
+  console.log(`\n-- reconcile @${wall}\n  ${JSON.stringify(rest)}`);
+});
+
+// numeric fields of rate-limited lines: count, sum and max per field
+const aggregate = (lines) => {
+  const out = {};
+  for (const x of lines) for (const [k, v] of Object.entries(x)) {
+    if (typeof v !== 'number' || k === 'wall') continue;
+    const a = out[k] || (out[k] = { sum: 0, max: -Infinity });
+    a.sum += v; a.max = Math.max(a.max, v);
+  }
+  return Object.entries(out).map(([k, a]) => `${k} sum ${Math.round(a.sum)} max ${Math.round(a.max)}`).join(', ');
+};
+
 const steps = recs.filter((x) => x.event === 'search');
 if (steps.length) {
   console.log('\n-- search rebuild steps');
-  // progress and slow-slice lines can number in the hundreds: summarize them
-  steps.filter((x) => x.step !== 'progress' && x.step !== 'slow-slice')
+  // progress, slow-slice, slow-sync and maint lines can number in the
+  // hundreds: summarize them
+  const many = new Set(['progress', 'slow-slice', 'slow-sync', 'maint']);
+  steps.filter((x) => !many.has(x.step))
     .forEach((x) => { const { wall, event, step, ...rest } = x; console.log(`  @${wall} ${step} ${JSON.stringify(rest)}`); });
+  for (const s of ['slow-sync', 'maint']) {
+    const l = steps.filter((x) => x.step === s);
+    if (l.length) console.log(`  ${s}: ${l.length} lines; ${aggregate(l)}`);
+  }
   const prog = steps.filter((x) => x.step === 'progress');
   if (prog.length) {
     const last = prog[prog.length - 1];

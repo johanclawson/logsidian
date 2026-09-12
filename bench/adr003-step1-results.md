@@ -86,7 +86,9 @@ worker in pieces afterwards, so its sync time says nothing.
 origin, before the worker even opened the db. So it is startup, and it is **graph-independent**: a fresh profile
 with only the demo graph shows the same task, 5125 ms starting at 5.5 s.
 `main.js` is **35 MB**; parsing and evaluating it is the likely cause
-(hypothesis — a CPU profile would confirm; outside step 1). A fixed ~5 s
+(hypothesis — a CPU profile would confirm; outside step 1). *Refuted
+2026-09-12: a 9 MB no-debug build still freezes ~5 s, see "UI boot freeze:
+not the `--debug` build".* A fixed ~5 s
 frozen UI on every start still counts against "never choke". After initial-data the UI thread never blocked longer than
 572 ms (coincides with the 562 ms `get-view-data`).
 
@@ -354,6 +356,92 @@ checkpoints are not keeping it in check, consistent with Codex's leading
 theory for the commit spikes (WAL auto-checkpoint in the committing
 transaction; SAH-pool `xSync` flushes on every checkpoint).
 
+### After the FTS fix (`~/.cache/lsbench/fts/`, build c176b50, 2026-09-12)
+
+**Migration works.** On reopen, an index without a schema row and with the old
+triggers opens with reason `"schema"`, then truncates and walks. The next
+reopen trusts the result (schema 2, triggers current), and search hits.
+
+| | rows | walk | slices | max / p99 slice | slices > 100 ms |
+|---|---|---|---|---|---|
+| g-real | 4 673 | 13.7 s | 369 | 390 / 234 ms | 11 |
+| g-10k | 69 938 | 254 s | 5 836 | 757 / 269 ms | 266 |
+
+The walk's commit spikes are unchanged: median slow slice 164 ms, of which
+index is 7 ms and commit 156 ms, for 14 rows. A rebuild only inserts, so the
+rowid fix cannot help it; this is step 4's target.
+
+**Typing.** The worker time of a `save-block`, from the new `apply-ops` LSPERF
+line; restores are given as ms (count). Each save is followed by two small
+`transact` calls of 16–35 ms each, mostly store (6–17 ms).
+
+| run | save | total | store (2 commits) | search sync (1 row) | restores | rest |
+|---|---|---|---|---|---|---|
+| g-real (after migration) | 1st | 156 | 6 | 17 | 30 (65) | 103 |
+| | 2nd | 87 | 32 | 8 | 0 | 47 |
+| g-10k (after migration) | 1st | 118 | 11 | 24 | 6 (13) | 77 |
+| | 2nd | 100 | 43 | 11 | 0 | 46 |
+| g-10k (trusted) | 1st | 185 | 8 | 48 | 36 (69) | 93 |
+| | 2nd | 60 | 10 | 24 | 0 | 26 |
+
+- **The 467 ms cold first save at 10k did not come back.** It now measures
+  118–185 ms, and restores are at most 36 ms of it.
+- **The FTS scan is gone, but a one-row search sync still takes 8–48 ms.**
+  Its `slow-sync` lines put 11–41 ms of that in SQLite. A commit on the
+  NORMAL search db does not fsync, which points at FTS5 automerge work inside
+  the commit. Step 4 moves automerge out (`automerge=0` plus merge steps in a
+  tick); the measurement will show whether that was the cause.
+- **Store is 6–43 ms for the two commits** on the main db, which runs FULL
+  (step 4 switches it to NORMAL).
+- **The largest share is the rest, 26–103 ms**: the outliner and DataScript
+  pipeline. It is outside step 4.
+
+### Restored nodes do not survive GCs (`~/.cache/lsbench/gctest/10k`, 2026-09-12)
+
+The harness ran `LSBENCH_GCTEST=1` on g-10k with a reopen and the no-debug
+build, with the worker started with `--expose-gc`. It ran the same search
+("möte") four times, with a forced `gc()` in the db worker before the third.
+
+| run | restores | restore ms | search-blocks sync/total |
+|---|---|---|---|
+| cold | 1 438 | 450 | 96 / 689 ms (plus get-file-paths 334 ms, once) |
+| warm (same query ~1 s later) | 653 | 169 | 54 / 485 ms |
+| after `gc()` | 729 | 203 | 52 / 479 ms |
+| warm again | 0 | 0 | 7 / 350 ms |
+
+- **Ordinary GCs already evict about half the restored nodes.** They run
+  during the search itself: the warm run repeated the same query and still
+  restored 653 nodes.
+- **A forced full GC evicts all of them.** Only back-to-back runs with no GC
+  in between hit fully.
+- This confirms Codex's reading of persistent-sorted-set 0.1.2: restored
+  nodes are held only through `js/WeakRef`, there is no cache, and the fork's
+  `accessed` hook is a no-op.
+
+Restores are about a third of a warm search at 10k (169–203 of ~480 ms). They
+also add up to 36 ms (69 restores) to the first save after an idle period.
+**Decision: add a bounded, strongly held LRU of restored nodes.** It must be
+invalidated on store, because stores reuse node addresses. The memory it
+costs has to be measured against the 4 GB floor.
+
+### UI boot freeze: not the `--debug` build (`bench/run-boot.sh`, 2026-09-12)
+
+Three launches per build. Each used an empty profile with no graph open, so
+only the app boot was measured. The boot task is the UI long task that
+starts before 15 s.
+
+| build | main.js | db-worker.js | longest boot task | boot tasks, summed |
+|---|---|---|---|---|
+| `release --debug` (today's `cljs:release-electron`) | 35 MB | 12 MB | 4.8 / 5.9 / 6.2 s | 5.9–7.3 s |
+| `release` without `--debug` (`CLJS_DEBUG=0`) | 9 MB | 2 MB | 4.8 / 5.4 / 4.8 s | 6.1–6.7 s |
+
+Dropping `--debug` shrinks main.js about 4×, but the longest boot task only
+goes from 5.6 to 5.0 s (mean of three). **The ~5 s freeze is not script
+size.** It is work done at boot (evaluation or initialisation), and needs a
+CPU profile of that task to name it. The no-debug build is still worth
+having for its size, but it is not the boot fix. That corrects the
+"likely cause" noted under *Named stalls* and in the investigations list.
+
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
 `slow-slice` split of the 258 slices over 100 ms: median 167 ms = **index 7 ms
@@ -420,7 +508,10 @@ profiles).
   `release ... --debug` (`package.json:92`): main.js 36 MB instead of ~11 MB,
   compiled as a classic script without a code cache. Proposal: drop `--debug`
   (keep source maps), then stop eager `<script defer>` loading of code-editor,
-  excalidraw and tldraw.
+  excalidraw and tldraw. *Measured 2026-09-12: without `--debug` main.js is
+  9 MB but the longest boot task is still 4.8–5.4 s (see "UI boot freeze: not
+  the `--debug` build"). The next step is a CPU profile of that task, not a
+  smaller bundle; the deferred-scripts idea is still open.*
 
 ### Step 4 designs (2026-09-12, `bench/step4-designs.json`, both "needs-changes")
 
