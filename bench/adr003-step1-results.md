@@ -442,6 +442,32 @@ CPU profile of that task to name it. The no-debug build is still worth
 having for its size, but it is not the boot fix. That corrects the
 "likely cause" noted under *Named stalls* and in the investigations list.
 
+**What the boot task does** (V8 CPU profile, `LSBENCH_CPUPROF=1`, master's
+`--debug` build, empty profile, `~/.cache/lsbench/bootprof/master`,
+summarised with `bench/cpuprof-top.js`). Profiling stretches the task to
+7.8 s; the proportions are what counts.
+
+| inside the boot task | ms | share |
+|---|---|---|
+| main.js top level | 4 110 | 54 % |
+| – shadow js requires (npm modules; tabler-icons-react ~470 self) | 820 | |
+| – `frontend.handler/start!` (global shortcut commands 324) | 460 | |
+| – tongue `build-dicts` (i18n dictionaries at load) | 395 | |
+| – malli validators and closed schemas built at load | 510 | |
+| – `cljs.cache` seeding | 177 | |
+| code-editor.js module load | 1 960 | 26 % |
+| – **instaparse grammar parsed at runtime** (`frontend.extensions.calc`) | 1 870 | |
+| GC | 530 | 7 % |
+
+The largest single item is the calculator block's grammar. `defparser`
+precompiles a grammar at macro time only when it gets a string literal.
+`(rc/inline "grammar/calc.bnf")` is a form, so instaparse falls back to
+parsing the grammar at runtime, on every boot, in a module that is loaded
+eagerly. Making it a literal at macro time should remove about 1.9 s
+(profiled) from every start. The i18n dictionaries and the load-time malli
+schemas are the next candidates (about 0.9 s). The fixes are in progress on
+branch `perf/boot-lazy`.
+
 ### Search rebuild: where the slice budget goes (`now/reindex-10k`)
 
 `slow-slice` split of the 258 slices over 100 ms: median 167 ms = **index 7 ms
