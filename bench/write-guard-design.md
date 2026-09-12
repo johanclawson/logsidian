@@ -375,3 +375,96 @@ The commit does **not** meet the stated content-preservation bar. These include 
 **No LOW findings.** I found no additional concrete arity, unresolved-symbol, or missing-require defect in the added functions.
 
 The new test’s equality assertions are meaningful: an always-run or always-defer planner would fail them. However, it explicitly endorses running unknown-path repairs on clean runs and does not exercise any filesystem, watcher, retry, or overlap protection above. Static inspection found no demonstrated Node-loading blocker; existing Node tests already import much of this handler’s dependency tree, including editor and global-config handlers. Actual loading remains unverified under the no-build/no-test constraint.
+
+---
+
+# Review of the guard MVP (Codex, perf/write-guard 0d99e12, 2026-09-12)
+
+Findings 2, 4, 6, 7, 8 are being fixed on perf/write-guard; 1, 3 and 5 go to
+a second arbiter decision (decision-write-guard-2.md).
+
+The branch does **not yet meet the owner’s data-preservation bar**. Findings below are from static review at HEAD `0d99e12`. No files were changed, and no builds or tests were run.
+
+Paths below use `F/ = src/main/frontend/` and `E/ = src/electron/electron/`.
+
+1. **[HIGH] The expected base remains speculative and is not bound to the proposal.**  
+   **Location:** `F/handler/file_based/file.cljs:164,274`; `F/worker/file.cljs:126,183`.
+
+   Capturing `original-content` before `alter-file` updates the DB fixes the immediate config bug. It does **not** make that value the last successfully read/written content: earlier writes still advance `:file/content` before disk success. Worker messages still contain only the proposal; `alter-files` supplies their base later.
+
+   Two writes can capture A before the renderer receives its DB update: A→B succeeds, then A→C self-refuses against B. Different outliner operations survive the batch deduplication at worker line 183, so duplicate writes are possible within one flush. Conversely, B→C is safe when B was successfully written and IPC ordering is maintained; advancing the renderer base alone does not guarantee that.
+
+   The more dangerous ordering is a queued proposal derived from A reaching `alter-files` after a refusal’s reparse has installed E. It acquires expected E and can replace E with stale content derived from A. There is no generation check or invalidation of old proposals.
+
+   **Fix:** Bind each proposal to an immutable, confirmed base; serialize writes per file; advance that base only on successful write/ingestion; invalidate queued proposals across refusal/reparse. Coalesce same-file writes regardless of outliner operation.
+
+2. **[HIGH] Conflict copies can be silently deleted or overwritten.**  
+   **Location:** `E/handler.cljs:128`; `E/backup_file.cljs:28,56,60,62`.
+
+   Conflict copies use exactly the ordinary backup directory and retention policy. Six later ordinary backups or conflicts can prune the **only copy** of refused user text. Filenames have only timestamp precision to milliseconds, and `writeFileSync` uses replacement mode, so same-millisecond copies for one path can overwrite each other.
+
+   The explicit reparse does await backup completion, which is correct. However, the returned path is not a durable preservation guarantee under this naming and retention policy.
+
+   **Fix:** Use a separate conflict tree, such as `logseq/bak/conflicts/`, outside ordinary pruning traversal. Never automatically prune unresolved conflicts. Create collision-resistant names with `wx` and retry collisions. Merely skipping pruning during conflict creation is insufficient if later ordinary backups still prune that directory.
+
+3. **[HIGH] The reparse can discard edits newer than the conflict copy.**  
+   **Location:** `F/fs/node.cljs:59,71`; `F/handler/events.cljs:191`; `F/fs/watcher_handler.cljs:181,185`.
+
+   The copy preserves the already-serialized proposal B. While its backup IPC and subsequent stat/read/worker pull are pending, the user can commit C into the same page. The reparse then resets the page from disk E with `backup? false`; neither C nor current editor text is captured or checked.
+
+   A pending page-save entry contains a page ID, not C’s snapshot. If serialization occurs after the reset, it serializes the replacement state. C can therefore disappear without ever reaching either disk or the conflict copy. Keeping the editor open introduces another possibility: old input can later save into the reparsed page.
+
+   **Fix:** Coordinate recovery per file with an edit generation. Preserve newer committed and editor content before applying disk state, and reject/restart a reparse whose generation changed. Invalidate older queued saves. A notification about preserving B does not establish preservation of C.
+
+4. **[HIGH] A transient missing file can trigger deletion of the file after it returns.**  
+   **Location:** `F/fs/watcher_handler.cljs:179,187`; supporting path `F/handler/common/page.cljs:208`.
+
+   Recovery converts `file-exists? = false` directly into a normal unlink event. `file-exists?` also converts **all stat failures** to false (`F/fs.cljs:222`), not just ENOENT.
+
+   The unlink handler calls normal page deletion. Its `after-page-deleted!` continuation checks whether the path exists and, if so, unlinks it. A concrete ordering is: sync client temporarily removes the path → recovery observes absence → sync client restores the external file → page-deletion continuation deletes that restored file. This bypasses the write guard entirely.
+
+   **Fix:** Distinguish ENOENT from access/I/O errors, retry transient absence, and use a disk-origin DB deletion path that never deletes the filesystem path. Recheck absence before committing the DB deletion.
+
+5. **[HIGH] Failed preservation still clears save tracking; no retry or close protection remains.**  
+   **Location:** `F/fs/node.cljs:72,78,130`; `F/handler/worker.cljs:18`; `F/worker/db_worker.cljs:840`.
+
+   If conflict-copy creation fails, recovery correctly skips its explicit reparse, but resolves normally. Guarded I/O errors are also swallowed through the supplied error handler. Both paths reach `page-file-saved`, which removes pending requests. Even the renderer’s outer failure branch acknowledges them.
+
+   Consequently, the worker has no outstanding record requiring preservation or retry. A warning does not prevent graph switching, subsequent watcher reparses, or closing the app with user text only in memory.
+
+   **Quit clarification:** I found `file-writes-finished?` used for **graph switching**, not a quit barrier. The inspected close handler destroys the window (`E/window.cljs:82`). Moreover, `file-writes-finished?` already has an inverted cleanup predicate at worker line 832: it removes requests for entities that **exist**. That pre-existing defect would also undermine simply retaining failed requests.
+
+   **Fix:** Propagate structured outcomes through the filesystem wrapper and worker acknowledgment. Track unresolved failures separately from successful writes; require successful conflict preservation before treating a refusal as terminal. Correct the cleanup predicate and make actual close/switch behavior honor unresolved preservation.
+
+6. **[HIGH] `io-error` can follow destructive partial writes, with no recovery copy.**  
+   **Location:** `E/write_guard.cljs:89,101`; `F/fs/node.cljs:123`.
+
+   The documented guarantee “Nothing is written unless the result is written” is false. Replacement `writeFileSync` truncates the destination before completing its writes; ENOSPC can leave an empty or partial file and return `io-error`. A failed post-write `statSync` can likewise report failure after a completed write.
+
+   Read-time EISDIR/EACCES correctly avoid replacement. The failure after opening/truncating is the dangerous case, and the guarded path no longer attempts the legacy error-side backup. Combined with finding 5, the proposal can be acknowledged without a complete persistent copy.
+
+   **Fix:** Prepare replacement content in a sibling temporary file before the final synchronous compare-and-rename sequence; preserve failure state and cleanup appropriately. Keep exclusive final-path creation for absent files. Distinguish an uncertain/post-write failure from a refusal that left disk untouched. This still cannot eliminate the accepted external compare/replace race.
+
+7. **[MEDIUM] Refused direct-file writes still execute success-side config/CSS updates.**  
+   **Location:** `F/handler/file_based/file.cljs:177,185,189`.
+
+   `alter-file` ignores the write outcome and continues applying the proposed content. A refused `config.edn` write still calls `restore-repo-config!` with that rejected proposal. A refused custom CSS write transacts the proposal again. These continuations race with the detached from-disk reparse, so the rejected version can become active again—or remain active if reparse fails.
+
+   **Fix:** Return and inspect the structured write result. Run proposal-based post-write actions only for `"written"`; on refusal, apply configuration/styles from the successfully ingested disk content and await recovery completion.
+
+8. **[MEDIUM] Newly settled worker rejections escape fire-and-forget callers.**  
+   **Location:** `F/db/transact.cljs:30`; callers `F/handler/editor.cljs:1113,1129` and `F/components/content.cljs:49`.
+
+   The settlement implementation handles synchronous throw, rejected promise, encoded `:ex-data`, and success without an apparent double-settlement path. However, copied references/embeds discard the promise from `set-blocks-id!`, and heading-menu callbacks discard the transaction promise. Worker unavailability/rejection now reaches these as unhandled rejections; copy actions continue without confirming ID persistence.
+
+   **Fix:** Await required transactions before their dependent UI action, and attach a user-visible rejection handler at fire-and-forget UI boundaries. I found no legitimate requirement to preserve the old hanging behavior.
+
+**No additional [LOW] findings.**
+
+Other checks:
+
+- Buffer comparison is exact for valid UTF-8, including BOM, CRLF, whitespace and final newlines. Invalid UTF-8 round-trips can refuse unchanged files; they do not silently authorize replacement.
+- `{absent: true}` survives the renderer/main bean conversions; `wx` handles creation collisions. Comparison precedes chmod, with no asynchronous yield. Nil-expected Electron callers retain the previous branch.
+- Eager reconciliation, the opt-in 16 cap, unknown-path deferral, exact pre-repair string comparison, retry-queue restoration and final superseded-run notice check match the decision. The installed Promesa macro wraps `p/do` in promise context, supporting the restoration catch.
+- A from-disk reset itself suppresses save hooks (`F/worker/pipeline.cljs:517`), so I found no unconditional reparse→save loop. Immediate missing-ID repairs and outstanding editor saves can still initiate further writes.
+- `electron.write-guard` is available to the node test build: `deps.edn:1` includes `src/electron`, and the namespace requires only Node `fs`. Static inspection does not substitute for the deferred integration scenarios.
