@@ -436,21 +436,71 @@ DROP TRIGGER IF EXISTS blocks_au;
 
 (defn checkpoint!
   "PRAGMA wal_checkpoint(PASSIVE): [busy log checkpointed], log being the
-  frames in the WAL and checkpointed how many of them are in the db file now.
-  Copies every frame; there is no bounded checkpoint, so the tick keeps the
-  WAL small instead."
+  frames in the WAL and checkpointed how many of them are in the db file now
+  (earlier backfill included). Complete when busy is 0 and log equals
+  checkpointed; a partial result is not an error. It copies every frame not
+  in the db file yet: SQLite 3.50.3 has no way to bound a checkpoint's work.
+  Inside a transaction on db it fails with SQLITE_LOCKED."
   [^js db]
   (first (query-rows db "PRAGMA wal_checkpoint(PASSIVE)")))
 
 (defn restart-wal!
   "One small write right after a complete checkpoint. The first write after
-  one restarts the WAL: it syncs the new WAL header (an OPFS flush) and
-  applies journal_size_limit (a truncate). This way the tick pays for both,
-  not the next save or walk slice. The row is not index state: rows->meta
-  ignores its key."
+  one restarts the WAL: it syncs the new WAL header (an OPFS flush, even under
+  synchronous=NORMAL) and, as the first commit of the new WAL, applies
+  journal_size_limit (a truncate). This way the tick pays for both, not the
+  next save or walk slice. The row is not index state: rows->meta ignores
+  its key."
   [^js db]
   (.exec db #js {:sql "INSERT INTO search_meta (k, v) VALUES ('wal_restart', $v) ON CONFLICT (k) DO UPDATE SET v = excluded.v"
                  :bind #js {:$v (str (js/Date.now))}}))
+
+(defn cache-writes
+  "SQLITE_DBSTATUS_CACHE_WRITE of db (sqlite3_db_status, never reset): pages
+  its pager has written since it opened. In WAL mode each is a WAL frame,
+  whoever wrote it: syncs, walks, FTS5 merges, orphan deletes, meta and
+  restart rows. Checkpoint copies are not counted. A bench probe (3.46,
+  same pager path) saw the delta equal the frames appended, and 0 for a
+  checkpoint or for a merge step with nothing to merge. It counts writes, not
+  the WAL's size: a page written twice in one WAL counts twice. sqlite3: the
+  sqlite-wasm module (worker-state/*sqlite). nil when it or the call is not
+  available."
+  [^js sqlite3 ^js db]
+  (when sqlite3
+    (try
+      (let [^js capi (.-capi sqlite3)
+            ^js wasm (.-wasm sqlite3)
+            ^js pstack (.-pstack wasm)
+            op (.-SQLITE_DBSTATUS_CACHE_WRITE capi)
+            ptr (.-pointer db)]
+        (when (and (number? op) ptr)
+          (let [pos (.-pointer pstack)]
+            (try
+              ;; two ints out: the current value, and a highwater mark this
+              ;; op leaves 0
+              (let [out (.alloc pstack 8)
+                    rc (.sqlite3_db_status capi ptr op out (+ out 4) 0)]
+                (when (zero? rc) (.peek32 wasm out)))
+              (finally (.restore pstack pos))))))
+      (catch :default _e nil))))
+
+(defn txn-open?
+  "Whether db's connection has a transaction open on main: sqlite3_txn_state
+  is not SQLITE_TXN_NONE. That is a BEGIN nobody ended, or a statement
+  stepped and not reset, which holds a read (autocommit alone does not rule
+  that out). A checkpoint then fails with SQLITE_LOCKED, and a write joins
+  that transaction. sqlite3: the sqlite-wasm module. nil when it or the call
+  is not available."
+  [^js sqlite3 ^js db]
+  (when sqlite3
+    (try
+      (let [^js capi (.-capi sqlite3)
+            none (.-SQLITE_TXN_NONE capi)
+            ptr (.-pointer db)
+            s (when (and (number? none) ptr) (.sqlite3_txn_state capi ptr "main"))]
+        ;; -1: no such schema, which main always is
+        (when (and (number? s) (>= s 0)) (not= s none)))
+      (catch :default _e nil))))
 
 (defn- varint
   "SQLite varint at i of bytes (7 bits a byte, big-endian, the 9th byte all

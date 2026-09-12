@@ -375,10 +375,14 @@
       ;; until it is edited again.
       (.exec search-db "PRAGMA synchronous=NORMAL")
       ;; Checkpoints leave the commit: search-indexer's maintenance tick runs
-      ;; them (PASSIVE) between tasks. The auto-checkpoint stays on as a hard
-      ;; cap for starved ticks (SQLite counts every frame, whoever wrote it);
-      ;; journal_size_limit truncates the WAL at its next restart (the 10k
-      ;; search db had a 79 MB WAL that never shrank). Both are per connection.
+      ;; them (PASSIVE) between tasks, on a page budget or an age. The
+      ;; auto-checkpoint stays on as a fallback threshold, not a hard cap: a
+      ;; commit that takes the WAL past it (SQLite counts every frame, whoever
+      ;; wrote it) still checkpoints inline, and one large transaction crosses
+      ;; it before any timer runs. journal_size_limit is retained space, not a
+      ;; maximum: the first commit after a WAL restart truncates the WAL file
+      ;; down to it (the 10k search db had a 79 MB WAL that never shrank).
+      ;; Both are per connection.
       (.exec search-db (str "PRAGMA wal_autocheckpoint=" search-indexer/search-wal-autocheckpoint))
       (.exec search-db (str "PRAGMA journal_size_limit=" search-indexer/search-journal-size-limit))
       (common-sqlite/create-kvs-table! db)

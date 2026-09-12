@@ -50,36 +50,57 @@
 
 ;; Search db maintenance (ADR-003 step 4; see the Maintenance section). All
 ;; to be tuned from the LSSEARCH maint lines.
-;; WAL auto-checkpoint of the search db (db_worker sets it on every open). Only
-;; a hard cap now: at 2000 frames (16 MB at 8 KiB pages) SQLite checkpoints
-;; inside the committing statement, as every 1000 frames it did before. The
-;; tick keeps the WAL far below that.
+;;
+;; Cost model (SQLite 3.50.3 wal.c, from a Codex source review): under WAL +
+;; synchronous=NORMAL a commit flushes nothing. A PASSIVE checkpoint that
+;; copies frames flushes twice (the WAL before the copy, the db after it),
+;; and the first write after the WAL restarts flushes once more (its header).
+;; On opfs-sahpool a flush is FileSystemSyncAccessHandle.flush(). So many
+;; small checkpoints cost more flushes and more worker time in total than a
+;; few bigger ones (about 12 against 3 per 1000 frames), for a modestly
+;; smaller worst pause. Neither a checkpoint nor an FTS5 merge step can be
+;; bounded in time.
+;;
+;; WAL auto-checkpoint of the search db (db_worker sets it on every open): a
+;; fallback threshold, not a hard cap. A commit that takes the WAL past 2000
+;; frames still checkpoints (PASSIVE) inline, right after it commits, and one
+;; large transaction crosses it before any timer runs. The tick normally
+;; checkpoints long before that (maint-checkpoint-soft-pages).
 (def search-wal-autocheckpoint 2000)
-;; journal_size_limit of the search db: the WAL file is truncated to this at
-;; its next restart after a checkpoint.
+;; journal_size_limit of the search db: retained space, not a maximum WAL
+;; size. SQLite truncates the WAL file down to it on the first commit after a
+;; WAL restart (the tick's restart row), never during the checkpoint, so a
+;; fully checkpointed WAL keeps its size until the next write.
 (def search-journal-size-limit 4194304)
-;; Tick interval, and the least time between two checkpoints (a little under
-;; the interval, so timer jitter can't skip one): a checkpoint about every
-;; tick while writes keep happening, each one small.
+;; Tick interval while writes happen or merge work waits.
 (def maint-tick-ms 250)
-(def maint-ckpt-gap-ms 200)
-;; Writes quiet this long: the last checkpoint of a burst (or of one save).
+;; No application write for this long and no thread-api call: idle. The idle
+;; drain merges (maint-idle-step-delay-ms) and then checkpoints once.
 (def maint-quiet-ms 1000)
-;; However busy the worker stays, no write waits longer than about this for
-;; its checkpoint. Writes less often than one per tick (a save every 0.5-1 s
-;; while typing) never make a streak and never leave a quiet second; without
-;; this bound only the auto-checkpoint cap would take them, inside a commit.
-;; Above maint-quiet-ms, so one save while the user keeps the worker busy
-;; still waits for quiet first.
-(def maint-max-pending-ms 2000)
-;; Pages of output per FTS5 merge step ('merge', N). FTS5 stops only at term
-;; boundaries, so a step can overshoot on long doclists (see maint-action).
-(def maint-merge-pages 64)
-;; Idle (no writes, no thread-api call): merge steps per tick until FTS5
-;; reports no work or this budget is spent, then the next tick after
-;; maint-idle-yield-ms.
-(def maint-idle-merge-budget-ms 20)
-(def maint-idle-yield-ms 10)
+;; Checkpoint once this many pages were written since the last complete
+;; checkpoint. Every write through the connection counts: syncs, walks, the
+;; tick's merges, orphan deletes and restart rows (write-count).
+(def maint-checkpoint-soft-pages 512)
+;; ... or once the oldest application write not checkpointed has waited this
+;; long, busy or not. This also covers writes too sparse for any budget (a
+;; save every 0.5-1 s while typing): the former 2 s max-pending rule adds
+;; nothing on top of it and is gone.
+(def maint-checkpoint-max-age-ms 1000)
+;; FTS5 merge step ('merge', N): N budgets pages of leaf output. It starts at
+;; maint-merge-n-initial and adapts to step time (maint-merge-n), aiming at
+;; about 5 ms: halved after a step over maint-merge-slow-ms, doubled after
+;; maint-merge-grow-after steps in a row under maint-merge-fast-ms that all
+;; found work. FTS5 ends a step only at a term boundary, so even N=1 can run
+;; long on a common trigram. Always positive: a negative N merges the whole
+;; index.
+(def maint-merge-n-initial 8)
+(def maint-merge-n-min 1)
+(def maint-merge-n-max 64)
+(def maint-merge-slow-ms 10)
+(def maint-merge-fast-ms 2.5)
+(def maint-merge-grow-after 4)
+;; Idle drain: one merge step per timer task, this far apart.
+(def maint-idle-step-delay-ms 16)
 ;; At most one LSSEARCH maint line per this many ms (counts merged).
 (def maint-log-ms 1000)
 
@@ -632,89 +653,149 @@
 ;; Maintenance (ADR-003 step 4)
 ;;
 ;; Commits to the search db no longer checkpoint the WAL or merge FTS5
-;; segments inline: wal_autocheckpoint is only a hard cap
+;; segments inline: wal_autocheckpoint is only a fallback threshold
 ;; (search-wal-autocheckpoint), and blocks_fts runs automerge=0
-;; (search/fts-config). This tick does both between tasks, in small pieces,
-;; and deletes orphan rows search-blocks found. A PASSIVE checkpoint still
-;; blocks the worker while it copies; it is moved out of the commit, not
-;; made cheaper, which is why it runs often and small.
+;; (search/fts-config). This tick does both between tasks and deletes orphan
+;; rows search-blocks found. A PASSIVE checkpoint still blocks the worker
+;; while it copies; it is moved out of the commit, not made cheaper, and each
+;; one that copies costs its flushes whatever it copies (the cost model at
+;; search-wal-autocheckpoint). So it runs when a page budget or an age says
+;; so, not on every tick that saw a write.
 
 (defn maint-action
-  "What one maintenance tick does. m:
-  :wrote?        writes since the last tick (total_changes moved; the tick's
-                 own writes are not counted)
-  :streak-ms     how long ticks have kept seeing writes (0 on the first)
-  :quiet-ms      since the last tick that saw writes
-  :since-ckpt-ms since the last checkpoint
-  :pending?      writes not checkpointed yet (the tick's own included)
-  :pending-ms    since the first tick that saw them pending (0 if none)
+  "What one maintenance tick does (pure). m:
+  :wrote?        application writes since the last tick (total_changes moved;
+                 the tick's own writes are not counted)
+  :quiet-ms      since the last tick that saw application writes
+  :pending-pages pages written and not checkpointed yet: application writes
+                 and the tick's own merges and orphan deletes, not the
+                 restart row (the checkpoint's own write)
+  :budget-pages  pages written since the last complete checkpoint, the
+                 restart row included
+  :age-ms        since the first tick that saw application writes the last
+                 complete checkpoint does not have (0 if none)
+  :held?         a checkpoint came back partial or failed less than
+                 maint-checkpoint-max-age-ms ago
   :merge?        FTS5 merge work may be left
   :busy?         a thread-api call arrived in the last busy-window-ms
-  Returns {:ckpt? :merge}, :merge nil, :step (one step) or :run (steps until
-  none is left or the idle budget is spent).
-  - Checkpoint about every tick while writes keep happening (a streak of at
-    least maint-ckpt-gap-ms), else once after maint-quiet-ms of quiet unless
-    the user is waiting on the worker, and in any case once writes have been
-    pending maint-max-pending-ms; never two within maint-ckpt-gap-ms. One
-    save thus gets a single checkpoint a second later, not one at the next
-    tick, and writes too sparse for a streak still get one every
-    maint-max-pending-ms or so.
-  - Merge one step per tick while writes happen or the user waits, so a
-    first open (which never goes idle) merges too; run steps when idle.
-  - A busy tick has no time bound. FTS5 ends a step only at a term boundary,
-    so a step can write well past maint-merge-pages on a long doclist, and
-    the same tick can also checkpoint. Accepted: smaller or skipped busy
-    steps leave the work to crisismerge, which merges a whole level inside a
-    commit. The maint line (busy-tick-max-ms, merge-max-step-ms and -changes,
-    l0-drops) shows what it costs, and the defs above are the knobs."
-  [{:keys [wrote? streak-ms quiet-ms since-ckpt-ms pending? pending-ms merge? busy?]}]
-  {:ckpt? (boolean (and pending?
-                        (>= since-ckpt-ms maint-ckpt-gap-ms)
-                        (or (if wrote?
-                              (>= streak-ms maint-ckpt-gap-ms)
-                              (and (>= quiet-ms maint-quiet-ms) (not busy?)))
-                            (>= (or pending-ms 0) maint-max-pending-ms))))
-   :merge (when merge? (if (or wrote? busy?) :step :run))})
+  Returns {:ckpt :merge? :idle?}.
+  - :ckpt is why to checkpoint now, or nil. Only with pages pending and no
+    hold: :budget once budget-pages reaches maint-checkpoint-soft-pages,
+    :age once age-ms reaches maint-checkpoint-max-age-ms (busy or not), and
+    :final once idle with no merge work left (the drain's last writes).
+    Never merely because the last tick saw a write: a streak gets one
+    checkpoint per budget or per second, not one per tick. One save gets a
+    single checkpoint (:age) about a second later.
+  - :merge? is one positive FTS5 merge step now, whenever merge work may be
+    left (a first open, which never goes idle, merges too). Never in a tick
+    that checkpoints: that tick leaves the merge to the next one.
+  - :idle? is no application write for maint-quiet-ms and no thread-api
+    call: the next tick then comes maint-idle-step-delay-ms later while the
+    drain has work (maint-next-ms), one step per task.
+  No tick has a time bound: a checkpoint copies every pending frame, and
+  FTS5 ends a merge step only at a term boundary. Steps that are too small or
+  too rare leave the work to crisismerge, a whole level inside a commit. The
+  maint line (ckpt-max-ms, ckpt-pending-max, merge-max-step-ms, l0-drops)
+  shows what each costs; the defs above are the knobs."
+  [{:keys [wrote? quiet-ms pending-pages budget-pages age-ms held? merge? busy?]}]
+  (let [idle? (and (not wrote?) (not busy?) (>= quiet-ms maint-quiet-ms))
+        ckpt (when (and (pos? pending-pages) (not held?))
+               (cond
+                 (>= budget-pages maint-checkpoint-soft-pages) :budget
+                 (>= age-ms maint-checkpoint-max-age-ms) :age
+                 (and idle? (not merge?)) :final))]
+    {:ckpt ckpt
+     :merge? (boolean (and merge? (nil? ckpt)))
+     :idle? idle?}))
 
 (defn maint-observe
   "A tick's bookkeeping before it decides (pure; maint-tick! and the tests
-  run it). st: repo's maintenance state (*maint), t: now, tc: total_changes
-  now, orphans: rows the tick deleted before deciding. Returns [st' m], m
-  being maint-action's argument without :busy?."
-  [st t tc orphans]
+  run it). st: repo's maintenance state (*maint). t: now. tc: total_changes
+  as the tick starts, before its own writes, so any change since the last
+  tick is an application write. pages: the write counter (write-count)
+  after the tick's orphan deletes. orphans: rows those deleted. Returns
+  [st' m], m being maint-action's argument without :busy?."
+  [st t tc pages orphans]
   (let [wrote? (not= tc (:tc st))
-        pending? (or (not= tc (:ckpt-tc st)) (pos? orphans))
-        st (cond-> (assoc st :pending-t (when pending? (or (:pending-t st) t)))
-             wrote? (assoc :write-t t :streak-t (or (:streak-t st) t))
-             (not wrote?) (assoc :streak-t nil)
+        st (cond-> st
+             wrote? (assoc :write-t t :app-t (or (:app-t st) t))
              (or wrote? (pos? orphans)) (assoc :merge? true))]
     [st {:wrote? wrote?
-         :streak-ms (if wrote? (- t (:streak-t st)) 0)
          :quiet-ms (- t (:write-t st))
-         :since-ckpt-ms (- t (:ckpt-t st))
-         :pending? pending?
-         :pending-ms (if pending? (- t (:pending-t st)) 0)
-         :merge? (:merge? st)}]))
+         :pending-pages (max 0 (- pages (:done-pages st)))
+         :budget-pages (max 0 (- pages (:ckpt-pages st)))
+         :age-ms (if-let [a (:app-t st)] (- t a) 0)
+         :held? (< t (or (:held-until st) 0))
+         :merge? (boolean (:merge? st))}]))
 
 (defn maint-settle
-  "A tick's bookkeeping after its work (pure). tc: total_changes after the
-  tick's own writes, which never count as writes (the tick can't feed
-  itself) but stay pending until a checkpoint takes them. t: when the
-  checkpoint started if ckpt?, else the tick's time."
-  [st t ckpt? merge-left? tc]
-  (let [st (assoc st :merge? merge-left? :tc tc)]
-    (if ckpt?
-      (assoc st :ckpt-t t :ckpt-tc tc :pending-t nil)
-      (cond-> st
-        (and (not= tc (:ckpt-tc st)) (nil? (:pending-t st))) (assoc :pending-t t)))))
+  "A tick's bookkeeping after its work (pure). t: the tick's time. r:
+  :tc          total_changes after the tick's own writes, which never count
+               as application writes (the tick can't feed itself)
+  :pages       the write counter after them
+  :ckpt        nil, or how the checkpoint came out: :complete, :partial
+               (busy, or log != checkpointed) or :failed (an error)
+  :ckpt-pages  the write counter right after the checkpoint, before the
+               restart row
+  :merge-left? whether merge work may be left (FTS5's answer if a step ran)
+  A complete checkpoint starts a new budget and leaves nothing pending, its
+  restart row included. A partial or failed one leaves everything pending,
+  the application writes' age included, and holds the next try for
+  maint-checkpoint-max-age-ms: retried on a later tick, never in a loop."
+  [st t {:keys [tc pages ckpt ckpt-pages merge-left?]}]
+  (cond-> (assoc st :tc tc :merge? (boolean merge-left?))
+    (= :complete ckpt) (assoc :ckpt-pages ckpt-pages :done-pages pages :app-t nil)
+    (contains? #{:partial :failed} ckpt) (assoc :held-until (+ t maint-checkpoint-max-age-ms))))
+
+(defn maint-merge-n
+  "N for the next FTS5 merge step (pure), from the last step: it took ms and
+  left? says whether it found work (total_changes delta >= 2). Halved, down
+  to maint-merge-n-min, after a step over maint-merge-slow-ms; doubled, up
+  to maint-merge-n-max, after maint-merge-grow-after steps in a row under
+  maint-merge-fast-ms that all found work; any other step starts that count
+  again. Returns the state's :merge-n and :merge-fast."
+  [{:keys [merge-n merge-fast]} ms left?]
+  (cond
+    (> ms maint-merge-slow-ms)
+    {:merge-n (max maint-merge-n-min (quot merge-n 2)) :merge-fast 0}
+
+    (and left? (< ms maint-merge-fast-ms))
+    (if (>= (inc merge-fast) maint-merge-grow-after)
+      {:merge-n (min maint-merge-n-max (* 2 merge-n)) :merge-fast 0}
+      {:merge-n merge-n :merge-fast (inc merge-fast)})
+
+    :else
+    {:merge-n merge-n :merge-fast 0}))
+
+(defn maint-next-ms
+  "Delay to the next tick (pure). st: the state after maint-settle, t: the
+  tick's time, idle?: maint-action's, pending?: pages still pending after
+  the tick. While an idle drain has work (merge work left, or pages for its
+  final checkpoint that no hold keeps back): maint-idle-step-delay-ms, so
+  each step is its own short task. Otherwise maint-tick-ms; a drain with
+  nothing left is disarmed, and ticks find nothing to do until new writes."
+  [st t idle? pending?]
+  (if (and idle?
+           (or (:merge? st)
+               (and pending? (>= t (or (:held-until st) 0)))))
+    maint-idle-step-delay-ms
+    maint-tick-ms))
 
 ;; repo -> {:sdb db :timer id
-;;          :tc n        ; total_changes at the end of the last tick
-;;          :ckpt-tc n   ; total_changes right after the last checkpoint
-;;          :ckpt-t t :write-t t :streak-t t|nil
-;;          :pending-t t|nil ; first tick that saw writes not checkpointed
-;;          :merge? b
-;;          :l0 n|nil}   ; level-0 segments at the end of the last tick
+;;          :src :pages|:changes ; write-count's counter, fixed at start
+;;          :tc n          ; total_changes at the end of the last tick
+;;          :ckpt-pages n  ; write count right after the last complete
+;;                         ; checkpoint: the budget counts from here
+;;          :done-pages n  ; ... and after its restart row: pages above
+;;                         ; this are pending
+;;          :write-t t     ; last tick that saw application writes
+;;          :app-t t|nil   ; first tick that saw application writes the last
+;;                         ; complete checkpoint does not have
+;;          :held-until t|nil ; no checkpoint try before (after a partial
+;;                         ; or failed one)
+;;          :merge? b      ; FTS5 merge work may be left
+;;          :merge-n n :merge-fast n ; the next step's N (maint-merge-n)
+;;          :l0 n|nil}     ; level-0 segments at the end of the last tick
 (defonce ^:private *maint (atom {}))
 
 ;; Counts merged into the next LSSEARCH maint line.
@@ -725,12 +806,13 @@
   (vswap! *maint-log f))
 
 (defn- log-maint!
-  "At most one maint line per maint-log-ms, only after some work."
-  [t]
+  "At most one maint line per maint-log-ms, only after some work. src: the
+  write counter behind its page counts (write-count)."
+  [t src]
   (let [{:keys [last-log] :as m} @*maint-log]
     (when (and (> (count m) 1) (>= (- t last-log) maint-log-ms))
       (vreset! *maint-log {:last-log t})
-      (log-step! "maint" (into {}
+      (log-step! "maint" (into {:pages-src (name src)}
                                (map (fn [[k v]] [k (if (number? v) (js/Math.round v) v)]))
                                (dissoc m :last-log))))))
 
@@ -756,58 +838,96 @@
       (search/delete-blocks! sdb ids'))
     (count ids')))
 
-(defn- merge!
-  "FTS5 merge steps in one transaction: mode :step runs one, :run runs steps
-  until FTS5 reports no work or maint-idle-merge-budget-ms is spent. Returns
-  whether work is left. Each step's ms goes to the maint line (its max too:
-  a step stops only at a term boundary, so it can overshoot)."
-  [^js sdb mode]
-  (let [t0 (now)]
-    (.transaction
-     sdb
-     (fn [tx]
-       (loop []
-         (let [t1 (now)
-               delta (search/merge-step! tx maint-merge-pages)
-               ms (- (now) t1)
-               left? (>= delta 2)]
-           (note-maint! (fn [m] (-> m
-                                    (update :merge-steps (fnil inc 0))
-                                    (update :merge-changes (fnil + 0) delta)
-                                    (update :merge-ms (fnil + 0) ms)
-                                    (update :merge-max-step-ms (fnil max 0) ms)
-                                    ;; about the pages the step wrote: its
-                                    ;; overshoot past maint-merge-pages
-                                    (update :merge-max-step-changes (fnil max 0) delta))))
-           (if (and left? (= mode :run) (< (- (now) t0) maint-idle-merge-budget-ms))
-             (recur)
-             left?)))))))
+(defn- write-count
+  "The tick's write counter for sdb. src :pages: search/cache-writes, pages
+  written through the connection (in WAL mode, WAL frames), whoever wrote
+  them: syncs, walks, and the tick's merges, orphan deletes and restart rows.
+  src :changes, only when that call did not work at start-maint!:
+  total_changes, rows written, FTS5 shadow rows included. An approximate
+  proxy that over-counts pages (about 20 rows a page for a 50-row commit in
+  a bench probe), so the page budget then fires early: more and smaller
+  checkpoints, never a bigger WAL."
+  [sdb src]
+  (if (= src :pages)
+    (or (search/cache-writes @worker-state/*sqlite sdb)
+        (throw (ex-info "search: sqlite3_db_status failed" {})))
+    (search/total-changes sdb)))
+
+(defn- merge-step!
+  "One FTS5 merge step of n pages: its own statement, no transaction.
+  search/merge-step! reads total_changes right around it, so the delta is
+  the step's alone: below 2, FTS5 found nothing to merge. Notes the step for
+  the maint line (pages: the WAL frames it wrote, for a checkpoint to copy).
+  Returns {:left? :ms}."
+  [sdb src n idle?]
+  (let [p0 (write-count sdb src)
+        t0 (now)
+        delta (search/merge-step! sdb n)
+        ms (- (now) t0)
+        pages (- (write-count sdb src) p0)]
+    (note-maint! (fn [m] (cond-> (-> m
+                                     (update :merge-steps (fnil inc 0))
+                                     (update :merge-changes (fnil + 0) delta)
+                                     (update :merge-pages (fnil + 0) pages)
+                                     (update :merge-ms (fnil + 0) ms)
+                                     (update :merge-max-step-ms (fnil max 0) ms)
+                                     ;; the overshoot past n: a step ends only
+                                     ;; at a term boundary
+                                     (update :merge-max-step-changes (fnil max 0) delta)
+                                     (update :merge-n-min (fnil min n) n)
+                                     (update :merge-n-max (fnil max n) n))
+                           idle? (update :merge-idle-steps (fnil inc 0)))))
+    {:left? (>= delta 2) :ms ms}))
 
 (defn- checkpoint!
-  "PASSIVE checkpoint, then the WAL restart write when it completed. Timed
-  apart: ckpt-ms is the copy and its flush, restart-ms the restart write
-  (the new WAL header's flush and the journal_size_limit truncate)."
-  [sdb]
+  "PASSIVE checkpoint for why (maint-action's :ckpt) with pending pages
+  waiting, then the WAL restart row if it completed with frames in the WAL:
+  the next write restarts the WAL anyway, and this way the tick pays for the
+  header flush and the journal_size_limit truncate, not the next save. Timed
+  apart: ckpt-ms is the copy and its two flushes, restart-ms the restart
+  write. An error (SQLITE_LOCKED inside a transaction, I/O) is counted on its
+  own (ckpt-errors, ckpt-error) and, like a partial result, leaves the
+  writes pending for a later try (maint-settle). Returns {:ckpt outcome
+  :ckpt-pages n}."
+  [sdb src why pending]
   (let [t0 (now)
-        [_busy log ckpt] (search/checkpoint! sdb)
+        [r err] (try [(search/checkpoint! sdb) nil]
+                     (catch :default e [nil e]))
         t1 (now)
-        complete? (and (number? log) (pos? log) (= log ckpt))
-        _ (when complete? (search/restart-wal! sdb))
+        [busy log ckpt] r
+        outcome (cond
+                  err :failed
+                  (and (= 0 busy) (number? log) (= log ckpt)) :complete
+                  :else :partial)
+        ckpt-pages (write-count sdb src)
+        restart? (and (= :complete outcome) (pos? log))
+        _ (when restart? (search/restart-wal! sdb))
         ms (- t1 t0)
         restart-ms (- (now) t1)]
     (note-maint! (fn [m] (cond-> (-> m
                                      (update :ckpts (fnil inc 0))
+                                     (update (keyword (str "ckpt-" (name why))) (fnil inc 0))
                                      (update :ckpt-ms (fnil + 0) ms)
                                      (update :ckpt-max-ms (fnil max 0) ms)
+                                     (update :ckpt-pending (fnil + 0) pending)
+                                     (update :ckpt-pending-max (fnil max 0) pending)
                                      (update :wal-log-max (fnil max 0) (or log 0))
-                                     (update :wal-ckpt (fnil + 0) (or ckpt 0))
-                                     (update :restarts (fnil + 0) (if complete? 1 0)))
-                           complete? (update :restart-ms (fnil + 0) restart-ms))))))
+                                     (update :wal-ckpt (fnil + 0) (or ckpt 0)))
+                           restart? (-> (update :restarts (fnil inc 0))
+                                        (update :restart-ms (fnil + 0) restart-ms))
+                           (= :partial outcome) (update :ckpt-partial (fnil inc 0))
+                           err (-> (update :ckpt-errors (fnil inc 0))
+                                   (assoc :ckpt-error (str (or (ex-message err) err)))))))
+    {:ckpt outcome :ckpt-pages ckpt-pages}))
 
 (defn- maint-tick!
-  "One tick; reschedules itself while sdb is still repo's search db. A
-  failure stops the tick for this session (logged once): the auto-checkpoint
-  cap and crisismerge still bound the WAL and the segments."
+  "One tick; reschedules itself while sdb is still repo's search db. It
+  deletes queued orphans, then does at most one of: a checkpoint (and its
+  restart row), or one FTS5 merge step. Nothing while the connection has a
+  transaction open. A checkpoint error is counted and retried later
+  (checkpoint!); any other failure stops the tick for this session (logged
+  once): the auto-checkpoint and crisismerge still bound the WAL and the
+  segments."
   [repo sdb]
   (let [st (get @*maint repo)]
     (if-not (and st
@@ -816,53 +936,58 @@
       (when (and st (identical? sdb (:sdb st)))
         (swap! *maint dissoc repo))
       (let [t0 (now)
+            src (:src st)
             next-ms
             (try
-              (let [tc (search/total-changes sdb)
-                    busy (busy? t0)
-                    orphans (delete-orphans! repo sdb)
-                    [st' seen] (maint-observe st t0 tc orphans)
-                    {:keys [ckpt?] merge-mode :merge} (maint-action (assoc seen :busy? busy))
-                    ;; Level 0 before this tick's merge. Only writes add
-                    ;; segments, so it is read only after some.
-                    l0 (if (:wrote? seen) (search/level0-segments sdb) (:l0 st))
-                    ;; merge first, so this tick's checkpoint also takes the
-                    ;; merge's frames
-                    merge-left? (if merge-mode (merge! sdb merge-mode) (:merge? st'))
-                    t-ckpt (now)
-                    _ (when ckpt? (checkpoint! sdb))
-                    st' (maint-settle st' (if ckpt? t-ckpt t0) ckpt? merge-left?
-                                      (search/total-changes sdb))
-                    l0' (if merge-mode (search/level0-segments sdb) l0)
-                    ms (- (now) t0)]
-                (when (pos? orphans)
-                  (note-maint! (fn [m] (update m :orphans (fnil + 0) orphans))))
-                ;; Level 0 went down since the last tick with no merge step in
-                ;; between: a crisismerge ran inside a commit (or the index was
-                ;; truncated), the stall this tick is there to prevent.
-                (when (and (some? l0) (some? (:l0 st)) (< l0 (:l0 st)))
-                  (note-maint! (fn [m] (update m :l0-drops (fnil inc 0)))))
-                (when (or ckpt? merge-mode (pos? orphans))
-                  (note-maint! (fn [m] (cond-> (-> m
-                                                   (update :ticks (fnil inc 0))
-                                                   ;; busy: writes seen or a thread-api
-                                                   ;; call waiting (merge :step)
-                                                   (update (if (or (:wrote? seen) busy)
-                                                             :busy-tick-max-ms
-                                                             :idle-tick-max-ms)
-                                                           (fnil max 0) ms))
-                                         (some? l0) (update :l0-max (fnil max 0) l0)))))
-                (swap! *maint update repo
-                       (fn [cur]
-                         (when cur
-                           (merge cur
-                                  (select-keys st' [:tc :ckpt-tc :ckpt-t :write-t :streak-t
-                                                    :pending-t :merge?])
-                                  {:l0 l0'}))))
-                (log-maint! (now))
-                (if (and merge-left? (= merge-mode :run))
-                  maint-idle-yield-ms
-                  maint-tick-ms))
+              (if (search/txn-open? @worker-state/*sqlite sdb)
+                ;; A transaction is open on the connection: a checkpoint would
+                ;; fail with SQLITE_LOCKED and a write would join it. Not one
+                ;; of ours: .transaction runs its callback through COMMIT in
+                ;; one task, so no timer task runs inside it, and oo1 exec
+                ;; finalizes its statements. So a statement left stepping or a
+                ;; BEGIN nobody ended; the next tick looks again.
+                (do (note-maint! (fn [m] (update m :txn-skips (fnil inc 0))))
+                    (log-maint! (now) src)
+                    maint-tick-ms)
+                (let [tc (search/total-changes sdb)
+                      busy (busy? t0)
+                      orphans (delete-orphans! repo sdb)
+                      pages (write-count sdb src)
+                      [st' seen] (maint-observe st t0 tc pages orphans)
+                      {:keys [ckpt merge? idle?]} (maint-action (assoc seen :busy? busy))
+                      ;; Level 0 before this tick's merge. Only writes add
+                      ;; segments, so it is read only after some.
+                      l0 (if (:wrote? seen) (search/level0-segments sdb) (:l0 st))
+                      c (when ckpt (checkpoint! sdb src ckpt (:pending-pages seen)))
+                      step (when merge? (merge-step! sdb src (:merge-n st') idle?))
+                      pages' (write-count sdb src)
+                      st' (cond-> (maint-settle st' t0 {:tc (search/total-changes sdb)
+                                                        :pages pages'
+                                                        :ckpt (:ckpt c)
+                                                        :ckpt-pages (:ckpt-pages c)
+                                                        :merge-left? (if step (:left? step) (:merge? st'))})
+                            step (merge (maint-merge-n st' (:ms step) (:left? step))))
+                      l0' (if step (search/level0-segments sdb) l0)
+                      ms (- (now) t0)]
+                  (when (pos? orphans)
+                    (note-maint! (fn [m] (update m :orphans (fnil + 0) orphans))))
+                  ;; Level 0 went down since the last tick with no merge step in
+                  ;; between: a crisismerge ran inside a commit (or the index was
+                  ;; truncated), the stall this tick is there to prevent.
+                  (when (and (some? l0) (some? (:l0 st)) (< l0 (:l0 st)))
+                    (note-maint! (fn [m] (update m :l0-drops (fnil inc 0)))))
+                  (when (or c step (pos? orphans))
+                    (note-maint! (fn [m] (cond-> (-> m
+                                                     (update :ticks (fnil inc 0))
+                                                     (update (if idle? :idle-tick-max-ms :busy-tick-max-ms)
+                                                             (fnil max 0) ms))
+                                           (some? l0) (update :l0-max (fnil max 0) l0)))))
+                  (swap! *maint update repo
+                         (fn [cur]
+                           (when cur
+                             (merge cur (dissoc st' :sdb :timer) {:l0 l0'}))))
+                  (log-maint! (now) src)
+                  (maint-next-ms st' t0 idle? (> pages' (:done-pages st')))))
               (catch :default e
                 (js/console.error "search: maintenance tick failed" e)
                 (log-step! "maint-failed" {:msg (str (or (ex-message e) e))})
@@ -875,16 +1000,22 @@
   "Start repo's maintenance tick on sdb. Only db_worker's open path calls this,
   right after it sets the search db's pragmas; never a test. A db without
   changes() (a fake, no sqlite) starts nothing and returns nil. close! stops
-  the tick. FTS5 merging starts as pending, so segments left by an earlier
-  session are merged in idle time."
+  the tick. The write counter is SQLITE_DBSTATUS_CACHE_WRITE when the capi
+  call works, else total_changes (write-count), fixed for the session.
+  Nothing is pending at start: frames an earlier session left in the WAL go
+  with the first checkpoint. FTS5 merging starts as pending, so segments left
+  by an earlier session are merged in idle time."
   [repo ^js sdb]
   (stop-maint! repo)
   (when (and sdb (fn? (.-changes sdb)))
     (let [t (now)
-          tc (search/total-changes sdb)]
-      (swap! *maint assoc repo {:sdb sdb :tc tc :ckpt-tc tc
-                                :ckpt-t t :write-t t :streak-t nil
-                                :merge? true
+          tc (search/total-changes sdb)
+          p (search/cache-writes @worker-state/*sqlite sdb)
+          pages (if (some? p) p tc)]
+      (swap! *maint assoc repo {:sdb sdb :src (if (some? p) :pages :changes) :tc tc
+                                :ckpt-pages pages :done-pages pages
+                                :write-t t :app-t nil :merge? true
+                                :merge-n maint-merge-n-initial :merge-fast 0
                                 :timer (js/setTimeout #(maint-tick! repo sdb) maint-tick-ms)})
       true)))
 
