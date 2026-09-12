@@ -122,10 +122,11 @@
   (fs-extra/copy from-path to-path))
 
 (defmethod handle :backupConflictFile [_window [_ repo-dir rpath content]]
-  ;; Saves content that a guarded writeFile refused (frontend.fs.node) to
-  ;; logseq/bak/, next to the backups of that file. Returns the copy's path.
+  ;; Saves content that a guarded writeFile refused (frontend.fs.node) as a
+  ;; new file under logseq/bak/conflicts/, which is never pruned. Returns the
+  ;; copy's path.
   (logger/info ::backup-conflict-file rpath)
-  (backup-file/backup-file repo-dir :backup-dir rpath (node-path/extname rpath) content))
+  (backup-file/create-conflict-copy! repo-dir rpath (node-path/extname rpath) content))
 
 (defmethod handle :writeFile [window [_ repo path content expected]]
   ;; expected nil: legacy, unguarded write (below, unchanged). Otherwise a

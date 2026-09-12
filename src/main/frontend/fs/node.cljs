@@ -38,7 +38,8 @@
 (defn- <handle-refused-write!
   "A guarded writeFile refused to write rpath: the disk no longer holds what the
    app last saw (\"mismatch\"), or a new file's path is taken (\"exists\"). The
-   disk wins. The proposed content is saved to logseq/bak/ as a conflict copy,
+   disk wins. The proposed content is saved as a conflict copy under
+   logseq/bak/conflicts/ (never pruned, electron.backup-file/create-conflict-copy!),
    a warning that stays until dismissed names the copy, and the file is
    reparsed from disk (:file/reparse-from-disk) so the db follows the disk.
    When the copy cannot be saved there is no reparse, which would drop the
@@ -71,7 +72,7 @@
           (state/pub-event! [:file/reparse-from-disk repo rpath]))
         (state/pub-event! [:notification/show
                            {:content (str "Your change was not saved: " reason
-                                          ", and saving your version to logseq/bak/ failed."
+                                          ", and saving your version to logseq/bak/conflicts/ failed."
                                           " Copy your changes elsewhere before editing this page again.")
                             :status :error
                             :clear? false}]))
