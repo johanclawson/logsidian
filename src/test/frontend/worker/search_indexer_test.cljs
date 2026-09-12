@@ -227,9 +227,22 @@
     (testing "quotes, backslashes and non-ASCII survive the JSON parameter"
       (let [t "a \"quote\" \\ back\\slash, möte 😀"]
         (is (= [[id t page]] (rows [{:id id :title t :page page}])))))
-    (when (.-toWellFormed "")
-      (testing "a lone surrogate becomes U+FFFD, the bytes TextEncoder wrote before"
-        (is (= [[id "a\uFFFDb" page]] (rows [{:id id :title "a\uD800b" :page page}])))))))
+    (testing "a lone surrogate becomes U+FFFD, the bytes TextEncoder wrote before"
+      (is (= [[id "a\uFFFDb" page]] (rows [{:id id :title "a\uD800b" :page page}]))))))
+
+(deftest replace-lone-surrogates-test
+  (testing "the fallback for runtimes without String.prototype.toWellFormed"
+    (doseq [[in out] [["a\uD800b" "a\uFFFDb"]
+                      ["\uDC00x" "\uFFFDx"]
+                      ["x\uD800" "x\uFFFD"]
+                      ["\uDE00\uD83D" "\uFFFD\uFFFD"]
+                      ["\uD800\uD83D\uDE00" "\uFFFD\uD83D\uDE00"]
+                      ["\uD83D\uDE00 m\u00F6te" "\uD83D\uDE00 m\u00F6te"]
+                      ["" ""]]]
+      (is (= out (search/replace-lone-surrogates in)) (pr-str in))
+      (is (= out (search/replace-lone-surrogates in)) "the g regex keeps no state between calls")
+      (when (.-toWellFormed in)
+        (is (= (.toWellFormed in) (search/replace-lone-surrogates in)) "what toWellFormed does")))))
 
 (deftest delete-blocks-by-ids-test
   (let [{:keys [db store]} (fake-sdb)

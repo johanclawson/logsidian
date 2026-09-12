@@ -351,28 +351,30 @@
                                        :client-ops client-ops-db})
       (doseq [db' dbs]
         (enable-sqlite-wal-mode! db'))
-      ;; The main db (the kvs table DataScript stores into) on NORMAL too. The
-      ;; wasm build defaults to FULL (DEFAULT_WAL_SYNCHRONOUS=2): an OPFS flush
-      ;; on every commit, and every DataScript transact commits, at least twice
-      ;; per save. WAL + NORMAL cannot corrupt the db; SQLite then syncs only at
-      ;; checkpoints and WAL restarts, so a power loss or OS crash can lose the
-      ;; last commits (the db stays consistent, one state older). The markdown
-      ;; files are the source of truth and are not fsynced either (no fsync in
-      ;; src/electron). A process kill or crash loses nothing, on the
-      ;; assumption that FileSystemSyncAccessHandle writes reach the OS
-      ;; without a flush (Chromium's implementation; the spec does not say).
-      (.exec db "PRAGMA synchronous=NORMAL")
+      ;; A file graph's main db (the kvs table DataScript stores into) on
+      ;; NORMAL too. The wasm build defaults to FULL (DEFAULT_WAL_SYNCHRONOUS=2):
+      ;; an OPFS flush on every commit, and every DataScript transact commits,
+      ;; at least twice per save. WAL + NORMAL cannot corrupt the db; SQLite
+      ;; then syncs only at checkpoints and WAL restarts, so a power loss or OS
+      ;; crash can lose the last commits (the db stays consistent, one state
+      ;; older). In a file graph the markdown files are the source of truth,
+      ;; and they are not fsynced either (no fsync in src/electron). A DB graph
+      ;; has no such source: its main db is the graph, so it keeps FULL. A
+      ;; process kill or crash loses nothing, on the assumption that
+      ;; FileSystemSyncAccessHandle writes reach the OS without a flush
+      ;; (Chromium's implementation; the spec does not say).
+      (when-not db-based?
+        (.exec db "PRAGMA synchronous=NORMAL"))
       ;; The search db holds derived data and now commits once per DataScript
       ;; tx (search-indexer/sync-tx!): skip the WAL fsync on each commit. WAL +
       ;; NORMAL survives a process kill; a power loss can drop the last search
       ;; commits, which the watermark check on open sees as a gap and heals.
-      ;; With the main db on NORMAL the search db can also be the one ahead,
-      ;; which the open trusts (search-indexer/open-action). Rows for blocks
-      ;; the main db lost are orphans: a re-parse does not replace them (a
-      ;; file-graph block without id:: gets a new uuid), so search-blocks
-      ;; hides them and queues them for deletion (search/queue-orphans!). A
-      ;; block that still exists keeps the title of a lost edit in the index
-      ;; until it is edited again.
+      ;; With a file graph's main db on NORMAL the search db can also be the
+      ;; one ahead, which the open trusts (search-indexer/open-action lists
+      ;; what that leaves wrong). Rows for blocks the main db lost are orphans:
+      ;; a re-parse does not replace them (a file-graph block without id::
+      ;; gets a new uuid), so search-blocks hides them and queues them for
+      ;; deletion (search/queue-orphans!).
       (.exec search-db "PRAGMA synchronous=NORMAL")
       ;; Checkpoints leave the commit: search-indexer's maintenance tick runs
       ;; them (PASSIVE) between tasks, on a page budget or an age. The

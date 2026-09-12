@@ -179,14 +179,23 @@
 
     ;; DataScript stored a tx the index never reflected: rows can be missing or
     ;; stale anywhere, so truncate (which also drops stale rows) and walk.
-    ;; An index ahead of the stored db is trusted. With the main db on
-    ;; synchronous=NORMAL a power loss can drop its last commits while the
-    ;; search db keeps them: rows of blocks the db lost become orphans
-    ;; (search/queue-orphans!), and a block that still exists keeps the title
-    ;; of a lost edit until it is edited again. Accepted (it takes a power loss
-    ;; or OS crash; clean reopens show the index 0 or 1 tx ahead, so no
-    ;; threshold tells the two apart). The trust path sets the watermark back
-    ;; to max-tx (on-open!), so later gaps still show.
+    ;; An index ahead of the stored db is trusted. With a file graph's main db
+    ;; on synchronous=NORMAL (db_worker; a DB graph's stays FULL) a power loss
+    ;; or OS crash can drop the main db's last commit, and the markdown write
+    ;; with it, while the search db keeps its commit. The index can then be
+    ;; wrong in three ways:
+    ;; - rows of blocks the db lost are orphans: search-blocks hides them and
+    ;;   the tick deletes them (search/queue-orphans!);
+    ;; - a block that still exists keeps the title of a lost edit;
+    ;; - a block whose deletion was lost exists again but has no row (the
+    ;;   deletion reached the search db only), so search never finds it.
+    ;;   Orphan cleanup can't see it: it only checks rows a search returned.
+    ;; The last two stay until the block is edited again or the index is
+    ;; rebuilt (Rebuild search index). Accepted, with no detector: clean
+    ;; reopens show the index 0 or 1 tx ahead (a tx that did not store), so no
+    ;; threshold on indexed-tx against stored-max-tx tells these apart. The
+    ;; trust path sets the watermark back to max-tx (on-open!), so later gaps
+    ;; still show.
     (and (some? stored-max-tx)
          (or (nil? indexed-tx) (> stored-max-tx indexed-tx)))
     {:action :walk :truncate? true :cursor 0 :reason "gap"}

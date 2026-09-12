@@ -255,7 +255,9 @@ DROP TRIGGER IF EXISTS blocks_au;
   "Delete the blocks rows of $ids (a JSON array of block uuid strings) in one
   statement; the delete trigger drops their blocks_fts rows. A DELETE with
   triggers visits its rowids in order, so this adds one FTS5 segment
-  (bench/sqlprobe-step4.py), as the string-built IN list it replaces did."
+  (bench/sqlprobe-step4.py), as the string-built IN list it replaces did. A
+  sync-rows! commit with deletes and rows is two statements, so it adds two
+  (bench/sqlwasm-probe.mjs)."
   "DELETE FROM blocks WHERE id IN (SELECT value FROM json_each($ids))")
 
 (defn- valid-row?
@@ -264,12 +266,25 @@ DROP TRIGGER IF EXISTS blocks_au;
        (common-util/uuid-string? page)
        (string? title)))
 
+(def ^:private lone-surrogate
+  "A UTF-16 surrogate without its pair: a high one not followed by a low one,
+  or a low one not preceded by a high one."
+  (js/RegExp. "[\\uD800-\\uDBFF](?![\\uDC00-\\uDFFF])|(?<![\\uD800-\\uDBFF])[\\uDC00-\\uDFFF]" "g"))
+
+(defn replace-lone-surrogates
+  "s with every lone surrogate replaced by U+FFFD, as
+  String.prototype.toWellFormed does: well-formed's fallback for runtimes
+  without it."
+  [^js s]
+  (.replace s lone-surrogate "\uFFFD"))
+
 (defn- well-formed
   "s with lone surrogates replaced by U+FFFD: the bytes TextEncoder wrote when
   titles were bound one by one. JSON.stringify escapes a lone surrogate
-  instead, and SQLite's JSON decoder would store it as invalid UTF-8."
+  instead, and SQLite's JSON decoder would store it as invalid UTF-8 (\"a\\uD800b\"
+  as 61 ED A0 80 62 instead of 61 EF BF BD 62)."
   [^js s]
-  (if (.-toWellFormed s) (.toWellFormed s) s))
+  (if (.-toWellFormed s) (.toWellFormed s) (replace-lone-surrogates s)))
 
 (defn rows->json
   "The $rows parameter of upsert-sql: {:json \"[[id title page] ...]\" :n rows},
