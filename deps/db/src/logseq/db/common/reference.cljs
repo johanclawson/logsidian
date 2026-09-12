@@ -8,8 +8,7 @@
             [logseq.db :as ldb]
             [logseq.db.common.entity-plus :as entity-plus]
             [logseq.db.common.initial-data :as common-initial-data]
-            [logseq.db.frontend.class :as db-class]
-            [logseq.db.frontend.rules :as rules]))
+            [logseq.db.frontend.class :as db-class]))
 
 (defn get-filters
   [db page]
@@ -36,25 +35,74 @@
              (catch :default e
                (log/error :syntax/filters e)))))))
 
-(defn- build-include-exclude-query
-  [includes excludes]
-  (concat
-   (for [include includes]
-     (list 'has-ref '?b include))
-   (for [exclude excludes]
-     (list 'not (list 'has-ref '?b exclude)))))
+(defn- ancestor-ref-ids
+  "Ids in `interesting` referenced by the strict ancestors of `e`: every node
+   reached through one or more :block/parent steps, page included, as the
+   `parent` rule derives them. The visited set ends the walk on a parent cycle,
+   where the rule also counts a node of the cycle as its own ancestor."
+  [e interesting]
+  (loop [p (:block/parent e)
+         visited #{}
+         result #{}]
+    (if (and p (not (contains? visited (:db/id p))))
+      (recur (:block/parent p)
+             (conj visited (:db/id p))
+             (into result (keep #(interesting (:db/id %))) (:block/refs p)))
+      result)))
 
-(defn- filter-refs-query
-  [includes excludes class-ids]
-  (let [clauses (concat
-                 (build-include-exclude-query includes excludes)
-                 (for [class-id class-ids]
-                   (list 'not ['?b :block/tags class-id])))]
-    (into [:find '[?b ...]
-           :in '$ '% '[?id ...]
-           :where
-           (list 'has-ref '?b '?id)]
-          clauses)))
+(defn- get-matched-ref-block-ids
+  "Same set as the former Datalog query
+   `[:find [?b ...] :in $ % [?id ...] :where (has-ref ?b ?id) <filters>]`:
+   blocks that reference one of the ids (`full-ref-block-ids`) or have an
+   ancestor that does, whose own refs plus their ancestors' refs contain every
+   include and no exclude, and that have no tag in `class-ids`.
+   Index walk instead of the has-ref/parent rules, which scanned every
+   :block/parent datom of the graph: start from the direct refs (:block/_refs)
+   and walk their :block/_parent subtrees, carrying the include/exclude refs
+   found on the path down. Ancestors of the direct refs are read only when there
+   are filters. Cost follows the refs, their subtrees and their ancestor chains,
+   not the graph size. The seen set also ends the walk on parent cycles.
+   Everything is realized in this call."
+  [db full-ref-block-ids includes excludes class-ids]
+  (let [includes (set includes)
+        excludes (set excludes)
+        class-ids (set class-ids)
+        interesting (set/union includes excludes)
+        filters? (seq interesting)
+        own-ref-ids (fn [e] (into #{} (keep #(interesting (:db/id %))) (:block/refs e)))
+        matched? (fn [e ref-ids]
+                   (and (every? ref-ids includes)
+                        (not-any? ref-ids excludes)
+                        (or (empty? class-ids)
+                            (not-any? #(contains? class-ids (:db/id %)) (:block/tags e)))))]
+    ;; stack holds [entity ref-ids], ref-ids = interesting ids referenced by the
+    ;; entity or one of its ancestors
+    (loop [stack ()
+           roots (seq full-ref-block-ids)
+           seen #{}
+           result #{}]
+      (if-let [[e ref-ids] (first stack)]
+        (let [eid (:db/id e)]
+          (if (contains? seen eid)
+            (recur (rest stack) roots seen result)
+            (recur (into (rest stack)
+                         (map (fn [child]
+                                [child (if filters? (into ref-ids (own-ref-ids child)) ref-ids)]))
+                         (:block/_parent e))
+                   roots
+                   (conj seen eid)
+                   (if (matched? e ref-ids) (conj result eid) result))))
+        (if roots
+          (let [root (d/entity db (first roots))]
+            (recur (if (and root (not (contains? seen (:db/id root))))
+                     (list [root (if filters?
+                                   (into (ancestor-ref-ids root interesting) (own-ref-ids root))
+                                   #{})])
+                     ())
+                   (next roots)
+                   seen
+                   result))
+          result)))))
 
 (defn- get-path-refs
   [db entity]
@@ -80,10 +128,14 @@
            (sort-by second #(> %1 %2))))))
 
 (defn- get-block-parents-until-top-ref
+  "Climbs from ref-id to its nearest ref block. The visited set ends the climb
+   on a parent cycle without a ref block: nothing is added, as when the chain
+   ends without one."
   [db id ref-id ref-block-ids *result]
   (loop [eid ref-id
-         parents' []]
-    (when eid
+         parents' []
+         visited #{}]
+    (when (and eid (not (contains? visited eid)))
       (cond
         (contains? @*result eid)
         (swap! *result into parents')
@@ -93,7 +145,7 @@
           (swap! *result into (conj parents' eid)))
         :else
         (let [e (d/entity db eid)]
-          (recur (:db/id (:block/parent e)) (conj parents' eid)))))))
+          (recur (:db/id (:block/parent e)) (conj parents' eid) (conj visited eid)))))))
 
 (defn get-linked-references
   [db id]
@@ -107,12 +159,7 @@
                       (set (conj class-children id))))
         full-ref-block-ids (->> (mapcat (fn [id] (map :db/id (:block/_refs (d/entity db id)))) ids)
                                 set)
-        matched-ref-block-ids (set (d/q (filter-refs-query includes excludes class-ids)
-                                        db
-                                        (rules/extract-rules rules/db-query-dsl-rules
-                                                             [:has-ref]
-                                                             {:deps rules/rules-dependencies})
-                                        ids))
+        matched-ref-block-ids (get-matched-ref-block-ids db full-ref-block-ids includes excludes class-ids)
         matched-refs-with-children-ids (let [*result (atom #{})]
                                          (doseq [ref-id matched-ref-block-ids]
                                            (get-block-parents-until-top-ref db id ref-id full-ref-block-ids *result))
