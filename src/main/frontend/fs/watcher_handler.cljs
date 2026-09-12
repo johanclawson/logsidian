@@ -71,8 +71,10 @@
    worker pull of the db content, the backup, the reparse or the page delete.
    Resolves to true when an add or change was handed to alter-file (see
    handle-add-and-change!). load-graph-files! awaits it, so its concurrency cap
-   also bounds the pulls and reparses; handle-changed! leaves them detached."
-  [type {:keys [dir path content stat global-dir] :as payload}]
+   also bounds the pulls and reparses; handle-changed! leaves them detached.
+   on-pull-ms, when given, is called with the round trip of the worker pull, so
+   the reconcile can log it."
+  [type {:keys [dir path content stat global-dir] :as payload} & {:keys [on-pull-ms]}]
   (let [repo (state/get-current-repo)]
     (when dir
       (let [;; Global directory events don't know their originating repo so we rely
@@ -84,7 +86,9 @@
             {:keys [mtime ctime]} stat
             ext (keyword (path/file-ext path))]
         (when (contains? #{:org :md :markdown :css :js :edn :excalidraw :tldr} ext)
-          (p/let [db-content (db-async/<get-file repo path)
+          (p/let [pull-t0 (js/performance.now)
+                  db-content (db-async/<get-file repo path)
+                  _ (when on-pull-ms (on-pull-ms (- (js/performance.now) pull-t0)))
                   exists-in-db? (not (nil? db-content))
                   db-content (or db-content "")]
             (when (or content (contains? #{"unlink" "unlinkDir" "addDir"} type))
@@ -151,7 +155,13 @@
    a read IPC call, a worker pull and, when changed, a reparse. The former p/all
    started all of them at once and so queued one pull per graph file in the
    worker. ADR-003 step 1 caps it to test whether that queue causes the reopen
-   stalls (H2). No bound on the stall is predicted: the LSPERF line measures it."
+   stalls (H2). No bound on the stall is predicted: the LSPERF line measures it.
+   A slot is held until the file's worker calls settle (pull, reset-file, the
+   set-missing-block-ids! transact). Worker calls have no timeout
+   (state/<invoke-db-worker*), so a call that never settles keeps its slot; if
+   all of them hang, the reconcile, its LSPERF line and the \"Loading changes
+   from disk...\" notice never finish. The former p/all left those calls
+   detached."
   16)
 
 (def ^:private reconcile-delete-concurrency
@@ -159,12 +169,31 @@
    outliner transact in the worker."
   4)
 
+(defonce ^:private *reconcile-run
+  ;; Id of the latest load-graph-files! run. An older run takes no new items.
+  (atom 0))
+
 (defn- log-reconcile-perf!
-  "ADR-003 instrumentation: one LSPERF line per reopen reconcile. max-queue-ms
-   is the longest wait from the start of the file phase (after the page deletes
-   and the 500 ms delay) until a file got a slot. max-file-ms is the slowest
-   file, from its stat to its reparse settling."
-  [{:keys [files deleted t0 files-t0 changed errors delete-errors max-file-ms max-queue-ms]}]
+  "ADR-003 instrumentation: one LSPERF line per reopen reconcile.
+   - max-queue-ms is the longest wait from the start of the file phase (after
+     the page deletes and the 500 ms delay) until a file got a slot. Under the
+     cap that is the last file, so it runs close to files-ms: it is the
+     reconcile's own queue, not the worker's.
+   - pulls, pull-ms-sum and pull-ms-max time each <get-file round trip from the
+     UI: post, wait in the worker queue, pull, return. With the cap, at most
+     reconcile-concurrency of them are outstanding, so pull-ms-max is the
+     bound on the worker queue wait that H2 is about.
+   - max-file-ms is the slowest file, from its stat to its reparse settling.
+   - changed counts files handed to alter-file, and deleted the vanished files.
+     errors and delete-errors count only failures that reach the reconcile: the
+     stat and read IPC calls, the pull, set-missing-block-ids! and synchronous
+     throws of the page delete. alter-file and page-handler/<delete! catch their
+     own errors (console, :capture-error) and resolve, so a failed reparse still
+     counts as changed and a failed page delete is not counted.
+   - skipped and delete-skipped count items not started because the run was
+     stopped (see load-graph-files!). run tells overlapping runs apart."
+  [{:keys [run files deleted t0 files-t0 changed errors delete-errors skipped delete-skipped
+           pulls pull-ms-sum pull-ms-max max-file-ms max-queue-ms]}]
   (let [now (js/performance.now)
         round #(js/Math.round (or % 0))]
     (js/console.log
@@ -172,27 +201,50 @@
           (js/JSON.stringify
            (clj->js {:event "reconcile"
                      :thread "ui"
+                     :run run
                      :concurrency reconcile-concurrency
                      :files files
                      :changed changed
                      :deleted deleted
                      :errors errors
                      :delete-errors delete-errors
+                     :skipped skipped
+                     :delete-skipped delete-skipped
                      :total-ms (round (- now t0))
                      :files-ms (round (- now files-t0))
+                     :pulls pulls
+                     :pull-ms-sum (round pull-ms-sum)
+                     :pull-ms-max (round pull-ms-max)
                      :max-file-ms (round max-file-ms)
                      :max-queue-ms (round max-queue-ms)
                      :t (round now)}))))))
 
 (defn load-graph-files!
-  "This fn replaces the former initial fs watcher"
+  "This fn replaces the former initial fs watcher.
+
+   A run stops taking new files and page deletes once the current graph is no
+   longer graph, or once a newer run started. Several steps read and write the
+   current repo's db rather than graph's (file-model/get-file-page,
+   set-missing-block-ids!, page-handler/<delete!), so after a graph switch they
+   would change the other graph. Nothing is lost by stopping: every :graph/ready
+   runs a full reconcile again. Items already in flight finish."
   [graph]
   (when graph
     (let [repo-dir (config/get-repo-dir graph)
           t0 (js/performance.now)
+          run-id (swap! *reconcile-run inc)
+          current-run? #(and (= run-id @*reconcile-run)
+                             (= graph (state/get-current-repo)))
           ;; LSPERF counters for this run, logged by log-reconcile-perf!
           *perf (volatile! {:changed 0 :errors 0 :delete-errors 0
-                            :max-file-ms 0 :max-queue-ms 0})]
+                            :skipped 0 :delete-skipped 0
+                            :pulls 0 :pull-ms-sum 0 :pull-ms-max 0
+                            :max-file-ms 0 :max-queue-ms 0})
+          on-pull-ms (fn [ms]
+                       (vswap! *perf #(-> %
+                                          (update :pulls inc)
+                                          (update :pull-ms-sum + ms)
+                                          (update :pull-ms-max max ms))))]
       ;; read all files in the repo dir, notify if readdir error
       (p/let [;; all paths, md/org included, or deleted-files would miss them
               db-files (db-async/<get-file-paths graph)
@@ -235,13 +287,15 @@
            (async-util/<map-bounded
             reconcile-delete-concurrency
             (fn [path]
-              (-> (p/do
-                   (when-let [page-name (file-model/get-file-page path)]
-                     (println "Delete page: " page-name ", file path: " path ".")
-                     (page-handler/<delete! page-name #())))
-                  (p/catch (fn [e]
-                             (vswap! *perf update :delete-errors inc)
-                             (js/console.error "Reconcile: deleting the page of" path "failed:" e)))))
+              (if-not (current-run?)
+                (vswap! *perf update :delete-skipped inc)
+                (-> (p/do
+                     (when-let [page-name (file-model/get-file-page path)]
+                       (println "Delete page: " page-name ", file path: " path ".")
+                       (page-handler/<delete! page-name #())))
+                    (p/catch (fn [e]
+                               (vswap! *perf update :delete-errors inc)
+                               (js/console.error "Reconcile: deleting the page of" path "failed:" e))))))
             deleted-files))
          (-> (p/delay 500) ;; workaround for notification ui not showing
              (p/then
@@ -250,30 +304,34 @@
                   (p/let [_ (async-util/<map-bounded
                              reconcile-concurrency
                              (fn [file-rpath]
-                               (let [start (js/performance.now)]
-                                 (vswap! *perf update :max-queue-ms max (- start files-t0))
-                                 ;; Caught per file: one unreadable or failing file is
-                                 ;; logged and counted, and the others still load.
-                                 (-> (p/let [stat (fs/stat repo-dir file-rpath)
-                                             content (fs/read-file repo-dir file-rpath)
-                                             type (if (db/file-exists? graph file-rpath)
-                                                    "change"
-                                                    "add")
-                                             changed? (<handle-changed type
-                                                                       {:dir repo-dir
-                                                                        :path file-rpath
-                                                                        :content content
-                                                                        :stat stat})]
-                                       (when (true? changed?)
-                                         (vswap! *perf update :changed inc)))
-                                     (p/catch (fn [e]
-                                                (vswap! *perf update :errors inc)
-                                                (js/console.error "Reconcile: loading" file-rpath "failed:" e)))
-                                     (p/then (fn [_]
-                                               (vswap! *perf update :max-file-ms max
-                                                       (- (js/performance.now) start)))))))
+                               (if-not (current-run?)
+                                 (vswap! *perf update :skipped inc)
+                                 (let [start (js/performance.now)]
+                                   (vswap! *perf update :max-queue-ms max (- start files-t0))
+                                   ;; Caught per file: one unreadable or failing file is
+                                   ;; logged and counted, and the others still load.
+                                   (-> (p/let [stat (fs/stat repo-dir file-rpath)
+                                               content (fs/read-file repo-dir file-rpath)
+                                               type (if (db/file-exists? graph file-rpath)
+                                                      "change"
+                                                      "add")
+                                               changed? (<handle-changed type
+                                                                         {:dir repo-dir
+                                                                          :path file-rpath
+                                                                          :content content
+                                                                          :stat stat}
+                                                                         :on-pull-ms on-pull-ms)]
+                                         (when (true? changed?)
+                                           (vswap! *perf update :changed inc)))
+                                       (p/catch (fn [e]
+                                                  (vswap! *perf update :errors inc)
+                                                  (js/console.error "Reconcile: loading" file-rpath "failed:" e)))
+                                       (p/then (fn [_]
+                                                 (vswap! *perf update :max-file-ms max
+                                                         (- (js/performance.now) start))))))))
                              files)]
                     (log-reconcile-perf! (assoc @*perf
+                                                :run run-id
                                                 :files (count files)
                                                 :deleted (count deleted-files)
                                                 :t0 t0
@@ -282,8 +340,11 @@
                        (when notification-uid
                          (prn ::init-notify)
                          (notification/clear! notification-uid)
-                         (state/pub-event! [:notification/show {:content (str "The graph " graph " is loaded.")
-                                                                :status :success
-                                                                :clear? true}]))))
+                         ;; a stopped run did not load every file
+                         (let [{:keys [skipped delete-skipped]} @*perf]
+                           (when (zero? (+ skipped delete-skipped))
+                             (state/pub-event! [:notification/show {:content (str "The graph " graph " is loaded.")
+                                                                    :status :success
+                                                                    :clear? true}]))))))
              (p/catch (fn [error]
                         (js/console.dir error)))))))))
